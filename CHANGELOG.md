@@ -1,5 +1,46 @@
 # Changelog
 
+## [Unreleased] — Faz 2 (uyumluluk)
+
+### Eklendi
+
+- **HelloRetryRequest** (RFC 8446 §4.1.4): transcript `message_hash` (254) ile
+  yeniden kurulur, HRR'deki grup ve cookie ile 2. ClientHello üretilir (aynı
+  random/session_id/GREASE/extension sırası). İkinci HRR, zaten teklif edilmiş
+  gruba HRR, farklı suite/grup seçen 2. ServerHello reddedilir.
+- **secp256r1 / secp384r1 key_share** (uncompressed nokta, nokta doğrulamalı
+  ECDH). Yeni saf modül `fasthttpc/security/keyshare.py`.
+- **Proxy desteği** (`fasthttpc/transport/proxy.py`): HTTP CONNECT (Basic auth)
+  ve SOCKS5 (no-auth, kullanıcı/parola, domain adresleme).
+  `Session(proxy=...)` / `Session(proxies={...})`.
+- `TLSImpersonator.build_client_hello(extra_tail_extensions=...)` — PSK için
+  son-extension kancası.
+- `fasthttpc/security/alerts.py` — alert adları ve kullanıcıya ipuçları.
+
+### nginx.org `protocol_version` (alert 70) — analiz
+
+Ağ testi bu ortamda anlamlı değil (çıkış trafiği TLS sonlandıran bir egress
+gateway'den geçiyor), bu yüzden analiz ClientHello üzerinden yapıldı:
+
+- record version 0x0301 / ClientHello legacy_version 0x0303: doğru.
+- GREASE (cipher, groups, extensions, supported_versions): RFC 8701'e uygun;
+  tekrarlanan extension yok.
+- key_share/supported_groups: key_share'deki her grup supported_groups'ta
+  ilan ediliyor (uyumsuzluk illegal_parameter=47 üretirdi, 70 değil).
+- **Kök neden (en olası):** `supported_versions` yalnızca `GREASE, 0x0304`
+  içeriyordu. OpenSSL, supported_versions varken sürümü YALNIZCA bu listeden
+  seçer; TLS 1.3 sunmayan bir sunucu (v0.2.1'deki "0xc02f seçiyor" gözlemi bu
+  sunucunun TLS 1.2 ile yanıt verdiğini gösteriyor) ortak sürüm bulamayınca
+  tam olarak `protocol_version` (70) döner. Cloudflare/tls.peet.ws TLS 1.3
+  desteklediği için etkilenmiyordu.
+- **Düzeltme:** profiller artık gerçek tarayıcılar gibi 0x0303'ü de ilan ediyor
+  (Chrome: GREASE,0304,0303; Firefox: 0304,0303; Safari: GREASE,0304..0301).
+  TLS 1.2-only sunucuda artık anlamsız alert 70 yerine net bir
+  "Sunucu TLS 1.2 ile yanıt verdi; TLS 1.2 kapsam dışı" hatası alınır;
+  alert 70 gelirse de mesaj nedeni açıklar. TLS 1.2 implemente EDİLMEDİ
+  (README → Bilinen sınırlar). Güvenlik: 0x0304 dışı her sürüm reddedildiği
+  için ilan etmek downgrade açmaz; `DOWNGRD` işareti ayrıca raporlanır.
+
 ## [0.2.4] — 2026-09-04
 
 `appdata_diagnose.py`'nin ham byte çıktısı, üç turdur peşinde olduğumuz
