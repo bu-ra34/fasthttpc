@@ -9,7 +9,7 @@ from cryptography.hazmat.primitives import serialization
 
 from fasthttpc.security import session_tickets, tls_adapter
 from fasthttpc.security.cert_validator import validate_server_certificate
-from tests.test_trust_store_cache import _make_ca
+from test_trust_store_cache import _make_ca
 
 
 @pytest.fixture

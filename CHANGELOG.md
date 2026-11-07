@@ -1,8 +1,52 @@
 # Changelog
 
-## [Unreleased]
+## [0.3.0] — 2026-11-07
 
-### Eklendi
+Beş paralel çalışma dalının (güvenlik, uyumluluk, sans-IO/async, performans,
+API) birleştirilmesi. 92 → 418 test, hepsi ağsız.
+
+### Güvenlik ve doğruluk
+
+- **KeyUpdate** (RFC 8446 §4.6.3): sunucu anahtar yenilemesi işleniyor,
+  `update_requested` gelirse istemci de yeniliyor. Eskiden yok sayılıyor ve
+  bağlantı anlamsız bir tag hatasıyla kopuyordu.
+- **Handshake sıra durum makinesi** (`HandshakeOrderValidator`):
+  SH → EE → Cert → CV → Fin dışındaki her sıra `unexpected_message` ile
+  reddediliyor; handshake sırasında application_data, Finished öncesi
+  NewSessionTicket ve CertificateRequest artık kabul edilmiyor.
+- **ServerHello sağlamlaştırma:** hs_type kontrolü, birden çok record'a
+  bölünmüş ServerHello, `legacy_session_id_echo` doğrulaması, tekrarlanan
+  extension reddi.
+- **Record sınırları:** 2^14+256 üstü şifreli record ve sequence number taşması
+  bağlantıyı kapatıyor; 2^14 üstü gönderim bölünüyor.
+- **HPACK sağlamlaştırma:** bozuk Huffman, sınırsız integer, 256KB üstü header
+  listesi ve geçersiz dynamic table size update artık `HpackDecodingError`
+  (GOAWAY COMPRESSION_ERROR). Size update'in literal header sanılması düzeltildi.
+- **WebSocket:** status satırı tam 101 olmalı, `Sec-WebSocket-Accept` zorunlu.
+  ws:// yolundaki TypeError ve 101 ile aynı okumada gelen frame'lerin
+  kaybolması düzeltildi.
+- Geniş `except Exception: pass` blokları daraltıldı.
+- Saf Python AES-GCM/ChaCha20/X25519 yedeği kaldırıldı; `cryptography` zorunlu.
+
+### Async
+
+- **Sans-IO TLS 1.3 çekirdeği** (`fasthttpc.tls13`): soketten bağımsız
+  `TLSClientConnection`, `SyncTLSSocket`, `AsyncTLSStream`.
+- **AsyncSession'da tarayıcı parmak izi:** `impersonate` verilince bağlantı
+  kendi TLS yığınıyla kuruluyor (HTTP/1.1).
+
+### Performans
+
+- CA güven deposu önbelleğe alınıyor (handshake başına ~2.5 ms → µs düzeyi).
+- Record okuma tamponu `bytearray` + ofset; AEAD nesneleri anahtar başına bir
+  kez kuruluyor.
+- **PSK session resumption** (varsayılan KAPALI:
+  `session_tickets.enable_resumption(True)` veya `FASTHTTPC_TLS_RESUMPTION=1`).
+  Bilet önbelleği host + port + `ca_path` ile ayrılıyor.
+- `benchmark.py` yeniden yazıldı (ağsız mikro-benchmark + `--network` ile
+  requests/httpx/curl_cffi karşılaştırması).
+
+### API
 
 - **`verify` parametresi** — `Session(verify="yol/ca.pem")` /
   `AsyncSession(verify=...)`: özel/kurumsal CA bundle'ı. Verilen dosya tek güven
@@ -25,9 +69,8 @@
 
 - `examples/05_async_session.py` yinelenen `impersonate` argümanı yüzünden
   sözdizimi hatası veriyordu.
-## [Unreleased] — Faz 2 (uyumluluk)
 
-### Eklendi
+### Uyumluluk
 
 - **HelloRetryRequest** (RFC 8446 §4.1.4): transcript `message_hash` (254) ile
   yeniden kurulur, HRR'deki grup ve cookie ile 2. ClientHello üretilir (aynı
@@ -42,7 +85,7 @@
   son-extension kancası.
 - `fasthttpc/security/alerts.py` — alert adları ve kullanıcıya ipuçları.
 
-### nginx.org `protocol_version` (alert 70) — analiz
+#### nginx.org `protocol_version` (alert 70) — analiz
 
 Ağ testi bu ortamda anlamlı değil (çıkış trafiği TLS sonlandıran bir egress
 gateway'den geçiyor), bu yüzden analiz ClientHello üzerinden yapıldı:
