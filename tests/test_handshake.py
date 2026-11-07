@@ -241,3 +241,17 @@ def test_pre_shared_key_selected_identity():
     assert parse_server_hello(server_hello(SID, PUB), SID)["selected_identity"] is None
     with pytest.raises(TLSProtocolError, match="pre_shared_key"):
         parse_server_hello(server_hello(SID, PUB, extra_exts=ext(41, b"\x00")), SID)
+
+
+def test_tls12_server_hello_gives_version_error_not_session_id_error():
+    """Canlı testte bulundu (nginx.org): TLS 1.2 ServerHello'su session_id'mizi
+    geri göndermez; kullanıcı 'session_id eşleşmiyor' yerine sürüm hatası görmeli."""
+    import os as _os
+    import pytest as _pytest
+    from fasthttpc.security.tls_adapter import parse_server_hello, TLSProtocolError
+    sid_sent = _os.urandom(32)
+    body = (b"\x03\x03" + _os.urandom(32) + b"\x20" + _os.urandom(32)
+            + b"\xc0\x2f" + b"\x00" + b"\x00\x00")
+    msg = b"\x02" + len(body).to_bytes(3, "big") + body
+    with _pytest.raises(TLSProtocolError, match="protocol_version"):
+        parse_server_hello(msg, sid_sent)
