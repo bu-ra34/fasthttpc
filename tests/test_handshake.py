@@ -216,3 +216,20 @@ def test_psk_modunda_sertifikasiz_sira():
     v2.expect(8)
     with pytest.raises(TLSProtocolError, match="unexpected_message"):
         v2.expect(11)
+
+
+def test_server_hello_oncesi_tek_ccs_yok_sayilir():
+    msg = server_hello(SID, PUB)
+    ccs = struct.pack("!BHH", 20, 0x0303, 1) + b"\x01"
+    assert ta._read_server_hello(FakeSocket(ccs + plain_records(msg))) == msg
+    with pytest.raises(TLSProtocolError, match="unexpected_message"):
+        ta._read_server_hello(FakeSocket(ccs + ccs + plain_records(msg)))
+    with pytest.raises(TLSProtocolError, match="unexpected_message"):
+        ta._read_server_hello(FakeSocket(ccs + plain_records(msg)), allow_ccs=False)
+
+
+def test_downgrd_isareti_mesajda():
+    rnd = os.urandom(24) + b"DOWNGRD\x01"
+    body = b"\x03\x03" + rnd + b"\x20" + SID + b"\xc0\x2f\x00" + struct.pack("!H", 0)
+    with pytest.raises(TLSProtocolError, match="downgrade saldırısı"):
+        parse_server_hello(hs(2, body), SID)
