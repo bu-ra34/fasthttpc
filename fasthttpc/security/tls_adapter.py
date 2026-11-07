@@ -30,6 +30,13 @@ from ..crypto_math import (
 )
 from ..tls_crafter import TLSImpersonator
 from .._log import get_logger
+from .keyshare import (
+    is_hello_retry_request,
+    parse_hrr,
+    message_hash,
+    group_name,
+    is_supported_group,
+)
 from .cert_validator import (
     validate_server_certificate,
     verify_certificate_verify,
@@ -228,11 +235,110 @@ def _parse_alpn_from_encrypted_extensions(hs_payload: bytes) -> str:
     return ""
 
 
+_SUITE_HASH = {0x1301: hashlib.sha256, 0x1302: hashlib.sha384, 0x1303: hashlib.sha256}
+
+
+def _recv_handshake_message(raw_socket: socket.socket, what: str) -> bytes:
+    """Şifresiz handshake record'larından TEK bir handshake mesajı okur.
+
+    CCS record'larını (TLS 1.3 uyumluluk) atlar, alert'te hata verir ve
+    birden çok record'a bölünmüş mesajı birleştirir.
+    """
+    buf = b""
+    while True:
+        header = _recv_all(raw_socket, 5)
+        rec_type, _ver, rec_len = struct.unpack("!BHH", header)
+        payload = _recv_all(raw_socket, rec_len)
+        if rec_type == 20:
+            continue
+        if rec_type == 21:
+            raise ConnectionError(f"Sunucu el sıkışmayı reddetti (alert): {payload.hex()}")
+        if rec_type != 22:
+            raise ConnectionError(f"{what} beklenirken beklenmeyen record tipi: {rec_type}")
+        buf += payload
+        if len(buf) >= 4:
+            hs_len = struct.unpack("!I", b"\x00" + buf[1:4])[0]
+            if len(buf) >= 4 + hs_len:
+                if len(buf) > 4 + hs_len:
+                    raise ConnectionError(f"{what} ile aynı record'da beklenmeyen ek veri.")
+                return buf
+
+
+def _handle_hrr(raw_socket: socket.socket, impersonator: TLSImpersonator,
+                client_hello1: bytes, hrr_msg: bytes):
+    """HelloRetryRequest'i işler (RFC 8446 §4.1.4) ve 2. ServerHello'yu döner.
+
+    Args:
+        client_hello1: ilk ClientHello handshake mesajı (record başlığı HARİÇ).
+        hrr_msg: HRR handshake mesajı (4 byte başlık DAHİL).
+
+    Döner: (server_hello2_msg, transcript_bytes, hrr_info). transcript_bytes
+    = message_hash(CH1) || HRR || CH2 || ServerHello2 — §4.4.1.
+    """
+    if hrr_msg[0] != 2:
+        raise ConnectionError("HelloRetryRequest handshake tipi ServerHello (2) değil.")
+    try:
+        hrr = parse_hrr(hrr_msg[4:])
+    except ValueError as e:
+        raise ConnectionError(f"Bozuk HelloRetryRequest: {e}") from e
+
+    if hrr.selected_version != 0x0304:
+        raise ConnectionError("HelloRetryRequest TLS 1.3 (supported_versions) seçmedi.")
+    hash_func = _SUITE_HASH.get(hrr.cipher_suite)
+    if hash_func is None:
+        raise ConnectionError(
+            f"HelloRetryRequest desteklenmeyen cipher suite seçti: 0x{hrr.cipher_suite:04x}"
+        )
+    group = hrr.selected_group
+    if group is None and hrr.cookie is None:
+        # §4.1.4: CH1'de hiçbir değişikliğe yol açmayacak HRR → illegal_parameter
+        raise ConnectionError("HelloRetryRequest ne key_share grubu ne cookie içeriyor.")
+    if group is None:
+        # Yalnızca cookie istendi: aynı key_share'lerle tekrar dene.
+        groups = impersonator.key_shares.groups
+        group = groups[0]
+        if len(groups) != 1:
+            raise ConnectionError("Yalnızca cookie içeren HRR, çoklu key_share ile desteklenmiyor.")
+    else:
+        if group in impersonator.key_shares.groups:
+            raise ConnectionError(
+                f"HelloRetryRequest zaten key_share gönderdiğimiz grubu ({group_name(group)}) "
+                f"istedi — protokol ihlali (illegal_parameter)."
+            )
+        if group not in impersonator.advertised_groups():
+            raise ConnectionError(
+                f"HelloRetryRequest supported_groups'ta ilan etmediğimiz grubu istedi: "
+                f"{group_name(group)}"
+            )
+        if not is_supported_group(group):
+            raise ConnectionError(
+                f"Sunucu HelloRetryRequest ile {group_name(group)} grubunu istedi; bu grup "
+                f"profilde ilan ediliyor ama bu istemci tarafından implemente edilmedi "
+                f"(desteklenenler: x25519, secp256r1, secp384r1)."
+            )
+
+    ch2_record = impersonator.build_retry_client_hello(group, hrr.cookie)
+    # Middlebox uyumluluk modu (RFC 8446 §D.4): Chrome 2. ClientHello'dan hemen
+    # önce sahte bir change_cipher_spec gönderir.
+    raw_socket.sendall(b"\x14\x03\x03\x00\x01\x01" + ch2_record)
+
+    sh2 = _recv_handshake_message(raw_socket, "2. ServerHello")
+    if sh2[0] != 2 or len(sh2) < 4 + 35:
+        raise ConnectionError("HRR sonrası ServerHello bekleniyordu.")
+    if is_hello_retry_request(sh2[6:38]):
+        raise ConnectionError(
+            "Sunucu ikinci bir HelloRetryRequest gönderdi — RFC 8446 §4.1.4 gereği "
+            "handshake sonlandırıldı (unexpected_message)."
+        )
+    transcript = message_hash(hash_func, client_hello1) + hrr_msg + ch2_record[5:] + sh2
+    return sh2, transcript, hrr
+
+
 class TLSAdapter:
     @staticmethod
     def negotiate(raw_socket: socket.socket, host: str, profile_name: str) -> EncryptedSocket:
         impersonator = TLSImpersonator(host, profile=profile_name)
-        record_bytes, priv_key, _c_rand = impersonator.build_client_hello()
+        record_bytes, _priv_key, _c_rand = impersonator.build_client_hello()
 
         raw_socket.sendall(record_bytes)
 
@@ -268,12 +374,12 @@ class TLSAdapter:
         if len(sh_body) < 35:
             raise ConnectionError("ServerHello mesajı bozuk (çok kısa).")
 
-        if sh_body[2:34] == _HELLO_RETRY_REQUEST_RANDOM:
-            raise ConnectionError(
-                "Sunucu HelloRetryRequest gönderdi — teklif ettiğimiz key_share grubunu "
-                "(x25519) kabul etmedi. Bu istemci şu an yalnızca tek turlu handshake "
-                "destekliyor; HRR implemente edilmedi."
+        hrr = None
+        if is_hello_retry_request(sh_body[2:34]):
+            server_hello_payload, state["handshake_messages"], hrr = _handle_hrr(
+                raw_socket, impersonator, record_bytes[5:], server_hello_payload
             )
+            sh_body = server_hello_payload[4:]
 
         sess_id_len = sh_body[34]
         offset = 35 + sess_id_len
@@ -292,11 +398,15 @@ class TLSAdapter:
                 f"Sunucu desteklenmeyen bir cipher suite seçti: 0x{cipher_suite:04x}. "
                 f"Bu istemci yalnızca TLS 1.3 suite'lerini destekler."
             )
+        if hrr is not None and cipher_suite != hrr.cipher_suite:
+            raise ConnectionError(
+                "HRR sonrası ServerHello farklı bir cipher suite seçti — protokol ihlali."
+            )
 
         extensions_len = struct.unpack("!H", sh_body[offset + 3:offset + 5])[0]
         curr = offset + 5
         ext_end = min(curr + extensions_len, len(sh_body))
-        is_tls13, server_pub = False, None
+        is_tls13, server_pub, selected_group = False, None, None
 
         while curr + 4 <= ext_end:
             ext_type, ext_len = struct.unpack("!HH", sh_body[curr:curr + 4])
@@ -305,11 +415,7 @@ class TLSAdapter:
                 if struct.unpack("!H", sh_body[curr:curr + 2])[0] == 0x0304:
                     is_tls13 = True
             elif ext_type == 51 and ext_len > 2:
-                group, key_len_val = struct.unpack("!HH", sh_body[curr:curr + 4])
-                if group != 0x001D:
-                    raise ConnectionError(
-                        f"Sunucu x25519 dışında bir grup seçti (0x{group:04x}); desteklenmiyor."
-                    )
+                selected_group, key_len_val = struct.unpack("!HH", sh_body[curr:curr + 4])
                 server_pub = sh_body[curr + 4:curr + 4 + key_len_val]
             curr += ext_len
 
@@ -318,15 +424,24 @@ class TLSAdapter:
                 "Sunucu TLS 1.3 (supported_versions=0x0304) müzakere etmedi. Bu istemci "
                 "TLS 1.2 ve altını desteklemez; downgrade kabul edilmiyor."
             )
-        if not server_pub or len(server_pub) != 32:
+        if not server_pub or selected_group is None:
             raise ConnectionError(
-                "ServerHello geçerli bir x25519 key_share içermiyor — handshake tamamlanamaz."
+                "ServerHello geçerli bir key_share içermiyor — handshake tamamlanamaz."
+            )
+        if hrr is not None and hrr.selected_group is not None and selected_group != hrr.selected_group:
+            raise ConnectionError(
+                "HRR sonrası ServerHello, HRR'de istenen gruptan farklı bir grup seçti."
             )
 
         state["is_tls13"] = True
+        state["key_share_group"] = selected_group
+        state["hello_retry"] = hrr is not None
 
         # ---- Handshake anahtarları ------------------------------------------
-        shared = PureCryptoEngine.x25519(priv_key, server_pub)
+        try:
+            shared = impersonator.key_shares.shared_secret(selected_group, server_pub)
+        except ValueError as e:
+            raise ConnectionError(f"key_share işlenemedi ({group_name(selected_group)}): {e}") from e
         t_hash = hash_func(state["handshake_messages"]).digest()
         hs, ck, civ, sk, siv, c_hts, s_hts = PureCryptoEngine.derive_tls13_keys(
             shared, t_hash, state["key_len"], hash_alg=hash_func
