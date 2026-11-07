@@ -12,6 +12,7 @@ Düzeltmeler:
   - response.elapsed otomatik doldurulur
 """
 from __future__ import annotations
+import functools
 import time
 from typing import Union
 
@@ -27,6 +28,8 @@ from .metrics    import RequestMetrics
 from .cache      import ResponseCache
 from .buffer     import AdaptiveReceiver, get_pool
 from .timeout    import Timeout
+from .config     import Limits, resolve_verify
+from .retry      import Retry
 from .multipart  import encode_multipart
 from .cookies    import CookieJar
 from ._log       import get_logger
@@ -70,6 +73,13 @@ class Session:
         cache_ttl:       Yerleşik cache için varsayılan TTL (saniye).
         resolver:        Opsiyonel :class:`~fasthttpc.protocol.dns_over_https.DoHResolver`.
                          Verilirse host adları DNS-over-HTTPS ile çözülür.
+        verify:          ``True`` (varsayılan; certifi + sistem CA'ları) veya özel CA
+                         bundle'ının PEM dosya yolu. ``False`` DESTEKLENMEZ (ValueError).
+        retries:         ``int`` veya :class:`~fasthttpc.retry.Retry`. Varsayılan: kapalı.
+        transport:       Opsiyonel transport (ör. :class:`~fasthttpc.transport.mock.MockTransport`);
+                         verilirse istekler ağ yerine buna gönderilir.
+        limits:          Opsiyonel :class:`~fasthttpc.config.Limits`; verilirse
+                         ``max_connections`` parametresini geçersiz kılar.
 
     Örnek::
 
@@ -87,15 +97,25 @@ class Session:
         cache:           "bool | ResponseCache"       = False,
         cache_ttl:       float                        = 300.0,
         resolver                                      = None,
+        verify:          "bool | str"                 = True,
+        retries:         "int | Retry | None"         = None,
+        transport                                     = None,
+        limits:          "Limits | None"              = None,
     ):
         self.impersonate   = impersonate
         self.timeout       = Timeout.from_value(timeout)
         self.max_redirects = max_redirects
+        self.verify        = verify
+        self._ca_path      = resolve_verify(verify)
+        self.retries       = Retry.from_value(retries)
+        self.transport     = transport
+        self.limits        = limits if limits is not None else Limits(max_connections=max_connections)
         self.pool          = ConnectionPool(
-            max_connections=max_connections,
+            max_connections=self.limits.max_connections,
             timeout=self.timeout.connect_timeout,
             resolver=resolver,
         )
+        self.limits.apply_to_pool(self.pool)
         self.cookie_jar = CookieJar()
 
         if isinstance(cache, ResponseCache):
@@ -357,7 +377,7 @@ class Session:
             conn = None
             is_new_conn = False
             try:
-                conn = self.pool.acquire(req.url)
+                conn = self.pool.acquire(req.url, timeout=self.timeout.pool)
                 is_new_conn = not conn.tls_established
                 logger.debug("conn id=%s yeni=%s tls=%s h2=%s",
                              id(conn), is_new_conn, conn.tls_established,
@@ -373,7 +393,8 @@ class Session:
                     logger.debug("%s profili ile TLS el sıkışması başlıyor (%s)",
                                  self.impersonate, req.url.host)
                     conn.socket = TLSAdapter.negotiate(
-                        conn.socket, req.url.host, self.impersonate
+                        conn.socket, req.url.host, self.impersonate,
+                        ca_path=self._ca_path,
                     )
                     conn.socket.raw_socket.settimeout(self.timeout.read_timeout)
                     conn.tls_established = True
@@ -523,6 +544,52 @@ class Session:
 
                                                                                 
 
+    # --- Faz 5 kancaları: transport + retry -------------------------------
+
+    def _send(self, method, url, data=None, json=None, headers=None, files=None,
+              metrics: RequestMetrics | None = None) -> Response:
+        """Tek bir isteği gönderir: transport verilmişse ona, yoksa ağa."""
+        if self.transport is None:
+            return self._raw_request(method, url, data=data, json=json,
+                                     headers=headers, files=files, metrics=metrics)
+        req = Request(method=method, url=url, data=data, json=json,
+                      headers=headers, files=files)
+        if "host" not in req.headers:
+            req.headers["Host"] = req.url.host
+        cookie_header = self.cookie_jar.header_for(
+            host=req.url.host, path=req.url.path, secure=(req.url.scheme == "https")
+        )
+        if cookie_header and "cookie" not in req.headers:
+            req.headers["Cookie"] = cookie_header
+        resp = self.transport.handle_request(req)
+        self._update_cookies(resp.headers, req.url)
+        if metrics and metrics.request_start:
+            resp.elapsed = time.monotonic() - metrics.request_start
+        return resp
+
+    def _send_with_retries(self, method, url, **kwargs) -> Response:
+        """``self.retries`` politikasına göre ``_send``'i tekrarlar."""
+        retry = self.retries
+        attempt = 0
+        while True:
+            try:
+                resp = self._send(method, url, **kwargs)
+            except Exception as e:
+                if not retry.should_retry_error(method, e, attempt):
+                    raise
+                attempt += 1
+                delay = retry.get_delay(attempt)
+                logger.debug("Ağ hatası (%s), %d. yeniden deneme %.2fs sonra", e, attempt, delay)
+            else:
+                if not retry.should_retry_status(method, resp.status_code, attempt):
+                    return resp
+                attempt += 1
+                delay = retry.get_delay(attempt, resp)
+                logger.debug("HTTP %s, %d. yeniden deneme %.2fs sonra",
+                             resp.status_code, attempt, delay)
+            if delay:
+                time.sleep(delay)
+
     def request(
         self,
         method:          str,
@@ -539,7 +606,7 @@ class Session:
         metrics = RequestMetrics(request_start=time.monotonic())
 
         while True:
-            resp = self._raw_request(
+            resp = self._send_with_retries(
                 method, current_url,
                 data=data, json=json, headers=headers, files=files,
                 metrics=metrics,
@@ -624,7 +691,7 @@ class Session:
     def pre_warm(self, hosts: list[str], count: int = 2) -> dict[str, int]:
         return self.pool.prewarm(
             hosts, count=count,
-            tls_negotiate_fn=TLSAdapter.negotiate,
+            tls_negotiate_fn=functools.partial(TLSAdapter.negotiate, ca_path=self._ca_path),
             impersonate=self.impersonate,
         )
 
@@ -649,6 +716,8 @@ class Session:
 
     def close(self) -> None:
         self.pool.close_all()
+        if self.transport is not None:
+            self.transport.close()
 
     def __enter__(self):
         return self

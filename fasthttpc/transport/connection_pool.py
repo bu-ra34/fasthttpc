@@ -245,7 +245,10 @@ class ConnectionPool:
             conn.idle_since = time.monotonic()
             with self._lock:
                 pool = self._pools[origin]
-                if len(pool) < self.max_connections:
+                keep = getattr(self, "max_keepalive_connections", None)
+                if keep is None:
+                    keep = self.max_connections
+                if len(pool) < keep:
                     pool.append(conn)
                 else:
                     conn.close()
