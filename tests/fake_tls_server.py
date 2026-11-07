@@ -185,7 +185,10 @@ class FakeTLS13Server:
         transcript = ch1
         if self.hrr_group is not None:
             hrr = self._hrr(ch, self.hrr_group)
-            sock.sendall(_rec(22, hrr))
+            # RFC 8446 §D.4: sunucu (OpenSSL gibi) ilk handshake mesajından —
+            # burada HRR — hemen sonra sahte CCS gönderir; istemci bunu
+            # 2. ServerHello'yu beklerken atlamalı.
+            sock.sendall(_rec(22, hrr) + _rec(20, b"\x01"))
             transcript = message_hash(hash_alg, ch1) + hrr
             try:
                 ch2, ch = self._read_ch(sock)
@@ -211,7 +214,7 @@ class FakeTLS13Server:
         sh = _hs(2, b"\x03\x03" + os.urandom(32) + bytes([len(ch["session_id"])]) + ch["session_id"]
                  + struct.pack("!H", self.suite) + b"\x00" + struct.pack("!H", len(exts)) + exts)
         transcript += sh
-        sock.sendall(_rec(22, sh) + _rec(20, b"\x01"))
+        sock.sendall(_rec(22, sh) + (b"" if self.hrr_group is not None else _rec(20, b"\x01")))
 
         hs_secret, ck, civ, sk, siv, c_hts, s_hts = PureCryptoEngine.derive_tls13_keys(
             shared, hash_alg(transcript).digest(), key_len, hash_alg=hash_alg)
