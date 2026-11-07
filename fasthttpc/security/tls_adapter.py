@@ -187,9 +187,12 @@ def parse_server_hello(sh_msg: bytes, sent_session_id: bytes | None = None) -> d
             cookie = data[2:]
 
     if selected_version != 0x0304:
+        hint = ""
+        if random[24:32] in (b"DOWNGRD\x01", b"DOWNGRD\x00"):
+            hint = " ServerHello.random DOWNGRD işareti taşıyor — olası downgrade saldırısı."
         raise TLSProtocolError(
             "protocol_version: Sunucu TLS 1.3 (supported_versions=0x0304) müzakere etmedi. Bu istemci "
-            "TLS 1.2 ve altını desteklemez; downgrade kabul edilmiyor."
+            "TLS 1.2 ve altını desteklemez; downgrade kabul edilmiyor." + hint
         )
 
     return {
@@ -542,13 +545,16 @@ def _parse_alpn_from_encrypted_extensions(hs_payload: bytes) -> str:
     return ""
 
 
-def _read_server_hello(raw_socket: socket.socket) -> bytes:
+def _read_server_hello(raw_socket: socket.socket, allow_ccs: bool = True) -> bytes:
     """Düz (şifresiz) handshake record'larından tam ServerHello mesajını toplar.
 
     ServerHello birden fazla record'a bölünebilir (RFC 8446 §5.1). Mesajdan
     sonra aynı düz record'da artık veri kalırsa (şifresiz EE vb.) reddedilir.
+    allow_ccs: mesaj başlamadan önce gelen TEK bir uyumluluk CCS'si (0x01)
+    yok sayılır — HRR -> CCS -> ServerHello2 akışı için (RFC 8446 §D.4).
     """
     buf = b""
+    ccs_seen = False
     while True:
         header = _recv_all(raw_socket, 5)
         rec_type, _ver, rec_len = struct.unpack("!BHH", header)
@@ -557,6 +563,9 @@ def _read_server_hello(raw_socket: socket.socket) -> bytes:
                 f"record_overflow: düz record uzunluğu {rec_len} > {MAX_PLAINTEXT}."
             )
         payload = _recv_all(raw_socket, rec_len)
+        if rec_type == 20 and allow_ccs and not ccs_seen and not buf and payload == b"\x01":
+            ccs_seen = True
+            continue
         if rec_type == 21:
             raise ConnectionError(f"Sunucu el sıkışmayı reddetti (alert): {payload.hex()}")
         if rec_type != 22:

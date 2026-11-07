@@ -1171,7 +1171,7 @@ class _PlainSocketAdapter:
     def send_record(self, data: bytes, content_type: int = 0x17, use_app_keys: bool = True) -> None:
         self.raw_socket.sendall(data)
 
-    def recv_record(self) -> tuple[bytes, int]:
+    def recv_record(self, skip_post_handshake: bool = False) -> tuple[bytes, int]:
         try:
             chunk = self.raw_socket.recv(16384)
         except (OSError, socket.timeout):
@@ -1250,11 +1250,48 @@ class WebSocketFrame:
         if len(data) < pos + pl_len:
             return None, 0
 
-        payload = data[pos:pos + pl_len]
+        payload = bytes(data[pos:pos + pl_len])
         if masked:
             payload = bytes(b ^ mk[i % 4] for i, b in enumerate(payload))
 
         return cls(opcode, payload, fin=fin, mask=False), pos + pl_len
+
+
+def _validate_ws_handshake_response(head: bytes, expected_accept: str) -> None:
+    """RFC 6455 §4.1 — sunucunun Upgrade yanıtını doğrular.
+
+    head: status satırı + header'lar (\r\n\r\n hariç). Status kodu TAM
+    OLARAK 101 olmalı; Upgrade: websocket, Connection: upgrade ve doğru
+    Sec-WebSocket-Accept zorunludur. Aksi hâlde ConnectionError.
+    """
+    lines = head.split(b"\r\n")
+    status_line = lines[0].decode("latin-1", errors="replace")
+    parts = status_line.split(" ", 2)
+    if len(parts) < 2 or not parts[0].startswith("HTTP/1.") or not parts[1].isdigit():
+        raise ConnectionError(f"WebSocket Upgrade yanıtı geçersiz status satırı: {status_line[:100]!r}")
+    if int(parts[1]) != 101:
+        raise ConnectionError(
+            f"WebSocket Upgrade başarısız: sunucu {parts[1]} döndü (101 bekleniyordu): "
+            f"{status_line[:100]!r}"
+        )
+    hdrs: dict[str, list[str]] = {}
+    for line in lines[1:]:
+        if b":" not in line:
+            continue
+        k, _, v = line.partition(b":")
+        hdrs.setdefault(k.strip().lower().decode("latin-1"), []).append(
+            v.strip().decode("latin-1")
+        )
+    if [v.lower() for v in hdrs.get("upgrade", [])] != ["websocket"]:
+        raise ConnectionError("WebSocket Upgrade yanıtında 'Upgrade: websocket' yok.")
+    conn_tokens = {t.strip().lower() for v in hdrs.get("connection", []) for t in v.split(",")}
+    if "upgrade" not in conn_tokens:
+        raise ConnectionError("WebSocket Upgrade yanıtında 'Connection: Upgrade' yok.")
+    accepts = hdrs.get("sec-websocket-accept", [])
+    if not accepts:
+        raise ConnectionError("WebSocket Upgrade yanıtında Sec-WebSocket-Accept yok — reddedildi.")
+    if len(accepts) != 1 or accepts[0] != expected_accept:
+        raise ConnectionError("WebSocket Accept anahtarı hatalı — MITM şüphesi!")
 
 
 class WebSocketConnection:
@@ -1267,7 +1304,7 @@ class WebSocketConnection:
     def __init__(self, conn, url: str, wire=None, session=None):
         self._conn    = conn
         self._url     = url
-        self._buf     = b""
+        self._buf     = bytearray()
         self._closed  = False
         self._session = session
         # wire: send_record/recv_record arayüzüne sahip nesne (EncryptedSocket
@@ -1318,25 +1355,21 @@ class WebSocketConnection:
             )
             wire.send_record(req.encode("latin-1"))
 
-                                  
+            # Yanıt başlığını oku (101'den hemen sonra gelen frame'ler kaybolmasın).
             resp_raw = b""
             while b"\r\n\r\n" not in resp_raw:
                 msg, mt = wire.recv_record(skip_post_handshake=True)
+                if not msg:
+                    raise ConnectionError(
+                        f"WebSocket Upgrade yanıtı tamamlanmadan bağlantı kapandı: {resp_raw[:200]!r}"
+                    )
                 if mt == 23:
                     resp_raw += msg
-                if not msg:
-                    break
+                if len(resp_raw) > 65536:
+                    raise ConnectionError("WebSocket Upgrade yanıt başlığı çok büyük.")
 
-            if b"101" not in resp_raw:
-                raise ConnectionError(f"WebSocket Upgrade başarısız: {resp_raw[:200]!r}")
-
-                                          
-            for line in resp_raw.split(b"\r\n"):
-                if b"sec-websocket-accept" in line.lower():
-                    server_accept = line.split(b":", 1)[1].strip().decode("latin-1")
-                    if server_accept != expected:
-                        raise ConnectionError("WebSocket Accept anahtarı hatalı — MITM şüphesi!")
-                    break
+            head, _, leftover = resp_raw.partition(b"\r\n\r\n")
+            _validate_ws_handshake_response(head, expected)
         except Exception:
             # Handshake başarısız olduysa bağlantıyı havuzda kilitli/yarım
             # bırakmamak için kapatıp semaphore'u serbest bırakıyoruz.
@@ -1345,6 +1378,7 @@ class WebSocketConnection:
             raise
 
         ws = cls(conn, url, wire, session=session)
+        ws._buf += leftover
         return ws
 
     def send_text(self, text: str) -> None:
@@ -1360,7 +1394,7 @@ class WebSocketConnection:
         while True:
             frame, consumed = WebSocketFrame.parse(self._buf)
             if frame:
-                self._buf = self._buf[consumed:]
+                del self._buf[:consumed]
                 if frame.opcode == WebSocketFrame.OP_PING:
                     pong = WebSocketFrame(WebSocketFrame.OP_PONG, frame.payload)
                     self._wire.send_record(pong.serialize())
