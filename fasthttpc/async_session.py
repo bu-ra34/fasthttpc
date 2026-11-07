@@ -394,15 +394,20 @@ class AsyncSession:
                 send_time = time.monotonic()
 
                             
-                hdr_buf = b""
-                while b"\r\n\r\n" not in hdr_buf:
+                hdr_acc = bytearray()
+                sep     = -1
+                while True:
                     chunk = await asyncio.wait_for(reader.read(4096), timeout=self.timeout)
                     if not chunk: break
-                    if not hdr_buf and metrics:
+                    if not hdr_acc and metrics:
                         metrics.first_byte_time = time.monotonic()
-                    hdr_buf += chunk
+                    search_from = max(0, len(hdr_acc) - 3)
+                    hdr_acc += chunk
+                    sep = hdr_acc.find(b"\r\n\r\n", search_from)
+                    if sep != -1:
+                        break
+                hdr_buf = bytes(hdr_acc)
 
-                sep              = hdr_buf.find(b"\r\n\r\n")
                 headers_raw      = hdr_buf[:sep]
                 first_body_chunk = hdr_buf[sep + 4:]
 
