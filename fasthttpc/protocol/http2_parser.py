@@ -411,6 +411,21 @@ HPACK_HUFFMAN_TRIE = [
 ]
 
 
+class HpackDecodingError(ValueError):
+    """HPACK çözme hatası — HTTP/2 COMPRESSION_ERROR (RFC 7540 §4.3) karşılığı.
+
+    Bağlantı-seviyesi bir hatadır: HPACK durumu artık senkron değildir, bağlantı
+    yeniden kullanılmamalıdır.
+    """
+    error_code = 0x9  # COMPRESSION_ERROR
+
+
+# HPACK güvenlik sınırları
+HPACK_MAX_INT = 2 ** 32                     # integer decode üst sınırı
+HPACK_MAX_HEADER_LIST_SIZE = 256 * 1024     # toplam header list boyutu (RFC 7540 §6.5.2 tanımıyla)
+HPACK_DEFAULT_TABLE_SIZE = 4096             # SETTINGS_HEADER_TABLE_SIZE varsayılanı
+
+
 def _hpack_huffman_decode(data: bytes) -> bytes:
     """
     RFC 7541 Appendix B Huffman kod tablosuna göre decode eder.
@@ -418,25 +433,38 @@ def _hpack_huffman_decode(data: bytes) -> bytes:
     header value'ları (örn. Set-Cookie) neredeyse her zaman Huffman-encoded
     gelir; bu decode edilmeden ham bit dizisi metin sanılırsa çöp veri üretilir
     (ki önceki implementasyonun hatası tam buydu).
+
+    RFC 7541 §5.2: sondaki padding 7 bitten uzun olamaz ve EOS'un en anlamlı
+    bitlerine (tamamı 1) eşit olmalıdır; aksi hâlde decoding error.
+    Hata: HpackDecodingError.
     """
     out = bytearray()
     trie = HPACK_HUFFMAN_TRIE
-    node = 0                          
+    node = 0
+    pad_bits = 0          # son sembolden beri okunan bit sayısı
+    pad_all_ones = True   # bu bitlerin tamamı 1 mi
     for byte in data:
         for shift in (7, 6, 5, 4, 3, 2, 1, 0):
             bit = (byte >> shift) & 1
             child = trie[node][bit]
             if child is None:
-                raise ValueError("Geçersiz Huffman kod dizisi.")
-            if isinstance(child, tuple):                     
+                raise HpackDecodingError("Geçersiz Huffman kod dizisi.")
+            pad_bits += 1
+            pad_all_ones = pad_all_ones and bit == 1
+            if isinstance(child, tuple):
                 symbol = child[1]
-                if symbol == 256:                        
-                    raise ValueError("EOS sembolü veri içinde beklenmiyordu.")
+                if symbol == 256:
+                    raise HpackDecodingError("EOS sembolü veri içinde beklenmiyordu.")
                 out.append(symbol)
                 node = 0
+                pad_bits = 0
+                pad_all_ones = True
             else:
                 node = child
-                                                                             
+    if pad_bits > 7:
+        raise HpackDecodingError("Huffman padding 7 bitten uzun.")
+    if not pad_all_ones:
+        raise HpackDecodingError("Huffman padding EOS önekiyle (tümü 1) eşleşmiyor.")
     return bytes(out)
 
 
@@ -508,12 +536,22 @@ HPACK_STATIC_TABLE = [
 
 class HpackDecoder:
     """
-    Basit HPACK decoder — static table + literal header decode.
-    Dynamic table indexing destekli (tam RFC 7541).
+    HPACK decoder (RFC 7541) — static + dynamic table, Huffman.
+
+    Güvenlik sınırları: integer'lar HPACK_MAX_INT ile, toplam header list
+    boyutu max_header_list_size ile sınırlıdır; dynamic table size update
+    ilan edilen (SETTINGS_HEADER_TABLE_SIZE) değeri aşamaz ve yalnızca blok
+    başında gelebilir. Kesik/bozuk girdi HpackDecodingError fırlatır.
     """
-    def __init__(self):
+    def __init__(self, max_table_size: int = HPACK_DEFAULT_TABLE_SIZE,
+                 max_header_list_size: int = HPACK_MAX_HEADER_LIST_SIZE):
         self._dynamic: list[tuple[str, str]] = []
-        self._max_size = 4096
+        self._dynamic_size = 0
+        # Bizim SETTINGS ile ilan ettiğimiz üst sınır; sunucunun size update'i bunu aşamaz.
+        self._max_allowed = max_table_size
+        # Karşı taraf size update gönderene kadar RFC varsayılanı (4096) geçerlidir.
+        self._max_size = min(max_table_size, HPACK_DEFAULT_TABLE_SIZE)
+        self.max_header_list_size = max_header_list_size
 
     def _table_get(self, idx: int) -> tuple[str, str]:
         if 1 <= idx <= len(HPACK_STATIC_TABLE) - 1:
@@ -521,110 +559,124 @@ class HpackDecoder:
         dyn_idx = idx - len(HPACK_STATIC_TABLE)
         if 0 <= dyn_idx < len(self._dynamic):
             return self._dynamic[dyn_idx]
-        return ("", "")
+        raise HpackDecodingError(f"Geçersiz HPACK tablo indeksi: {idx}.")
+
+    def _evict(self) -> None:
+        while self._dynamic_size > self._max_size and self._dynamic:
+            n, v = self._dynamic.pop()
+            self._dynamic_size -= len(n) + len(v) + 32
 
     def _add_dynamic(self, name: str, value: str) -> None:
         entry_size = len(name) + len(value) + 32
+        if entry_size > self._max_size:
+            # RFC 7541 §4.4: tablodan büyük giriş tabloyu boşaltır, eklenmez.
+            self._dynamic.clear()
+            self._dynamic_size = 0
+            return
         self._dynamic.insert(0, (name, value))
-                                        
-        total = sum(len(n) + len(v) + 32 for n, v in self._dynamic)
-        while total > self._max_size and self._dynamic:
-            n, v = self._dynamic.pop()
-            total -= len(n) + len(v) + 32
+        self._dynamic_size += entry_size
+        self._evict()
+
+    @staticmethod
+    def _decode_int(data: bytes, pos: int, prefix_bits: int) -> tuple[int, int]:
+        """RFC 7541 §5.1 integer; pos önek byte'ını gösterir."""
+        if pos >= len(data):
+            raise HpackDecodingError("HPACK integer kesik.")
+        mask = (1 << prefix_bits) - 1
+        value = data[pos] & mask
+        pos += 1
+        if value < mask:
+            return value, pos
+        m = 0
+        while True:
+            if pos >= len(data):
+                raise HpackDecodingError("HPACK integer kesik (devam byte'ı eksik).")
+            bb = data[pos]
+            pos += 1
+            value += (bb & 0x7F) << m
+            m += 7
+            if value > HPACK_MAX_INT:
+                raise HpackDecodingError("HPACK integer üst sınırı (2^32) aşıldı.")
+            if not (bb & 0x80):
+                return value, pos
 
     def decode(self, data: bytes) -> list[tuple[str, str]]:
-        """HPACK encoded bytes → (name, value) listesi."""
-        headers = []
-        pos     = 0
-        n       = len(data)
+        """HPACK encoded bytes → (name, value) listesi. Hata: HpackDecodingError."""
+        headers: list[tuple[str, str]] = []
+        pos = 0
+        n = len(data)
+        list_size = 0
+        size_update_allowed = True
 
         while pos < n:
             b = data[pos]
 
-                                              
-            if b & 0x80:
-                idx = b & 0x7F
+            if b & 0x80:                       # §6.1 Indexed Header Field
+                idx, pos = self._decode_int(data, pos, 7)
                 if idx == 0:
-                    pos += 1
-                    continue
-                                    
-                if idx == 0x7F:
-                    pos += 1
-                    m = 0
-                    while pos < n:
-                        bb = data[pos]; pos += 1
-                        idx += (bb & 0x7F) << m; m += 7
-                        if not (bb & 0x80): break
-                else:
-                    pos += 1
+                    raise HpackDecodingError("Indexed header field indeksi 0 olamaz.")
                 name, value = self._table_get(idx)
-                headers.append((name, value))
+                add = False
+            elif b & 0x40:                     # §6.2.1 Literal with Incremental Indexing
+                idx, pos = self._decode_int(data, pos, 6)
+                name, value, pos = self._decode_literal(data, pos, idx)
+                add = True
+            elif b & 0x20:                     # §6.3 Dynamic Table Size Update
+                if not size_update_allowed:
+                    raise HpackDecodingError(
+                        "Dynamic table size update header bloğunun başında olmalı."
+                    )
+                new_size, pos = self._decode_int(data, pos, 5)
+                if new_size > self._max_allowed:
+                    raise HpackDecodingError(
+                        f"Dynamic table size update ({new_size}) ilan edilen üst sınırı "
+                        f"({self._max_allowed}) aşıyor."
+                    )
+                self._max_size = new_size
+                self._evict()
+                continue
+            else:                              # §6.2.2 / §6.2.3 without / never indexed
+                idx, pos = self._decode_int(data, pos, 4)
+                name, value, pos = self._decode_literal(data, pos, idx)
+                add = False
 
-                                                               
-            elif b & 0x40:
-                idx = b & 0x3F; pos += 1
-                if idx == 0x3F:
-                    m = 0
-                    while pos < n:
-                        bb = data[pos]; pos += 1
-                        idx += (bb & 0x7F) << m; m += 7
-                        if not (bb & 0x80): break
-                if idx == 0:
-                    name, pos = self._decode_string(data, pos)
-                else:
-                    name, _ = self._table_get(idx)
-                value, pos = self._decode_string(data, pos)
+            size_update_allowed = False
+            list_size += len(name) + len(value) + 32
+            if list_size > self.max_header_list_size:
+                raise HpackDecodingError(
+                    f"Header list boyutu sınırı ({self.max_header_list_size} byte) aşıldı."
+                )
+            if add:
                 self._add_dynamic(name, value)
-                headers.append((name, value))
-
-                                                      
-            else:
-                pos += 1
-                idx = b & 0x0F
-                if idx == 0x0F:
-                    m = 0
-                    while pos < n:
-                        bb = data[pos]; pos += 1
-                        idx += (bb & 0x7F) << m; m += 7
-                        if not (bb & 0x80): break
-                if idx == 0:
-                    name, pos = self._decode_string(data, pos)
-                else:
-                    name, _ = self._table_get(idx)
-                value, pos = self._decode_string(data, pos)
-                headers.append((name, value))
+            headers.append((name, value))
 
         return headers
 
+    def _decode_literal(self, data: bytes, pos: int, idx: int) -> tuple[str, str, int]:
+        if idx == 0:
+            name, pos = self._decode_string(data, pos)
+        else:
+            name, _ = self._table_get(idx)
+        value, pos = self._decode_string(data, pos)
+        return name, value, pos
+
     def _decode_string(self, data: bytes, pos: int) -> tuple[str, int]:
-        """Huffman veya literal string decode."""
+        """Huffman veya literal string decode. Kesik veri HpackDecodingError."""
         if pos >= len(data):
-            return "", pos
-        b      = data[pos]; pos += 1
-        huffman = bool(b & 0x80)
-        length  = b & 0x7F
-                           
-        if length == 0x7F:
-            m = 0
-            while pos < len(data):
-                bb = data[pos]; pos += 1
-                length += (bb & 0x7F) << m; m += 7
-                if not (bb & 0x80): break
-        raw = data[pos:pos + length]; pos += length
-
+            raise HpackDecodingError("HPACK string uzunluğu eksik.")
+        huffman = bool(data[pos] & 0x80)
+        length, pos = self._decode_int(data, pos, 7)
+        if length > self.max_header_list_size:
+            raise HpackDecodingError("HPACK string uzunluğu sınırı aşıyor.")
+        if pos + length > len(data):
+            raise HpackDecodingError(
+                f"HPACK string kesik (beklenen {length}, kalan {len(data) - pos})."
+            )
+        raw = data[pos:pos + length]
+        pos += length
         if huffman:
-            try:
-                decoded_bytes = _hpack_huffman_decode(raw)
-            except ValueError:
-                # Bozuk/eksik Huffman verisi — sessizce boş dönmek yerine en
-                # azından çökmeyelim; çağıran taraf bunu görebilir.
-                return "", pos
-            return decoded_bytes.decode("latin-1", errors="replace"), pos
-
-        try:
-            return raw.decode("latin-1", errors="replace"), pos
-        except Exception:
-            return "", pos
+            raw = _hpack_huffman_decode(raw)
+        return raw.decode("latin-1"), pos
 
 
                                                                                
@@ -745,7 +797,9 @@ class Http2Connection:
     def __init__(self, encrypted_socket, initial_settings: Optional[dict] = None, debug: bool = False):
         self.sock = encrypted_socket
         self._next_stream_id = 1
-        self._decoder = HpackDecoder()
+        # SETTINGS'te HEADER_TABLE_SIZE=65536 ve MAX_HEADER_LIST_SIZE=256KB ilan ediliyor.
+        self._decoder = HpackDecoder(max_table_size=65536,
+                                     max_header_list_size=HPACK_MAX_HEADER_LIST_SIZE)
         self._encoder = HpackEncoder()
         self._recv_buf = bytearray()
         self._conn_window_send = self.DEFAULT_WINDOW      # bizim gönderebileceğimiz (server bize izin verdikçe artar)
@@ -779,6 +833,14 @@ class Http2Connection:
         )
         frame = HTTP2Frame(len(settings_payload), FrameType.SETTINGS, 0, 0, settings_payload)
         self.sock.send_record(frame.serialize())
+
+    def _send_goaway(self, error_code: int) -> None:
+        """En iyi çabayla GOAWAY gönderir (bağlantı zaten bozuksa hata yutulur)."""
+        payload = struct.pack("!II", 0, error_code)
+        try:
+            self.sock.send_record(HTTP2Frame(len(payload), FrameType.GOAWAY, 0, 0, payload).serialize())
+        except OSError as e:
+            self._dbg(f"GOAWAY gönderilemedi: {e}")
 
     def _read_frame(self) -> HTTP2Frame:
         # Gövde gönderirken pencere beklerken okunmuş ama işlenmemiş frame'ler
@@ -994,8 +1056,17 @@ class Http2Connection:
                         resp_header_block += _strip_headers_frame_fields(frame)
                     else:
                         resp_header_block += frame.payload
+                    if len(resp_header_block) > HPACK_MAX_HEADER_LIST_SIZE:
+                        self._send_goaway(0xB)  # ENHANCE_YOUR_CALM
+                        raise Http2ConnectionError(
+                            "Sıkıştırılmış header bloğu sınırı aşıldı (HEADERS/CONTINUATION seli)."
+                        )
                     if frame.end_headers:
-                        decoded = self._decoder.decode(bytes(resp_header_block))
+                        try:
+                            decoded = self._decoder.decode(bytes(resp_header_block))
+                        except HpackDecodingError as e:
+                            self._send_goaway(HpackDecodingError.error_code)
+                            raise Http2ConnectionError(f"COMPRESSION_ERROR: {e}") from e
                         # HPACK durumu bağlantı genelinde tutulduğu için her
                         # blok TAM OLARAK BİR KEZ decode edilmeli ve tampon
                         # sıfırlanmalıdır. Sıfırlanmazsa 1xx ara yanıtları ve
