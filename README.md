@@ -75,8 +75,8 @@ import asyncio
 from fasthttpc import AsyncSession
 
 async def main():
-    # impersonate=None: async tarafta TLS taklidi YOK (aşağıya bakın)
-    async with AsyncSession(impersonate=None) as s:
+    # Async tarafta da tarayıcı parmak izi taklidi var (kendi TLS 1.3 yığını)
+    async with AsyncSession(impersonate="chrome_131") as s:
         r = await s.get("https://httpbin.org/get")
         print(r.status_code)
 
@@ -249,10 +249,12 @@ Bilinmeyen bir profil adı `ValueError` fırlatır; sessizce `default`'a düşme
 Bunlar bilinçli olarak eksiktir, sessiz hata değildir — hepsi açık hata mesajı
 verir veya belgelenmiştir:
 
-- **AsyncSession'da TLS taklidi yok.** `asyncio.open_connection` stdlib `ssl`
-  ile çalışır, yani ClientHello Python/OpenSSL parmak izi taşır.
-  `impersonate` verilirse `UserWarning` çıkar. Parmak izi gerekiyorsa senkron
-  `Session` kullanın.
+- **AsyncSession yalnızca HTTP/1.1 konuşur.** `impersonate` verilince TLS
+  sans-IO çekirdekle (`fasthttpc.tls13`) kurulur ve ClientHello parmak izi
+  senkron taraftakiyle aynıdır (JA3). ALPN `http/1.1` olarak sabit olduğundan
+  JA4'ün ALPN alanı profilden farklıdır. `impersonate=None` verilirse stdlib
+  `ssl` kullanılır. `AsyncSession.pre_warm` ve async WebSocket hâlâ stdlib
+  `ssl` kullanır.
 - **HTTP/2 multiplexing yok.** İstekler aynı bağlantıda sıralı gider.
 - **TLS 1.2 bilinçli olarak kapsam dışıdır.** fasthttpc yalnızca TLS 1.3
   konuşur. Profiller gerçek tarayıcılar gibi `supported_versions` içinde
