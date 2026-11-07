@@ -57,6 +57,17 @@ def _resolve_location(base: URL, location: str) -> str:
     return f"{origin}{base_dir}/{location}"
 
 
+def _proxy_spec(proxy, proxies):
+    """proxy= (tek URL) ve proxies= (sözlük) parametrelerini birleştirir/doğrular."""
+    if proxy is not None and proxies is not None:
+        raise ValueError("proxy= ve proxies= birlikte verilemez.")
+    spec = proxy if proxy is not None else proxies
+    from .transport.proxy import resolve_proxy
+    for scheme in ("https", "http"):
+        resolve_proxy(spec, scheme)  # hatalı URL'i erken (Session kurulurken) yakala
+    return spec
+
+
 class Session:
     """
     fasthttpc senkron HTTP istemcisi.
@@ -87,6 +98,8 @@ class Session:
         cache:           "bool | ResponseCache"       = False,
         cache_ttl:       float                        = 300.0,
         resolver                                      = None,
+        proxies                                       = None,
+        proxy                                         = None,
     ):
         self.impersonate   = impersonate
         self.timeout       = Timeout.from_value(timeout)
@@ -95,6 +108,7 @@ class Session:
             max_connections=max_connections,
             timeout=self.timeout.connect_timeout,
             resolver=resolver,
+            proxy=_proxy_spec(proxy, proxies),
         )
         self.cookie_jar = CookieJar()
 
