@@ -187,7 +187,7 @@ def derive_handshake_keys_psk(psk: Optional[bytes], shared_secret: bytes, handsh
 # ---------------------------------------------------------------------------
 @dataclass
 class SessionTicket:
-    host: str
+    host: str  # önbellek anahtarı: cache_key(host, port, ca_path) ya da düz host adı
     ticket: bytes
     psk: bytes
     cipher_suite: int
@@ -230,6 +230,18 @@ def ticket_from_message(host: str, nst: NewSessionTicket, resumption_master_secr
         max_early_data=nst.max_early_data,
         peer_certificate=peer_certificate,
     )
+
+
+def cache_key(host: str, port=None, ca_path=None) -> str:
+    """Bilet önbelleği anahtarı.
+
+    Resumption'da sertifika YENİDEN doğrulanmaz; kimlik bileti veren handshake'ten
+    devralınır. Bu yüzden anahtar, o handshake'i doğrulayan güven kökünü (ca_path)
+    ve hedef portu içermelidir — aksi halde verify="kurumsal-ca.pem" ile açılan bir
+    oturum, başka bir güven deposuyla doğrulanmış bağlantının biletini kullanabilir.
+    """
+    ca = os.path.abspath(os.fspath(ca_path)) if ca_path is not None else ""
+    return f"{host.lower()}|{port if port is not None else ''}|{ca}"
 
 
 class TicketCache:

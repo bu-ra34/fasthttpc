@@ -98,6 +98,12 @@ def test_cache_single_use_lru_and_expiry():
     assert len(c) == 1  # yalnızca "y"
 
 
+def test_cache_key_includes_port_and_ca():
+    assert st.cache_key("A.test", 443) == st.cache_key("a.test", 443)
+    assert st.cache_key("a.test", 443) != st.cache_key("a.test", 8443)
+    assert st.cache_key("a.test", 443) != st.cache_key("a.test", 443, "ca.pem")
+
+
 def test_cache_thread_safe():
     c = st.TicketCache(max_hosts=1000, max_per_host=1000)
 

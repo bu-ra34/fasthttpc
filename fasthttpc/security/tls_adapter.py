@@ -250,7 +250,7 @@ class EncryptedSocket:
         Bir record'da birden fazla NewSessionTicket art arda gelebilir.
         """
         rms = self.state.get("resumption_master_secret")
-        host = self.state.get("ticket_host")
+        host = self.state.get("ticket_cache_key")
         if not rms or not host:
             return
         pos = 0
@@ -293,12 +293,21 @@ def _parse_alpn_from_encrypted_extensions(hs_payload: bytes) -> str:
 
 class TLSAdapter:
     @staticmethod
-    def negotiate(raw_socket: socket.socket, host: str, profile_name: str) -> EncryptedSocket:
+    def negotiate(raw_socket: socket.socket, host: str, profile_name: str, *,
+                  ca_path: str | None = None) -> EncryptedSocket:
+        """ca_path: None -> certifi + sistem CA'ları; aksi halde YALNIZCA o PEM dosyası."""
         impersonator = TLSImpersonator(host, profile=profile_name)
 
         # PSK resumption (faz4) — VARSAYILAN KAPALI; bkz. session_tickets.enable_resumption.
         resumption_on = session_tickets.resumption_enabled()
-        ticket = session_tickets.default_cache.pop(host) if resumption_on else None
+        ticket_key = None
+        if resumption_on:
+            try:
+                peer_port = raw_socket.getpeername()[1]
+            except (OSError, IndexError, TypeError):
+                peer_port = None
+            ticket_key = session_tickets.cache_key(host, peer_port, ca_path)
+        ticket = session_tickets.default_cache.pop(ticket_key) if resumption_on else None
         psk_hello = (
             session_tickets.build_resumption_client_hello(impersonator, ticket) if ticket else None
         )
@@ -488,7 +497,7 @@ class TLSAdapter:
                         effective_payload = hs_payload
 
                     try:
-                        leaf_cert = validate_server_certificate(effective_payload, host)
+                        leaf_cert = validate_server_certificate(effective_payload, host, ca_path=ca_path)
                     except CertificateValidationError as e:
                         raise ConnectionError(
                             f"TLS sertifika doğrulaması başarısız — bağlantı güvenli değil, "
@@ -557,7 +566,7 @@ class TLSAdapter:
                 hash_alg=hash_func,
             )
             state["cipher_suite"] = cipher_suite
-            state["ticket_host"] = host
+            state["ticket_cache_key"] = ticket_key
 
         # ---- Application anahtarları -------------------------------------------
         ak, aiv, ask_key, asiv = PureCryptoEngine.derive_application_keys(
