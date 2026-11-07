@@ -25,6 +25,16 @@ try:
 except ImportError:
     _ZSTD = False
 
+from .._log import get_logger
+logger = get_logger("http2")
+
+# Bozuk sıkıştırılmış veride beklenen hata tipleri (gerisi yukarı yükselir).
+_DECOMPRESS_ERRORS: tuple = (zlib.error, ValueError, EOFError)
+if _BROTLI:
+    _DECOMPRESS_ERRORS += (getattr(_brotli, "error", ValueError),)
+if _ZSTD:
+    _DECOMPRESS_ERRORS += (_zstd.ZstdError,)
+
 
                                                                                
                       
@@ -1370,8 +1380,8 @@ class WebSocketConnection:
 
             head, _, leftover = resp_raw.partition(b"\r\n\r\n")
             _validate_ws_handshake_response(head, expected)
-        except Exception:
-            # Handshake başarısız olduysa bağlantıyı havuzda kilitli/yarım
+        except BaseException:
+            # Handshake başarısız olduysa (KeyboardInterrupt dahil) bağlantıyı havuzda kilitli/yarım
             # bırakmamak için kapatıp semaphore'u serbest bırakıyoruz.
             conn.close()
             session.pool.release(conn)
@@ -1417,8 +1427,8 @@ class WebSocketConnection:
             frame = WebSocketFrame(WebSocketFrame.OP_CLOSE, struct.pack("!H", 1000))
             try:
                 self._wire.send_record(frame.serialize())
-            except Exception:
-                pass
+            except OSError as e:  # ConnectionError dahil — karşı taraf zaten kapatmış olabilir
+                logger.debug("WebSocket CLOSE frame'i gönderilemedi: %s", e)
             self._closed = True
         # WebSocket bağlantısı artık HTTP keep-alive için yeniden kullanılamaz
         # (protokol Upgrade edildi) — soketi kapatıp havuzdaki semaphore'u
@@ -1475,7 +1485,8 @@ class StreamingDecompressor:
                 buf = io.BytesIO(chunk)
                 self._obj = _zstd.ZstdDecompressor().stream_reader(buf)
                 return self._obj.read()
-        except Exception:
+        except _DECOMPRESS_ERRORS as e:
+            logger.warning("Akış açılamadı (%s), ham chunk döndürülüyor: %s", self._enc, e)
             return chunk
         return chunk
 
@@ -1483,7 +1494,8 @@ class StreamingDecompressor:
         if isinstance(self._obj, zlib.Decompress):
             try:
                 return self._obj.flush()
-            except Exception:
+            except zlib.error as e:
+                logger.warning("Akış flush hatası (%s): %s", self._enc, e)
                 return b""
         return b""
 
