@@ -446,7 +446,7 @@ class TLSAdapter:
         esock.send_record(finished_msg, content_type=0x16, use_app_keys=False)
 
         # ---- Application anahtarları -------------------------------------------
-        ak, aiv, ask_key, asiv = PureCryptoEngine.derive_application_keys(
+        ak, aiv, ask_key, asiv, c_ats, s_ats = PureCryptoEngine.derive_application_keys(
             state["handshake_secret"], t_hash, state["key_len"], hash_alg=hash_func
         )
         state.update({
