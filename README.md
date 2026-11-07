@@ -100,6 +100,23 @@ with Session() as s:
                files={"file": ("test.txt", b"merhaba", "text/plain")})
 ```
 
+### Proxy
+
+```python
+from fasthttpc import Session
+
+# HTTP CONNECT (Proxy-Authorization: Basic dahil)
+with Session(proxy="http://kullanici:parola@proxy.local:3128") as s:
+    r = s.get("https://example.com")
+
+# SOCKS5 (no-auth veya kullanıcı/parola; hedef adı proxy'de çözülür)
+with Session(proxies={"https": "socks5://u:p@127.0.0.1:1080"}) as s:
+    r = s.get("https://example.com")
+```
+
+TLS (ve parmak izi) her zaman tünelin İÇİNDE fasthttpc'nin kendi TLS 1.3
+yığınıyla kurulur; proxy yalnızca TCP baytlarını taşır.
+
 ### Logging
 
 Kütüphane `print()` kullanmaz. Ayrıntı görmek için:
@@ -142,13 +159,26 @@ verir veya belgelenmiştir:
   `impersonate` verilirse `UserWarning` çıkar. Parmak izi gerekiyorsa senkron
   `Session` kullanın.
 - **HTTP/2 multiplexing yok.** İstekler aynı bağlantıda sıralı gider.
-- **TLS 1.2 desteklenmiyor.** Sunucu TLS 1.3 müzakere etmezse bağlantı reddedilir.
-- **HelloRetryRequest işlenmiyor.** Sunucu x25519 dışında bir grup isterse
-  açık hata verilir.
+- **TLS 1.2 bilinçli olarak kapsam dışıdır.** fasthttpc yalnızca TLS 1.3
+  konuşur. Profiller gerçek tarayıcılar gibi `supported_versions` içinde
+  0x0303'ü ve TLS 1.2 cipher suite'lerini *ilan eder* (parmak izi doğruluğu
+  için), ama sunucu TLS 1.3 dışında bir sürüm seçerse bağlantı açık bir hatayla
+  reddedilir ("Sunucu TLS 1.2 ile yanıt verdi ..."). ServerHello.random'da
+  `DOWNGRD` işareti varsa olası downgrade saldırısı ayrıca belirtilir. Bu bir
+  downgrade yolu açmaz: TLS 1.2 handshake'i hiç implemente edilmemiştir.
+  Gerekçe: TLS 1.2 (RSA/ECDHE key exchange, CBC/GCM, renegotiation, ayrı PRF,
+  extended master secret) ikinci bir tam handshake yığını demektir ve saldırı
+  yüzeyini ikiye katlar; günümüzde TLS 1.3 desteklemeyen sunucu oranı düşüktür.
+  TLS 1.2-only sunucular için stdlib `ssl` tabanlı `AsyncSession` kullanılabilir.
+- **HelloRetryRequest:** destekleniyor (RFC 8446 §4.1.4, cookie dahil); ikinci
+  HRR handshake'i sonlandırır.
 - **Session resumption (PSK/0-RTT) yok.** Her bağlantı tam handshake yapar.
 - **HPACK huffman ENCODE yok** (decode var). Protokolde geçerli, ama h2 parmak
   izinde küçük bir sapma yaratır.
-- **key_share yalnızca x25519.** Chrome ayrıca X25519MLKEM768 gönderir.
+- **key_share grupları:** x25519, secp256r1, secp384r1. Hibrit/post-kuantum
+  gruplar (X25519MLKEM768) ve secp521r1/ffdhe implemente edilmedi: bunlar için
+  key_share *gönderilmez*; profil supported_groups'ta ilan ediyorsa ve sunucu
+  HRR ile bunları isterse açık hata verilir.
 - `Session` thread-safe değildir; thread başına bir tane kullanın.
 
 ## Modül yapısı

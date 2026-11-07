@@ -214,15 +214,27 @@ class TLSImpersonator:
         return self._ext(0x002D, b"\x01\x01")
 
     def _pack_supported_versions(self) -> bytes:
-        # Gerçek Chrome bu listeye önce bir GREASE değeri, sonra TLS 1.3 (0x0304)
-        # koyar. GREASE'siz düz "0304", Cloudflare gibi hoşgörülü sunucularda
-        # çalışır ama nginx.org gibi katı yığınlar 'protocol_version' alert'iyle
-        # reddedebilir. Cipher ve supported_groups listelerinde zaten GREASE
-        # kullandığımız için burada da tutarlı olmak hem uyumluluk hem parmak
-        # izi doğruluğu sağlar.
-        versions = struct.pack("!HH", self._grease_version, 0x0304)
-        payload = struct.pack(f"!B{len(versions)}s", len(versions), versions)
-        return self._ext(0x002B, payload)
+        # Profilin "supported_versions" listesi ("GREASE" placeholder'ı
+        # desteklenir). Gerçek Chrome: GREASE, 0x0304, 0x0303.
+        #
+        # nginx.org alert 70 analizi (bkz. CHANGELOG 0.2.5): yalnızca 0x0304
+        # teklif edip TLS 1.2-only bir OpenSSL sunucusuna bağlanınca OpenSSL
+        # ortak sürüm bulamaz ve protocol_version (70) alert'i döner. 0x0303'ü
+        # de ilan etmek (a) gerçek tarayıcı ClientHello'su ile birebir uyum
+        # sağlar, (b) böyle bir sunucuda anlamsız alert 70 yerine TLS 1.2
+        # ServerHello alınmasını ve istemcinin NET bir "TLS 1.2 kapsam dışı"
+        # hatası vermesini sağlar. Güvenlik: negotiate() 0x0304 dışındaki her
+        # sürümü reddeder, yani 0x0303'ü ilan etmek bir downgrade yolu açmaz.
+        versions = []
+        for v in self.profile.get("supported_versions", ["GREASE", 0x0304]):
+            if v == "GREASE":
+                versions.append(self._grease_version)
+            elif isinstance(v, int):
+                versions.append(v)
+        if 0x0304 not in versions:
+            raise ValueError("Profilin supported_versions listesi 0x0304 (TLS 1.3) içermeli.")
+        raw = b"".join(struct.pack("!H", v) for v in versions)
+        return self._ext(0x002B, struct.pack("!B", len(raw)) + raw)
 
     def _pack_compress_certificate(self) -> bytes:
         algorithms = [0x0002, 0x0001]

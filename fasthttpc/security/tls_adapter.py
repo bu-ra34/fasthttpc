@@ -30,6 +30,7 @@ from ..crypto_math import (
 )
 from ..tls_crafter import TLSImpersonator
 from .._log import get_logger
+from .alerts import describe_alert
 from .keyshare import (
     is_hello_retry_request,
     parse_hrr,
@@ -235,6 +236,19 @@ def _parse_alpn_from_encrypted_extensions(hs_payload: bytes) -> str:
     return ""
 
 
+def _tls12_hint(sh_body: bytes) -> str:
+    """TLS 1.2 ServerHello'su için açıklayıcı ek mesaj (TLS 1.2 kapsam dışı)."""
+    if sh_body[:2] != b"\x03\x03":
+        return ""
+    if sh_body[26:34] in (b"DOWNGRD\x01", b"DOWNGRD\x00"):
+        # RFC 8446 §4.1.3: TLS 1.3 destekleyen sunucu daha düşük sürüm seçerse
+        # random'un son 8 byte'ına bu işareti koyar → aktif downgrade saldırısı.
+        return (" UYARI: ServerHello.random downgrade işareti (DOWNGRD) taşıyor — sunucu "
+                "TLS 1.3 destekliyor ama araya giren biri sürümü düşürmüş olabilir.")
+    return (" Sunucu TLS 1.2 ile yanıt verdi; TLS 1.3 desteklemiyor görünüyor. "
+            "TLS 1.2 bilinçli olarak kapsam dışıdır (README).")
+
+
 _SUITE_HASH = {0x1301: hashlib.sha256, 0x1302: hashlib.sha384, 0x1303: hashlib.sha256}
 
 
@@ -252,7 +266,7 @@ def _recv_handshake_message(raw_socket: socket.socket, what: str) -> bytes:
         if rec_type == 20:
             continue
         if rec_type == 21:
-            raise ConnectionError(f"Sunucu el sıkışmayı reddetti (alert): {payload.hex()}")
+            raise ConnectionError(f"Sunucu el sıkışmayı reddetti: {describe_alert(payload)}")
         if rec_type != 22:
             raise ConnectionError(f"{what} beklenirken beklenmeyen record tipi: {rec_type}")
         buf += payload
@@ -363,7 +377,7 @@ class TLSAdapter:
 
         if rec_type == 21:
             raise ConnectionError(
-                f"Sunucu el sıkışmayı reddetti (alert): {server_hello_payload.hex()}"
+                f"Sunucu el sıkışmayı reddetti: {describe_alert(server_hello_payload)}"
             )
         if rec_type != 22:
             raise ConnectionError(f"ServerHello beklenirken beklenmeyen record tipi: {rec_type}")
@@ -397,6 +411,7 @@ class TLSAdapter:
             raise ConnectionError(
                 f"Sunucu desteklenmeyen bir cipher suite seçti: 0x{cipher_suite:04x}. "
                 f"Bu istemci yalnızca TLS 1.3 suite'lerini destekler."
+                + _tls12_hint(sh_body)
             )
         if hrr is not None and cipher_suite != hrr.cipher_suite:
             raise ConnectionError(
