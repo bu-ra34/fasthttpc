@@ -107,7 +107,8 @@ def parse_server_hello(sh_msg: bytes, sent_session_id: bytes | None = None) -> d
     """ServerHello (4 byte handshake başlığı DAHİL) mesajını ayrıştırır ve doğrular.
 
     Döner: {random, session_id, cipher_suite, selected_version, selected_group,
-            server_pub, is_hrr, cookie, extensions}
+            server_pub, is_hrr, cookie, selected_identity, extensions}
+    selected_identity: pre_shared_key (ext 41) kabul edildiyse u16, yoksa None.
     HRR'de key_share yalnızca grup içerir -> server_pub=None.
     Grup/anahtar uzunluğu kontrolü çağırana bırakılır.
     Hata: TLSProtocolError.
@@ -162,7 +163,7 @@ def parse_server_hello(sh_msg: bytes, sent_session_id: bytes | None = None) -> d
         extensions.append((ext_type, body[curr:curr + ext_len]))
         curr += ext_len
 
-    selected_version = selected_group = None
+    selected_version = selected_group = selected_identity = None
     server_pub = cookie = None
     for ext_type, data in extensions:
         if ext_type == 43:
@@ -181,6 +182,10 @@ def parse_server_hello(sh_msg: bytes, sent_session_id: bytes | None = None) -> d
                 if klen != len(data) - 4 or klen == 0:
                     raise TLSProtocolError("decode_error: key_share anahtar uzunluğu hatalı.")
                 server_pub = data[4:]
+        elif ext_type == 41:
+            if is_hrr or len(data) != 2:
+                raise TLSProtocolError("illegal_parameter: pre_shared_key extension hatalı.")
+            selected_identity = struct.unpack("!H", data)[0]
         elif ext_type == 44:
             if len(data) < 2 or struct.unpack("!H", data[:2])[0] != len(data) - 2:
                 raise TLSProtocolError("decode_error: cookie extension bozuk.")
@@ -204,6 +209,7 @@ def parse_server_hello(sh_msg: bytes, sent_session_id: bytes | None = None) -> d
         "server_pub": server_pub,
         "is_hrr": is_hrr,
         "cookie": cookie,
+        "selected_identity": selected_identity,
         "extensions": extensions,
     }
 

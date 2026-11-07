@@ -233,3 +233,11 @@ def test_downgrd_isareti_mesajda():
     body = b"\x03\x03" + rnd + b"\x20" + SID + b"\xc0\x2f\x00" + struct.pack("!H", 0)
     with pytest.raises(TLSProtocolError, match="downgrade saldırısı"):
         parse_server_hello(hs(2, body), SID)
+
+
+def test_pre_shared_key_selected_identity():
+    sh = parse_server_hello(server_hello(SID, PUB, extra_exts=ext(41, b"\x00\x00")), SID)
+    assert sh["selected_identity"] == 0
+    assert parse_server_hello(server_hello(SID, PUB), SID)["selected_identity"] is None
+    with pytest.raises(TLSProtocolError, match="pre_shared_key"):
+        parse_server_hello(server_hello(SID, PUB, extra_exts=ext(41, b"\x00")), SID)
