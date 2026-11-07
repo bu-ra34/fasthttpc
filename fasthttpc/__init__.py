@@ -31,7 +31,9 @@ _os.environ.setdefault("CRYPTOGRAPHY_OPENSSL_NO_LEGACY", "1")
 
 from .session       import Session
 from .async_session import AsyncSession
-from .timeout       import Timeout
+from .config        import Timeout, Limits
+from .retry         import Retry
+from .transport.mock import MockTransport, BaseTransport
 from .multipart     import encode_multipart
 from .models.response import Response, HTTPStatusError
 from .models.request  import Request
@@ -67,6 +69,10 @@ __all__ = [
     "Session",
     "AsyncSession",
     "Timeout",
+    "Limits",
+    "Retry",
+    "MockTransport",
+    "BaseTransport",
     "encode_multipart",
     "Response",
     "HTTPStatusError",

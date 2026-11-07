@@ -1,5 +1,31 @@
 # Changelog
 
+## [Unreleased]
+
+### Eklendi
+
+- **`verify` parametresi** — `Session(verify="yol/ca.pem")` /
+  `AsyncSession(verify=...)`: özel/kurumsal CA bundle'ı. Verilen dosya tek güven
+  kökü olur. `verify=False` bilinçli olarak desteklenmez (`ValueError`).
+  `validate_server_certificate(hs_payload, hostname, ca_path=None)` ve
+  `TLSAdapter.negotiate(..., *, ca_path=None)` opsiyonel parametre aldı.
+- **`fasthttpc.config`** — httpx benzeri `Timeout(connect, read, write, pool)` ve
+  `Limits(max_connections, max_keepalive_connections, keepalive_expiry)`;
+  `Session(limits=...)`. `fasthttpc.timeout.Timeout` aynı sınıfı yeniden ihraç
+  eder; float timeout ve eski `Timeout(connect=, read=)` çağrıları çalışmaya devam eder.
+- **`fasthttpc.retry.Retry`** — urllib3 benzeri yeniden deneme: `total`,
+  `backoff_factor`, `status_forcelist`, `allowed_methods` (varsayılan idempotent),
+  `Retry-After` desteği, bağlantı hatalarında yeniden deneme.
+  `Session(retries=...)`, `AsyncSession(retries=...)`.
+- **`fasthttpc.transport.mock.MockTransport`** — `handler(request) -> Response`
+  ile ağsız test; `Session(transport=...)`, `AsyncSession(transport=...)`.
+- CI: GitHub Actions (pytest, Python 3.10–3.13) + ruff (kritik kurallar).
+
+### Düzeltildi
+
+- `examples/05_async_session.py` yinelenen `impersonate` argümanı yüzünden
+  sözdizimi hatası veriyordu.
+
 ## [0.2.4] — 2026-09-04
 
 `appdata_diagnose.py`'nin ham byte çıktısı, üç turdur peşinde olduğumuz

@@ -145,10 +145,14 @@ def _parse_tls13_certificate_message(hs_payload: bytes) -> list[bytes]:
     return certs
 
 
-def validate_server_certificate(hs_payload: bytes, hostname: str) -> x509.Certificate:
+def validate_server_certificate(
+    hs_payload: bytes, hostname: str, ca_path: "str | None" = None
+) -> x509.Certificate:
     """
     Sunucudan gelen TLS 1.3 Certificate mesajını doğrular:
       1. Zincir, güvenilir bir CA'ya (certifi bundle) kadar kurulabiliyor mu?
+         ``ca_path`` verilirse güven kökü YALNIZCA o PEM dosyasıdır
+         (kurumsal/özel CA); certifi ve sistem deposu kullanılmaz.
       2. Sertifika süresi geçerli mi (expired/not-yet-valid değil mi)?
       3. Hostname, sertifikanın SAN alanıyla eşleşiyor mu?
 
@@ -186,13 +190,18 @@ def validate_server_certificate(hs_payload: bytes, hostname: str) -> x509.Certif
 
     try:
         ca_bundle_pem = b""
-        with open(certifi.where(), "rb") as f:
-            ca_bundle_pem += f.read()
+        if ca_path is not None:
+            with open(ca_path, "rb") as f:
+                ca_bundle_pem = f.read()
+        else:
+            with open(certifi.where(), "rb") as f:
+                ca_bundle_pem += f.read()
 
         # Sistemin kendi güven deposunu da ekle (ör. kurumsal/sandbox proxy CA'ları
         # veya yönetici tarafından eklenmiş özel kök sertifikalar için). Bu, curl/requests'in
         # sistem CA bundle + certifi birleşimiyle çalışma şekline benzer.
-        for sys_ca_path in ("/etc/ssl/certs/ca-certificates.crt", "/etc/pki/tls/certs/ca-bundle.crt"):
+        for sys_ca_path in (() if ca_path is not None else
+                            ("/etc/ssl/certs/ca-certificates.crt", "/etc/pki/tls/certs/ca-bundle.crt")):
             try:
                 with open(sys_ca_path, "rb") as f:
                     ca_bundle_pem += b"\n" + f.read()

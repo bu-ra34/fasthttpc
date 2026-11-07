@@ -593,7 +593,8 @@ def _read_server_hello(raw_socket: socket.socket, allow_ccs: bool = True) -> byt
 
 class TLSAdapter:
     @staticmethod
-    def negotiate(raw_socket: socket.socket, host: str, profile_name: str) -> EncryptedSocket:
+    def negotiate(raw_socket: socket.socket, host: str, profile_name: str,
+                  *, ca_path: "str | None" = None) -> EncryptedSocket:
         impersonator = TLSImpersonator(host, profile=profile_name)
         record_bytes, priv_key, _c_rand = impersonator.build_client_hello()
         sent_session_id = _client_hello_session_id(record_bytes)
@@ -703,7 +704,7 @@ class TLSAdapter:
                         effective_payload = hs_payload
 
                     try:
-                        leaf_cert = validate_server_certificate(effective_payload, host)
+                        leaf_cert = validate_server_certificate(effective_payload, host, ca_path=ca_path)
                     except CertificateValidationError as e:
                         raise ConnectionError(
                             f"TLS sertifika doğrulaması başarısız — bağlantı güvenli değil, "
