@@ -434,8 +434,8 @@ class Session:
                         k_str = k.strip().decode("latin-1")
                         v_str = v.strip().decode("latin-1")
                         resp_headers.add(k_str, v_str)
-                    except Exception:
-                        pass
+                    except (UnicodeDecodeError, ValueError) as e:
+                        logger.debug("Geçersiz yanıt header'ı atlandı %r: %s", line[:80], e)
 
                              
                 status_code = 0
@@ -510,8 +510,8 @@ class Session:
                         logger.debug("Bayat bağlantı, yeniden deneniyor (%s)", e)
                         continue
                 raise
-            except Exception:
-                # Beklenmeyen hata (encoding, parsing, vb.) — bağlantıyı havuzda
+            except BaseException:
+                # Beklenmeyen hata (encoding, parsing, KeyboardInterrupt vb.) — bağlantıyı havuzda
                 # yarım bırakmamak için kapatıp semaphore'u serbest bırak.
                 if conn is not None:
                     conn.close()

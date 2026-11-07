@@ -301,7 +301,8 @@ class AsyncSession:
                 writer.close()
                 await writer.wait_closed()
                 return host, True
-            except Exception:
+            except (OSError, asyncio.TimeoutError) as e:  # ssl.SSLError ⊂ OSError
+                logger.debug("Ön ısıtma başarısız %s: %s", host, e)
                 return host, False
 
         tasks = [_warm_one(h) for h in hosts for _ in range(count)]
@@ -411,8 +412,8 @@ class AsyncSession:
                 status_code = 0
                 try:
                     status_code = int(lines[0].decode("ascii", errors="ignore").split(" ", 2)[1])
-                except Exception:
-                    pass
+                except (IndexError, ValueError):
+                    logger.debug("Status satırı ayrıştırılamadı: %r", lines[0][:80])
 
                 resp_headers = Headers()
                 for line in lines[1:]:
@@ -453,7 +454,7 @@ class AsyncSession:
                         nl2 = raw_b.find(b"\r\n", p2)
                         if nl2 == -1: break
                         try: sz2 = int(raw_b[p2:nl2].split(b";")[0].strip(), 16)
-                        except: break
+                        except ValueError: break
                         if sz2 == 0: break
                         p2 = nl2 + 2
                         decoded.extend(raw_b[p2:p2 + sz2])
@@ -513,8 +514,8 @@ class AsyncSession:
                 writer.close()
                 try:
                     await writer.wait_closed()
-                except Exception:
-                    pass
+                except OSError as e:  # ssl kapanış hataları dahil
+                    logger.debug("wait_closed hatası yok sayıldı: %s", e)
 
                               
                 resp = await self._run_response_hooks(resp)
@@ -741,8 +742,8 @@ class AsyncWebSocket:
         self._writer.close()
         try:
             await self._writer.wait_closed()
-        except Exception:
-            pass
+        except OSError as e:
+            logger.debug("WebSocket wait_closed hatası yok sayıldı: %s", e)
 
     async def __aenter__(self): return self
     async def __aexit__(self, *a): await self.close()
