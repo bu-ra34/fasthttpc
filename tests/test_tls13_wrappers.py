@@ -167,3 +167,41 @@ def test_async_mitm_reddedilir(pki, trust):
                 await AsyncTLSStream.connect("127.0.0.1", port, "chrome_131",
                                              server_hostname=HOST, **trust)
     asyncio.run(asyncio.wait_for(main(), 10))
+
+
+# ------------------------------------------------- AsyncSession entegrasyonu
+def test_async_session_impersonate_tls13_cekirdegini_kullanir(tmp_path, monkeypatch):
+    """AsyncSession(impersonate=...) artık stdlib ssl değil, tls13 çekirdeğini kullanır."""
+    import warnings
+    from fasthttpc import AsyncSession
+    from tls13_fakeserver import parse_client_hello
+
+    lpki = PKI("localhost")
+    ca = tmp_path / "ca.pem"
+    ca.write_bytes(lpki.ca_pem())
+
+    class _Certifi:
+        @staticmethod
+        def where():
+            return str(ca)
+
+    monkeypatch.setattr(cv, "certifi", _Certifi)
+
+    async def main():
+        srv, port, servers = await _start(lpki, http_responder(b"parmak izi tamam"))
+        async with srv:
+            with warnings.catch_warnings():
+                warnings.simplefilter("error")      # artık uyarı yok
+                s = AsyncSession(impersonate="chrome_131", timeout=5)
+            if hasattr(s, "_ca_path") and s._ca_path is None:
+                s._ca_path = str(ca)
+            resp = await s.get(f"https://localhost:{port}/yol")
+            assert resp.status_code == 200
+            assert resp.body == b"parmak izi tamam"
+            assert s.cookies.get("s") == "1"
+            ch = servers[0].client_hellos[0]
+            assert ch["alpn"] == ["http/1.1"]
+            assert ch["exts"][0][5:].decode() == "localhost"     # SNI
+            assert servers[0].requests[0].startswith(b"GET /yol HTTP/1.1\r\n")
+            await s.close()
+    asyncio.run(asyncio.wait_for(main(), 10))
