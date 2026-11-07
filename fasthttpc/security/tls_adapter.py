@@ -30,6 +30,7 @@ from ..crypto_math import (
 )
 from ..tls_crafter import TLSImpersonator
 from .._log import get_logger
+from . import session_tickets
 from .cert_validator import (
     validate_server_certificate,
     verify_certificate_verify,
@@ -228,7 +229,8 @@ class EncryptedSocket:
         if not msg:
             return
         hs_type = msg[0]
-        if hs_type == 4:      # NewSessionTicket — resumption yok, yok say
+        if hs_type == 4:      # NewSessionTicket
+            self._on_new_session_ticket(msg)
             return
         if hs_type == 24:     # KeyUpdate
             # Doğru yanıt anahtarları döndürmektir; bu basit istemci key update
@@ -237,6 +239,36 @@ class EncryptedSocket:
             logger.debug("KeyUpdate alındı ama işlenmiyor (implemente edilmedi)")
             return
         logger.debug("Bilinmeyen post-handshake mesajı hs_type=%d, yok sayıldı", hs_type)
+
+
+    def _on_new_session_ticket(self, msg: bytes) -> None:
+        """NewSessionTicket'ları PSK resumption önbelleğine yazar (faz4).
+
+        Yalnızca resumption bayrağı açık bir handshake'te resumption_master_secret
+        türetilmişse çalışır; aksi halde bilet eskisi gibi yutulur. Bozuk bilet
+        bağlantıyı düşürmez (resumption bir optimizasyondur), yalnızca loglanır.
+        Bir record'da birden fazla NewSessionTicket art arda gelebilir.
+        """
+        rms = self.state.get("resumption_master_secret")
+        host = self.state.get("ticket_host")
+        if not rms or not host:
+            return
+        pos = 0
+        while pos + 4 <= len(msg) and msg[pos] == 4:
+            end = pos + 4 + int.from_bytes(msg[pos + 1:pos + 4], "big")
+            try:
+                nst = session_tickets.parse_new_session_ticket(msg[pos:end])
+            except session_tickets.TicketError as e:
+                logger.debug("NewSessionTicket ayrıştırılamadı, yok sayıldı: %s", e)
+                return
+            ticket = session_tickets.ticket_from_message(
+                host, nst, rms, self.state.get("cipher_suite", 0),
+                peer_certificate=self.state.get("peer_certificate"),
+            )
+            if ticket is not None:
+                session_tickets.default_cache.put(ticket)
+                logger.debug("Oturum bileti önbelleğe alındı: host=%s lifetime=%ds", host, ticket.lifetime)
+            pos = end
 
 
 def _parse_alpn_from_encrypted_extensions(hs_payload: bytes) -> str:
@@ -263,7 +295,18 @@ class TLSAdapter:
     @staticmethod
     def negotiate(raw_socket: socket.socket, host: str, profile_name: str) -> EncryptedSocket:
         impersonator = TLSImpersonator(host, profile=profile_name)
-        record_bytes, priv_key, _c_rand = impersonator.build_client_hello()
+
+        # PSK resumption (faz4) — VARSAYILAN KAPALI; bkz. session_tickets.enable_resumption.
+        resumption_on = session_tickets.resumption_enabled()
+        ticket = session_tickets.default_cache.pop(host) if resumption_on else None
+        psk_hello = (
+            session_tickets.build_resumption_client_hello(impersonator, ticket) if ticket else None
+        )
+        if psk_hello is None:
+            ticket = None
+            record_bytes, priv_key, _c_rand = impersonator.build_client_hello()
+        else:
+            record_bytes, priv_key, _c_rand = psk_hello
 
         raw_socket.sendall(record_bytes)
 
@@ -328,6 +371,7 @@ class TLSAdapter:
         curr = offset + 5
         ext_end = min(curr + extensions_len, len(sh_body))
         is_tls13, server_pub = False, None
+        psk_selected = None
 
         while curr + 4 <= ext_end:
             ext_type, ext_len = struct.unpack("!HH", sh_body[curr:curr + 4])
@@ -342,6 +386,8 @@ class TLSAdapter:
                         f"Sunucu x25519 dışında bir grup seçti (0x{group:04x}); desteklenmiyor."
                     )
                 server_pub = sh_body[curr + 4:curr + 4 + key_len_val]
+            elif ext_type == session_tickets.EXT_PRE_SHARED_KEY and ext_len == 2:
+                psk_selected = struct.unpack("!H", sh_body[curr:curr + 2])[0]
             curr += ext_len
 
         if not is_tls13:
@@ -354,14 +400,33 @@ class TLSAdapter:
                 "ServerHello geçerli bir x25519 key_share içermiyor — handshake tamamlanamaz."
             )
 
+        psk_accepted = psk_selected is not None
+        if psk_accepted:
+            if ticket is None or psk_selected != 0:
+                raise ConnectionError(
+                    "Sunucu teklif etmediğimiz bir PSK kimliğini seçti — protokol ihlali."
+                )
+            if session_tickets._SUITE_HASH.get(cipher_suite) is not ticket.hash_alg:
+                raise ConnectionError(
+                    "Sunucu PSK'yı kabul etti ama biletin hash'iyle uyumsuz bir cipher suite seçti."
+                )
+
         state["is_tls13"] = True
 
         # ---- Handshake anahtarları ------------------------------------------
         shared = PureCryptoEngine.x25519(priv_key, server_pub)
         t_hash = hash_func(state["handshake_messages"]).digest()
-        hs, ck, civ, sk, siv, c_hts, s_hts = PureCryptoEngine.derive_tls13_keys(
-            shared, t_hash, state["key_len"], hash_alg=hash_func
-        )
+        if psk_accepted:
+            hs, ck, civ, sk, siv, c_hts, s_hts = session_tickets.derive_handshake_keys_psk(
+                ticket.psk, shared, t_hash, state["key_len"], hash_alg=hash_func
+            )
+            state["peer_certificate"] = ticket.peer_certificate
+            state["resumed"] = True
+            logger.debug("PSK resumption kabul edildi: host=%s", host)
+        else:
+            hs, ck, civ, sk, siv, c_hts, s_hts = PureCryptoEngine.derive_tls13_keys(
+                shared, t_hash, state["key_len"], hash_alg=hash_func
+            )
         state.update({
             "client_write_key": ck, "client_write_iv": civ,
             "server_write_key": sk, "server_write_iv": siv,
@@ -406,6 +471,13 @@ class TLSAdapter:
                 if hs_type == _HS_ENCRYPTED_EXTENSIONS:
                     state["alpn"] = _parse_alpn_from_encrypted_extensions(hs_payload)
 
+                elif hs_type in (_HS_CERTIFICATE, _HS_COMPRESSED_CERTIFICATE, _HS_CERTIFICATE_VERIFY) \
+                        and psk_accepted:
+                    raise ConnectionError(
+                        "PSK ile devam edilen oturumda sunucu Certificate/CertificateVerify "
+                        "gönderdi — protokol ihlali (RFC 8446 §4.4.2)."
+                    )
+
                 elif hs_type in (_HS_CERTIFICATE, _HS_COMPRESSED_CERTIFICATE):
                     if hs_type == _HS_COMPRESSED_CERTIFICATE:
                         try:
@@ -438,12 +510,14 @@ class TLSAdapter:
                     cert_verify_ok = True
 
                 elif hs_type == _HS_FINISHED:
-                    if not certificate_seen:
+                    # PSK resumption'da kimlik, bileti veren orijinal (tam doğrulanmış)
+                    # handshake'ten devralınır; Certificate/CertificateVerify gelmez.
+                    if not psk_accepted and not certificate_seen:
                         raise ConnectionError(
                             "Handshake Finished'a ulaştı ama sunucu sertifikası hiç doğrulanmadı — "
                             "bağlantı reddedildi."
                         )
-                    if not cert_verify_ok:
+                    if not psk_accepted and not cert_verify_ok:
                         raise ConnectionError(
                             "Sunucu CertificateVerify göndermedi veya doğrulanamadı — sertifikadaki "
                             "özel anahtara sahip olduğunu kanıtlayamadı. Bağlantı reddedildi."
@@ -475,6 +549,15 @@ class TLSAdapter:
         finished_msg = b"\x14" + struct.pack("!I", len(mac))[1:] + mac
 
         esock.send_record(finished_msg, content_type=0x16, use_app_keys=False)
+
+        if resumption_on:
+            state["resumption_master_secret"] = session_tickets.derive_resumption_master_secret(
+                state["handshake_secret"],
+                hash_func(state["handshake_messages"] + finished_msg).digest(),
+                hash_alg=hash_func,
+            )
+            state["cipher_suite"] = cipher_suite
+            state["ticket_host"] = host
 
         # ---- Application anahtarları -------------------------------------------
         ak, aiv, ask_key, asiv = PureCryptoEngine.derive_application_keys(
