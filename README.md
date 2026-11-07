@@ -160,7 +160,7 @@ fasthttpc/
 ├── cookies.py          # RFC 6265 cookie jar (domain/path/Secure)
 ├── tls_crafter.py      # ClientHello oluşturucu
 ├── tls_tools.py        # TLS yardımcıları
-├── crypto_math.py      # Key schedule + saf Python crypto yedeği
+├── crypto_math.py      # Key schedule + OpenSSL (cryptography) AEAD/X25519 sarmalayıcıları
 ├── fingerprint.py      # Tarayıcı profilleri, JA3
 ├── buffer.py           # Adaptif alıcı buffer
 ├── cache.py            # Response cache
