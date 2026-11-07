@@ -142,10 +142,6 @@ def parse_server_hello(sh_msg: bytes, sent_session_id: bytes | None = None) -> d
     if len(body) < offset + 5:
         raise TLSProtocolError("decode_error: ServerHello mesajı bozuk (cipher suite okunamadı).")
     session_id = body[35:offset]
-    if sent_session_id is not None and session_id != sent_session_id:
-        raise TLSProtocolError(
-            "illegal_parameter: ServerHello legacy_session_id_echo gönderilen session_id ile eşleşmiyor."
-        )
 
     cipher_suite = struct.unpack("!H", body[offset:offset + 2])[0]
     if body[offset + 2] != 0:
@@ -207,6 +203,13 @@ def parse_server_hello(sh_msg: bytes, sent_session_id: bytes | None = None) -> d
         raise TLSProtocolError(
             "protocol_version: Sunucu TLS 1.3 (supported_versions=0x0304) müzakere etmedi. Bu istemci "
             "TLS 1.2 ve altını desteklemez; downgrade kabul edilmiyor." + hint
+        )
+    # Sürüm kontrolünden SONRA: TLS 1.2 ServerHello'su session_id'mizi geri
+    # göndermek zorunda değildir; önce kontrol edilirse kullanıcı TLS 1.2
+    # yerine yanıltıcı bir "session_id eşleşmiyor" hatası görür.
+    if sent_session_id is not None and session_id != sent_session_id:
+        raise TLSProtocolError(
+            "illegal_parameter: ServerHello legacy_session_id_echo gönderilen session_id ile eşleşmiyor."
         )
 
     return {
