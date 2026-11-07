@@ -142,7 +142,10 @@ def test_anahtar_takvimi_eski_yolla_ayni():
     for h, kl in ((hashlib.sha256, 16), (hashlib.sha384, 32)):
         hs_secret, th = h(b"hs").digest(), h(b"t").digest()
         c, s = application_traffic_secrets(hs_secret, th, h)
-        ck, civ, sk, siv = P.derive_application_keys(hs_secret, th, kl, hash_alg=h)
+        res = P.derive_application_keys(hs_secret, th, kl, hash_alg=h)
+        ck, civ, sk, siv = res[:4]
+        if len(res) == 6:  # faz1 sonrası secret'lar da dönüyor
+            assert res[4:] == (c, s)
         assert P.tls13_hkdf_expand_label(c, "key", b"", kl, hash_alg=h) == ck
         assert P.tls13_hkdf_expand_label(s, "iv", b"", 12, hash_alg=h) == siv
 
@@ -339,3 +342,18 @@ def test_hrr_zaten_teklif_edilen_grup_reddedilir(pki, trust):
     conn = TLSClientConnection(HOST, "chrome_131", impersonator=imp, **trust)
     with pytest.raises(TLSError, match="illegal_parameter"):
         handshake(conn, server)
+
+
+@pytest.mark.skipif(not hasattr(TLSImpersonator, "build_retry_client_hello"),
+                    reason="faz2 (HRR crafter) henüz birleştirilmedi")
+def test_hrr_gercek_impersonator_ile(pki, trust):
+    """faz2 merge sonrası: gerçek TLSImpersonator.build_retry_client_hello yolu."""
+    imp = TLSImpersonator(HOST, profile="chrome_131")
+    offered = core_mod._offered_groups(imp)
+    candidates = [g for g in core_mod._supported_groups() if g not in offered and g in (0x0017, 0x0018)]
+    if not candidates:
+        pytest.skip("teklif edilmemiş desteklenen grup yok")
+    server = FakeTLS13Server(pki, hrr_group=candidates[0], hrr_cookie=b"c00k")
+    conn = TLSClientConnection(HOST, "chrome_131", impersonator=imp, **trust)
+    handshake(conn, server)
+    assert conn.handshake_complete and len(server.client_hellos) == 2
