@@ -266,8 +266,9 @@ class FakeTLS13Server:
         assert hmac.compare_digest(cfin[4:], hmac.new(cfk, app_hash, hash_alg).digest()), \
             "client Finished geçersiz"
 
+        # [:4] — faz1 dönüşe trafik secret'larını da ekliyor (KeyUpdate için).
         ak, aiv, ask, asiv = PureCryptoEngine.derive_application_keys(
-            hs_secret, app_hash, key_len, hash_alg=hash_alg)
+            hs_secret, app_hash, key_len, hash_alg=hash_alg)[:4]
         self.handshake_ok = True
         try:
             req, _t = recv_enc(ak, aiv, [0])
