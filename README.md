@@ -26,13 +26,35 @@ değişimini yapabilir. Herhangi biri başarısız olursa bağlantı reddedilir.
 Güven kökü olarak `certifi` bundle'ı + varsa sistem CA deposu kullanılır.
 Sertifika doğrulamayı kapatmanın bir yolu yoktur; bu kasıtlıdır.
 
+### `verify`: özel CA bundle
+
+Kurumsal ağlarda (iç CA, TLS denetleyen proxy) kendi CA'nızı verebilirsiniz:
+
+```python
+with Session(verify="/etc/kurum/ca.pem") as s:   # yalnızca bu CA'lara güvenilir
+    s.get("https://intranet.kurum.local/")
+```
+
+- `verify=True` (varsayılan): `certifi` + sistem CA deposu.
+- `verify="yol/ca.pem"`: güven kökü **yalnızca** bu PEM dosyasındaki
+  sertifikalardır (requests'in `verify="ca.pem"` semantiği). Dosya yoksa
+  `FileNotFoundError`. CertificateVerify ve Finished kontrolleri aynen yapılır.
+- `verify=False` **desteklenmez** ve `ValueError` verir. Doğrulamasız TLS,
+  araya giren herkesin trafiği okuyup değiştirebildiği bir bağlantıdır; bunu
+  bir bayrağa bağlamak yerine güvenmek istediğiniz CA'yı açıkça vermenizi
+  istiyoruz. Kendinden imzalı bir test sunucusu için de o sertifikayı (veya
+  imzalayan CA'yı) `verify=` ile verin.
+
+`AsyncSession(verify=...)` da aynı kuralları uygular (stdlib `ssl`'e `cafile`
+olarak iletilir).
+
 ## Kurulum
 
 ```bash
 git clone https://github.com/kullanici/fasthttpc
 cd fasthttpc
 pip install -e ".[dev]"
-pytest        # 84 test, ağ gerektirmez
+pytest        # ağ gerektirmez
 ```
 
 ## Hızlı başlangıç
@@ -61,14 +83,87 @@ async def main():
 asyncio.run(main())
 ```
 
-### Timeout
+### Timeout ve Limits
+
+httpx'e benzer `Timeout` ve `Limits` (`fasthttpc.config`):
 
 ```python
-from fasthttpc import Session, Timeout
+from fasthttpc import Session, Timeout, Limits
 
-with Session(timeout=Timeout(connect=5.0, read=30.0)) as s:
+with Session(
+    timeout=Timeout(10.0, connect=5.0),   # connect=5, read/write/pool=10
+    limits=Limits(max_connections=20, max_keepalive_connections=5,
+                  keepalive_expiry=30.0),
+) as s:
     r = s.get("https://example.com")
 ```
+
+| `Timeout` alanı | Anlamı |
+|---|---|
+| `connect` | TCP bağlantısı + TLS el sıkışması |
+| `read` | Sunucudan veri bekleme |
+| `write` | Veri gönderme (şimdilik senkron tarafta `read` ile aynı soket zaman aşımını paylaşır) |
+| `pool` | Havuzdan boş bağlantı bekleme (verilmezse `connect`) |
+
+Geriye dönük uyumluluk: `Session(timeout=30)` ve `Timeout(connect=5, read=30)`
+eskisi gibi çalışır; `from fasthttpc.timeout import Timeout` aynı sınıftır.
+`limits` verilmezse `max_connections` parametresi kullanılır.
+
+| `Limits` alanı | Varsayılan | Anlamı |
+|---|---|---|
+| `max_connections` | 10 | Origin başına eşzamanlı bağlantı |
+| `max_keepalive_connections` | `None` (= `max_connections`) | Havuzda boşta tutulan bağlantı |
+| `keepalive_expiry` | 30.0 | Boştaki bağlantının ömrü (sn); `None` → sınırsız |
+
+### Yeniden deneme (`retries`)
+
+urllib3 `Retry` benzeri bir politika (`fasthttpc.retry`):
+
+```python
+from fasthttpc import Session, Retry
+
+retry = Retry(total=5, backoff_factor=0.5, status_forcelist=(429, 502, 503, 504))
+with Session(retries=retry) as s:     # Session(retries=3) == Retry(total=3)
+    r = s.get("https://api.example.com/items")
+```
+
+- Varsayılan kapalıdır (`retries=None`).
+- Yalnızca `allowed_methods` yeniden denenir; varsayılan idempotent metotlar
+  (GET, HEAD, PUT, DELETE, OPTIONS, TRACE). POST/PATCH için
+  `allowed_methods=None` vermeniz gerekir.
+- Bağlantı hataları (`ConnectionError`, `TimeoutError`, `OSError`) yeniden
+  denenir; sertifika doğrulama hataları **asla** yeniden denenmez.
+- 413/429/503 yanıtlarındaki `Retry-After` (saniye veya HTTP-date) bekleme
+  süresi olarak kullanılır (`backoff_max` ile sınırlı, varsayılan 120 sn).
+- Bekleme: `backoff_factor * 2 ** (n - 1)`. Denemeler tükenince son yanıt
+  döner veya son hata fırlatılır.
+- Redirect zincirindeki her adım ayrı ayrı yeniden denenir.
+
+### Ağsız test: `MockTransport`
+
+`httpx.MockTransport` benzeri; TLS/havuz/proxy katmanlarını atlar, redirect,
+çerez ve retry gibi Session davranışları aynen çalışır:
+
+```python
+from fasthttpc import Session, Response, MockTransport
+
+def handler(request):
+    if request.url.path == "/login":
+        return Response(200, headers={"Set-Cookie": "sid=1"})
+    return Response(200, headers={"Content-Type": "application/json"},
+                    body=b'{"ok": true}')
+
+transport = MockTransport(handler)
+with Session(transport=transport) as s:
+    s.get("https://api.example.com/login")
+    assert s.get("https://api.example.com/me").json() == {"ok": True}
+assert len(transport.requests) == 2
+```
+
+Handler'ın fırlattığı istisnalar çağırana iletilir (retry testleri için).
+`AsyncSession(transport=...)` ile handler `async def` de olabilir. Kendi
+transport'unuz için `fasthttpc.transport.mock.BaseTransport`'tan türetip
+`handle_request(request) -> Response` yazmanız yeterli.
 
 ### Plugin'ler
 
@@ -150,12 +245,17 @@ verir veya belgelenmiştir:
   izinde küçük bir sapma yaratır.
 - **key_share yalnızca x25519.** Chrome ayrıca X25519MLKEM768 gönderir.
 - `Session` thread-safe değildir; thread başına bir tane kullanın.
+- **`verify=False` yok** (bilinçli; yukarıya bakın).
+- `Timeout.write` senkron tarafta ayrı uygulanmıyor (soket `read` zaman aşımını
+  kullanır); `AsyncSession` yalnızca tek bir `timeout` float'ı kabul eder.
 
 ## Modül yapısı
 
 ```
 fasthttpc/
 ├── session.py          # Sync HTTP istemcisi
+├── config.py           # Timeout, Limits, verify çözümleme
+├── retry.py            # Retry politikası
 ├── async_session.py    # Async istemci + plugin sistemi
 ├── cookies.py          # RFC 6265 cookie jar (domain/path/Secure)
 ├── tls_crafter.py      # ClientHello oluşturucu
@@ -168,7 +268,7 @@ fasthttpc/
 ├── models/             # URL, Headers, Request, Response
 ├── protocol/           # HTTP/1.1, HTTP/2, WebSocket, DoH
 ├── security/           # TLS adapter, sertifika doğrulama
-└── transport/          # Connection pool
+└── transport/          # Connection pool, MockTransport
 ```
 
 ## Testler
