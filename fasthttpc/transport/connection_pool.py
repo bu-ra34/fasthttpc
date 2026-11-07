@@ -17,6 +17,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Optional
 
 from ..models.urls import URL
+from .proxy import ProxyConfig, connect_via_proxy, resolve_proxy
 
 
 from .._log import get_logger
@@ -59,15 +60,24 @@ class HTTPConnection:
         self.h2_conn                = None       # ALPN "h2" ise Http2Connection nesnesi
         self.idle_since: float      = 0.0
 
-    def connect(self, timeout: float = 30.0, resolver=None) -> None:
+    def connect(self, timeout: float = 30.0, resolver=None,
+                proxy: "ProxyConfig | None" = None) -> None:
         """Hedef sunucuya ham TCP bağlantısı kurar (IPv4 + IPv6).
 
         Args:
             resolver: Opsiyonel ``DoHResolver``. Verilirse host adı önce
                 DNS-over-HTTPS ile çözülür; ISP/ağ seviyesindeki DNS
                 gözetimini ve engellemesini atlar.
+            proxy: Opsiyonel ``ProxyConfig``. Verilirse proxy'ye bağlanılıp
+                hedefe tünel (CONNECT/SOCKS5) kurulur; hedef adı proxy'de
+                çözülür (resolver kullanılmaz).
         """
         scheme, host, port = self.origin
+
+        if proxy is not None:
+            self.socket = connect_via_proxy(proxy, host, port, timeout=timeout)
+            self.is_closed = False
+            return
 
         if resolver is not None:
             try:
@@ -171,8 +181,11 @@ class ConnectionPool:
     """
 
     def __init__(self, max_connections: int = 10, timeout: float = 30.0,
-                 idle_timeout: float = DEFAULT_IDLE_TIMEOUT, resolver=None):
+                 idle_timeout: float = DEFAULT_IDLE_TIMEOUT, resolver=None,
+                 proxy=None):
         self.max_connections = max_connections
+        # proxy: None | URL str | ProxyConfig | {"https": url, "all": url}
+        self.proxy           = proxy
         self.timeout         = timeout
         self.idle_timeout    = idle_timeout
         self.resolver        = resolver
@@ -223,7 +236,8 @@ class ConnectionPool:
                                               
         conn = HTTPConnection(origin)
         try:
-            conn.connect(timeout=self.timeout, resolver=self.resolver)
+            conn.connect(timeout=self.timeout, resolver=self.resolver,
+                         proxy=resolve_proxy(self.proxy, url.scheme))
         except Exception:
             # Bağlantı kurulamadı: bu slot için hiç bağlantı verilmeyecek,
             # semaphore'u serbest bırakmazsak kalıcı olarak sızar (havuz asla
@@ -273,7 +287,8 @@ class ConnectionPool:
             origin = (url.scheme, url.host, url.port)
             conn = HTTPConnection(origin)
             try:
-                conn.connect(timeout=self.timeout, resolver=self.resolver)
+                conn.connect(timeout=self.timeout, resolver=self.resolver,
+                             proxy=resolve_proxy(self.proxy, url.scheme))
                 if tls_negotiate_fn:
                     conn.socket = tls_negotiate_fn(conn.socket, url.host, impersonate)
                     conn.tls_established = True
