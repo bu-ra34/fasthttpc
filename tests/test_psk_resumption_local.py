@@ -128,7 +128,7 @@ def test_corrupt_ticket_falls_back_to_full_handshake(tls_server):
     port, results = tls_server
     session_tickets.enable_resumption(True)
     _roundtrip(port, b"one")
-    t = session_tickets.default_cache.pop("localhost")
+    t = session_tickets.default_cache.pop(session_tickets.cache_key("localhost", port))
     t.ticket = b"\x00" * len(t.ticket)  # sunucu bunu çözemez -> PSK reddedilir
     session_tickets.default_cache.clear()
     session_tickets.default_cache.put(t)
@@ -142,12 +142,34 @@ def test_wrong_psk_rejected_by_server(tls_server):
     port, _results = tls_server
     session_tickets.enable_resumption(True)
     _roundtrip(port, b"one")
-    t = session_tickets.default_cache.pop("localhost")
+    t = session_tickets.default_cache.pop(session_tickets.cache_key("localhost", port))
     t.psk = bytes(len(t.psk))
     session_tickets.default_cache.clear()
     session_tickets.default_cache.put(t)
     with pytest.raises((ConnectionError, OSError)):
         _roundtrip(port, b"x")
+
+
+def test_ticket_not_shared_across_trust_roots(tls_server):
+    """ca_path farklıysa (farklı güven kökü) bilet kullanılmamalı."""
+    port, _results = tls_server
+    session_tickets.enable_resumption(True)
+    _roundtrip(port, b"one")
+    assert session_tickets.default_cache.pop(session_tickets.cache_key("localhost", port, "/other/ca.pem")) is None
+    assert session_tickets.default_cache.pop(session_tickets.cache_key("localhost", port + 1)) is None
+    assert session_tickets.default_cache.pop(session_tickets.cache_key("localhost", port)) is not None
+
+
+def test_negotiate_passes_ca_path(tls_server, monkeypatch):
+    port, _results = tls_server
+    seen = []
+    orig = tls_adapter.validate_server_certificate
+    monkeypatch.setattr(tls_adapter, "validate_server_certificate",
+                        lambda p, h, ca_path=None: (seen.append(ca_path), orig(p, h))[1])
+    raw = socket.create_connection(("127.0.0.1", port), timeout=5)
+    tls_adapter.TLSAdapter.negotiate(raw, "localhost", "chrome_131", ca_path="/x/ca.pem")
+    raw.close()
+    assert seen == ["/x/ca.pem"]
 
 
 def test_default_profile_without_psk_modes_skips_resumption(tls_server):
