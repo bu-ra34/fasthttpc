@@ -1,8 +1,10 @@
 import struct
 import os
 import threading
-from .crypto_math import PureCryptoEngine
 from .fingerprint import get_profile, _random_grease
+from .security.keyshare import (
+    KeyShareSet, SUPPORTED_GROUPS, GROUP_X25519, group_name,
+)
 
                                      
                              
@@ -28,11 +30,58 @@ class TLSImpersonator:
         self.target_host = target_host.encode("utf-8")
         self.host_str = target_host
         self.profile = get_profile(profile)
-        self.private_key, self.public_key = PureCryptoEngine.generate_keypair()
         self._grease_cipher = _random_grease()
         self._grease_group = _random_grease()
         self._grease_version = _random_grease()
         self._used_grease_exts = set()
+        # GREASE extension tipleri bağlantı başına bir kez seçilir ve HRR
+        # sonrası 2. ClientHello'da AYNEN tekrarlanır (RFC 8446 §4.1.2: CH2,
+        # key_share/cookie/early_data/pre_shared_key/padding dışında CH1 ile
+        # aynı olmalıdır).
+        self._grease_ext_values: list[int] = []
+        self._grease_ext_idx = 0
+        self.key_shares = KeyShareSet(self._key_share_groups())
+        self._cookie: bytes | None = None
+        self._client_random: bytes | None = None
+        self._session_id: bytes | None = None
+        self.last_client_hello: bytes = b""
+
+    def _key_share_groups(self) -> list[int]:
+        """Profilin key_share olarak göndermek istediği gruplardan GERÇEKTEN
+        desteklenenleri döner.
+
+        Karar (bkz. NOTES/README): desteklemediğimiz bir grup (ör. hibrit
+        X25519MLKEM768) için key_share GÖNDERİLMEZ — sahte/boş bir anahtar
+        göndermek sunucunun o grubu seçip handshake'i kırmasına yol açar.
+        supported_groups listesi parmak izi için olduğu gibi korunur; sunucu
+        HRR ile desteklenmeyen bir grup isterse negotiate() net hata verir.
+        """
+        wanted = self.profile.get("key_share_groups", [GROUP_X25519])
+        groups = [g for g in wanted if isinstance(g, int) and g in SUPPORTED_GROUPS]
+        if not groups:
+            groups = [GROUP_X25519]
+        return groups
+
+    @property
+    def private_key(self):
+        """Geriye dönük uyumluluk: x25519 özel anahtarının ham 32 byte'ı (yoksa None)."""
+        if GROUP_X25519 not in self.key_shares.groups:
+            return None
+        from cryptography.hazmat.primitives import serialization
+        return self.key_shares.private(GROUP_X25519).private_bytes(
+            serialization.Encoding.Raw, serialization.PrivateFormat.Raw,
+            serialization.NoEncryption(),
+        )
+
+    @property
+    def public_key(self):
+        if GROUP_X25519 not in self.key_shares.groups:
+            return None
+        return self.key_shares.public(GROUP_X25519)
+
+    def advertised_groups(self) -> list[int]:
+        """supported_groups uzantısında ilan edilen gruplar (GREASE hariç)."""
+        return [g for g in self.profile.get("supported_groups", []) if isinstance(g, int)]
 
     # GREASE değerleri (RFC 8701). Profillerde "GREASE" placeholder'ı olarak
     # geçer ve her bağlantıda rastgele bir değerle doldurulur.
@@ -75,10 +124,15 @@ class TLSImpersonator:
         return struct.pack("!HH", ext_type, len(payload)) + payload
 
     def _pack_grease_ext(self) -> bytes:
-        val = _random_grease()
-        while val in self._used_grease_exts:
+        if self._grease_ext_idx < len(self._grease_ext_values):
+            val = self._grease_ext_values[self._grease_ext_idx]
+        else:
             val = _random_grease()
-        self._used_grease_exts.add(val)
+            while val in self._used_grease_exts:
+                val = _random_grease()
+            self._used_grease_exts.add(val)
+            self._grease_ext_values.append(val)
+        self._grease_ext_idx += 1
         return self._ext(val, b"")
 
     def _pack_sni(self) -> bytes:
@@ -149,9 +203,12 @@ class TLSImpersonator:
         return self._ext(0x0012, b"")
 
     def _pack_key_share(self) -> bytes:
-        key_entry = struct.pack("!HH32s", 0x001D, 32, self.public_key)
-        payload = struct.pack(f"!H{len(key_entry)}s", len(key_entry), key_entry)
-        return self._ext(0x0033, payload)
+        entries = self.key_shares.entries()
+        ext = self._ext(0x0033, struct.pack("!H", len(entries)) + entries)
+        if self._cookie is not None:
+            # HRR cookie'si (RFC 8446 §4.2.2) 2. ClientHello'da aynen geri yollanır.
+            ext += self._ext(0x002C, struct.pack("!H", len(self._cookie)) + self._cookie)
+        return ext
 
     def _pack_psk_key_exchange_modes(self) -> bytes:
         return self._ext(0x002D, b"\x01\x01")
@@ -182,7 +239,7 @@ class TLSImpersonator:
     def _pack_record_size_limit(self) -> bytes:
         return self._ext(0x001C, struct.pack("!H", 0x4001))
 
-    def _pack_padding(self, ext_body_len: int) -> bytes:
+    def _pack_padding(self, ext_body_len: int, tail_len: int = 0) -> bytes:
         """
         ClientHello toplam uzunluğunu 512 byte'ın katına yuvarlayacak şekilde
         padding ekle (Chrome davranışı).
@@ -202,7 +259,7 @@ class TLSImpersonator:
         # içeriyor; ayrıca 2 eklemek toplamı 2 byte şişirip hedefi kaydırıyordu.
         cipher_len = len(self._build_cipher_suites())
         fixed = 5 + 4 + 2 + 32 + 33 + cipher_len + 2 + 2
-        current_total = fixed + ext_body_len + 4                          
+        current_total = fixed + ext_body_len + tail_len + 4
         target = ((current_total + 511) // 512) * 512
         pad_data_len = target - current_total
         if pad_data_len < 0:
@@ -229,8 +286,10 @@ class TLSImpersonator:
         "record_size_limit":         "_pack_record_size_limit",
     }
 
-    def _build_extensions(self) -> bytes:
+    def _build_extensions(self, extra_tail_extensions: bytes | None = None) -> bytes:
         order = self.profile.get("extensions_order", [])
+        tail = extra_tail_extensions or b""
+        self._grease_ext_idx = 0
         parts = []
         for name in order:
             if name == "padding":
@@ -244,25 +303,62 @@ class TLSImpersonator:
 
         ext_body = b"".join(parts)
 
-                                                           
         if "padding" in order:
-            pad_ext = self._pack_padding(len(ext_body))
-            ext_body += pad_ext
+            ext_body += self._pack_padding(len(ext_body), len(tail))
 
+        # extra_tail_extensions (ör. pre_shared_key) HER ZAMAN en sonda olmalı
+        # (RFC 8446 §4.2.11) — padding'den bile sonra.
+        ext_body += tail
         return struct.pack("!H", len(ext_body)) + ext_body
 
-    def build_client_hello(self) -> tuple[bytes, bytes, bytes]:
+    def build_client_hello(
+        self, extra_tail_extensions: bytes | None = None
+    ) -> tuple[bytes, bytes, bytes]:
+        """İlk ClientHello'yu üretir.
+
+        Döner: (record_bytes, x25519_private_raw | None, client_random).
+        Tüm key_share özel anahtarları ``self.key_shares`` (KeyShareSet) içindedir.
+
+        extra_tail_extensions: verilirse extension listesinin EN SONUNA bayt
+        bayt eklenir (PSK resumption için pre_shared_key — faz4).
+        """
         # RFC 8446 §4.1.2: client_random 32 byte TAM RASTGELE olmalıdır.
         # Eski TLS 1.2 pratiği ilk 4 byte'a gmt_unix_time koyardı; modern
         # tarayıcıların hiçbiri bunu yapmaz, dolayısıyla o alan tek başına
         # "bu bir tarayıcı değil" sinyali veren bir parmak izidir.
-        client_random = os.urandom(32)
-        session_id = os.urandom(32)
-        session_id_payload = struct.pack("!B32s", 32, session_id)
+        self._client_random = os.urandom(32)
+        self._session_id = os.urandom(32)
+        self._cookie = None
+        return self._assemble(extra_tail_extensions), self.private_key, self._client_random
+
+    def build_retry_client_hello(
+        self,
+        group: int,
+        cookie: bytes | None = None,
+        extra_tail_extensions: bytes | None = None,
+    ) -> bytes:
+        """HelloRetryRequest sonrası 2. ClientHello'yu üretir (RFC 8446 §4.1.2).
+
+        Aynı client_random, session_id, cipher listesi, GREASE değerleri ve
+        extension sırası korunur; key_share yalnızca ``group`` için YENİ bir
+        anahtar içerir, HRR'de cookie varsa cookie extension'ı eklenir.
+        Yeni özel anahtar ``self.key_shares`` içindedir.
+        """
+        if self._client_random is None:
+            raise RuntimeError("build_retry_client_hello, build_client_hello'dan önce çağrılamaz.")
+        if group not in SUPPORTED_GROUPS:
+            raise ValueError(f"HRR grubu desteklenmiyor: {group_name(group)}")
+        self.key_shares = KeyShareSet([group])
+        self._cookie = cookie
+        return self._assemble(extra_tail_extensions)
+
+    def _assemble(self, extra_tail_extensions: bytes | None) -> bytes:
+        client_random = self._client_random
+        session_id_payload = struct.pack("!B32s", 32, self._session_id)
 
         cipher_payload = self._build_cipher_suites()
         comp_payload = struct.pack("!BB", 1, 0x00)
-        extensions = self._build_extensions()
+        extensions = self._build_extensions(extra_tail_extensions)
 
         client_hello_body = (
             struct.pack("!H", 0x0303) +
@@ -279,4 +375,4 @@ class TLSImpersonator:
         record_header = struct.pack("!BHH", 0x16, 0x0301, len(full_payload))
 
         self.last_client_hello = record_header + full_payload
-        return self.last_client_hello, self.private_key, client_random
+        return self.last_client_hello
