@@ -10,6 +10,9 @@ import zlib
 from ..models.headers import Headers
 from ..models.response import Response
 from ..buffer import ZeroCopyReader
+from .._log import get_logger
+
+logger = get_logger("http1")
 
                               
 try:
@@ -24,6 +27,13 @@ try:
     _zstd_dctx = _zstd.ZstdDecompressor()
 except ImportError:
     _ZSTD = False
+
+# Bozuk sıkıştırılmış veride beklenen hata tipleri (gerisi yukarı yükselir).
+_DECOMPRESS_ERRORS: tuple = (zlib.error, ValueError, EOFError)
+if _BROTLI:
+    _DECOMPRESS_ERRORS += (getattr(_brotli, "error", ValueError),)
+if _ZSTD:
+    _DECOMPRESS_ERRORS += (_zstd.ZstdError,)
 
 
 class HTTP1Parser:
@@ -114,7 +124,8 @@ class HTTP1Parser:
             if _BROTLI:
                 try:
                     return _brotli.decompress(data)
-                except Exception:
+                except _DECOMPRESS_ERRORS as e:
+                    logger.warning("Brotli açılamadı, ham gövde döndürülüyor: %s", e)
                     return data
                                                       
             return data
@@ -125,7 +136,8 @@ class HTTP1Parser:
             if _ZSTD:
                 try:
                     return _zstd_dctx.decompress(data)
-                except Exception:
+                except _DECOMPRESS_ERRORS as e:
+                    logger.warning("Zstd açılamadı, ham gövde döndürülüyor: %s", e)
                     return data
             return data
 

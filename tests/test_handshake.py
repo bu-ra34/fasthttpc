@@ -139,8 +139,8 @@ def test_tek_hrr_izinli():
 
 @pytest.fixture
 def no_pki(monkeypatch):
-    monkeypatch.setattr(ta, "validate_server_certificate", lambda payload, host: "LEAF")
-    monkeypatch.setattr(ta, "verify_certificate_verify", lambda payload, leaf, th: 0x0804)
+    monkeypatch.setattr(ta, "validate_server_certificate", lambda payload, host, **kw: "LEAF")
+    monkeypatch.setattr(ta, "verify_certificate_verify", lambda payload, leaf, th, **kw: 0x0804)
 
 
 def _negotiate(server, chunk=16384):
