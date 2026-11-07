@@ -46,12 +46,31 @@ _HELLO_RETRY_REQUEST_RANDOM = bytes.fromhex(
 )
 
 # Handshake mesaj tipleri
+_HS_SERVER_HELLO = 2
 _HS_NEW_SESSION_TICKET = 4
 _HS_ENCRYPTED_EXTENSIONS = 8
 _HS_CERTIFICATE = 11
+_HS_CERTIFICATE_REQUEST = 13
 _HS_CERTIFICATE_VERIFY = 15
 _HS_FINISHED = 20
+_HS_KEY_UPDATE = 24
 _HS_COMPRESSED_CERTIFICATE = 25
+
+# RFC 8446 §5.1 / §5.2 — record boyut sınırları
+MAX_PLAINTEXT = 2 ** 14
+MAX_CIPHERTEXT = 2 ** 14 + 256
+# RFC 8446 §5.3 — sequence number 64 bit; taşmadan önce bağlantı kapatılmalı
+_MAX_SEQ_NUM = 2 ** 64 - 1
+# ServerHello için makul üst sınır (birden fazla record'a bölünmüş olabilir)
+_MAX_SERVER_HELLO = 64 * 1024
+
+
+class TLSProtocolError(ConnectionError):
+    """TLS protokol ihlali (RFC 8446 alert türü mesajın başında yer alır)."""
+
+
+def _unexpected(detail: str) -> TLSProtocolError:
+    return TLSProtocolError(f"unexpected_message: {detail}")
 
 
 def _recv_all(sock: socket.socket, length: int) -> bytes:
@@ -66,6 +85,217 @@ def _recv_all(sock: socket.socket, length: int) -> bytes:
     return bytes(data)
 
 
+# ---------------------------------------------------------------------------
+# Soket bağımsız (sans-IO) yardımcılar — fasthttpc/tls13 de bunları kullanır.
+# ---------------------------------------------------------------------------
+
+def suite_params(cipher_suite: int):
+    """TLS 1.3 cipher suite -> (cipher_name, key_len, hash_func)."""
+    if cipher_suite == 0x1301:
+        return "AES", 16, hashlib.sha256
+    if cipher_suite == 0x1302:
+        return "AES", 32, hashlib.sha384
+    if cipher_suite == 0x1303:
+        return "CHACHA20-POLY1305", 32, hashlib.sha256
+    raise TLSProtocolError(
+        f"illegal_parameter: Sunucu desteklenmeyen bir cipher suite seçti: 0x{cipher_suite:04x}. "
+        f"Bu istemci yalnızca TLS 1.3 suite'lerini destekler."
+    )
+
+
+def parse_server_hello(sh_msg: bytes, sent_session_id: bytes | None = None) -> dict:
+    """ServerHello (4 byte handshake başlığı DAHİL) mesajını ayrıştırır ve doğrular.
+
+    Döner: {random, session_id, cipher_suite, selected_version, selected_group,
+            server_pub, is_hrr, cookie, extensions}
+    HRR'de key_share yalnızca grup içerir -> server_pub=None.
+    Grup/anahtar uzunluğu kontrolü çağırana bırakılır.
+    Hata: TLSProtocolError.
+    """
+    if len(sh_msg) < 4:
+        raise TLSProtocolError("decode_error: ServerHello başlığı eksik.")
+    if sh_msg[0] != _HS_SERVER_HELLO:
+        raise _unexpected(f"ServerHello (2) beklenirken handshake tipi {sh_msg[0]} geldi.")
+    hs_len = int.from_bytes(sh_msg[1:4], "big")
+    if hs_len != len(sh_msg) - 4:
+        raise TLSProtocolError("decode_error: ServerHello uzunluk alanı mesajla uyuşmuyor.")
+    body = sh_msg[4:]
+    if len(body) < 35:
+        raise TLSProtocolError("decode_error: ServerHello mesajı bozuk (çok kısa).")
+
+    random = body[2:34]
+    is_hrr = random == _HELLO_RETRY_REQUEST_RANDOM
+    sid_len = body[34]
+    if sid_len > 32:
+        raise TLSProtocolError("decode_error: legacy_session_id_echo 32 byte'tan uzun.")
+    offset = 35 + sid_len
+    if len(body) < offset + 5:
+        raise TLSProtocolError("decode_error: ServerHello mesajı bozuk (cipher suite okunamadı).")
+    session_id = body[35:offset]
+    if sent_session_id is not None and session_id != sent_session_id:
+        raise TLSProtocolError(
+            "illegal_parameter: ServerHello legacy_session_id_echo gönderilen session_id ile eşleşmiyor."
+        )
+
+    cipher_suite = struct.unpack("!H", body[offset:offset + 2])[0]
+    if body[offset + 2] != 0:
+        raise TLSProtocolError("illegal_parameter: legacy_compression_method sıfır değil.")
+    ext_total = struct.unpack("!H", body[offset + 3:offset + 5])[0]
+    curr = offset + 5
+    if curr + ext_total != len(body):
+        raise TLSProtocolError("decode_error: ServerHello extension uzunluğu mesajla uyuşmuyor.")
+
+    extensions: list[tuple[int, bytes]] = []
+    seen: set[int] = set()
+    while curr < len(body):
+        if curr + 4 > len(body):
+            raise TLSProtocolError("decode_error: ServerHello extension başlığı kesik.")
+        ext_type, ext_len = struct.unpack("!HH", body[curr:curr + 4])
+        curr += 4
+        if curr + ext_len > len(body):
+            raise TLSProtocolError("decode_error: ServerHello extension gövdesi kesik.")
+        if ext_type in seen:
+            raise TLSProtocolError(
+                f"illegal_parameter: ServerHello'da extension 0x{ext_type:04x} tekrarlandı."
+            )
+        seen.add(ext_type)
+        extensions.append((ext_type, body[curr:curr + ext_len]))
+        curr += ext_len
+
+    selected_version = selected_group = None
+    server_pub = cookie = None
+    for ext_type, data in extensions:
+        if ext_type == 43:
+            if len(data) != 2:
+                raise TLSProtocolError("decode_error: supported_versions uzunluğu hatalı.")
+            selected_version = struct.unpack("!H", data)[0]
+        elif ext_type == 51:
+            if is_hrr:
+                if len(data) != 2:
+                    raise TLSProtocolError("decode_error: HRR key_share uzunluğu hatalı.")
+                selected_group = struct.unpack("!H", data)[0]
+            else:
+                if len(data) < 4:
+                    raise TLSProtocolError("decode_error: key_share uzunluğu hatalı.")
+                selected_group, klen = struct.unpack("!HH", data[:4])
+                if klen != len(data) - 4 or klen == 0:
+                    raise TLSProtocolError("decode_error: key_share anahtar uzunluğu hatalı.")
+                server_pub = data[4:]
+        elif ext_type == 44:
+            if len(data) < 2 or struct.unpack("!H", data[:2])[0] != len(data) - 2:
+                raise TLSProtocolError("decode_error: cookie extension bozuk.")
+            cookie = data[2:]
+
+    if selected_version != 0x0304:
+        raise TLSProtocolError(
+            "protocol_version: Sunucu TLS 1.3 (supported_versions=0x0304) müzakere etmedi. Bu istemci "
+            "TLS 1.2 ve altını desteklemez; downgrade kabul edilmiyor."
+        )
+
+    return {
+        "random": random,
+        "session_id": session_id,
+        "cipher_suite": cipher_suite,
+        "selected_version": selected_version,
+        "selected_group": selected_group,
+        "server_pub": server_pub,
+        "is_hrr": is_hrr,
+        "cookie": cookie,
+        "extensions": extensions,
+    }
+
+
+def _client_hello_session_id(record_bytes: bytes) -> bytes | None:
+    """ClientHello record'u (5 byte record + 4 byte hs başlığı dahil) içinden session_id."""
+    pos = 5 + 4 + 2 + 32
+    if len(record_bytes) <= pos:
+        return None
+    sid_len = record_bytes[pos]
+    if sid_len > 32 or len(record_bytes) < pos + 1 + sid_len:
+        return None
+    return bytes(record_bytes[pos + 1:pos + 1 + sid_len])
+
+
+def next_traffic_secret(secret: bytes, hash_alg) -> bytes:
+    """RFC 8446 §7.2: application_traffic_secret_N+1."""
+    return PureCryptoEngine.tls13_hkdf_expand_label(
+        secret, "traffic upd", b"", hash_alg().digest_size, hash_alg=hash_alg
+    )
+
+
+def traffic_key_iv(secret: bytes, key_len: int, hash_alg) -> tuple[bytes, bytes]:
+    """Trafik secret'ından (write_key, write_iv) türetir (RFC 8446 §7.3)."""
+    key = PureCryptoEngine.tls13_hkdf_expand_label(secret, "key", b"", key_len, hash_alg=hash_alg)
+    iv = PureCryptoEngine.tls13_hkdf_expand_label(secret, "iv", b"", 12, hash_alg=hash_alg)
+    return key, iv
+
+
+def build_key_update(request_update: bool) -> bytes:
+    """KeyUpdate handshake mesajı (4 byte başlık dahil)."""
+    return bytes([_HS_KEY_UPDATE, 0, 0, 1, 1 if request_update else 0])
+
+
+def parse_key_update(msg: bytes) -> bool:
+    """KeyUpdate mesajını (başlık dahil) ayrıştırır; update_requested döner."""
+    if len(msg) != 5 or msg[0] != _HS_KEY_UPDATE or msg[1:4] != b"\x00\x00\x01":
+        raise TLSProtocolError("decode_error: KeyUpdate mesajı bozuk.")
+    if msg[4] not in (0, 1):
+        raise TLSProtocolError("illegal_parameter: KeyUpdate request_update değeri geçersiz.")
+    return msg[4] == 1
+
+
+class HandshakeOrderValidator:
+    """İstemci tarafı TLS 1.3 handshake mesaj sırası (RFC 8446 §A.1).
+
+    ServerHello -> EncryptedExtensions -> (Certificate | CompressedCertificate)
+    -> CertificateVerify -> Finished.  Sonrasında yalnızca NewSessionTicket ve
+    KeyUpdate kabul edilir. Tek bir HelloRetryRequest'e izin verilir:
+    expect(2, is_hrr=True) sonrası ikinci bir ServerHello beklenir.
+    Sıra dışı/tekrar mesaj -> TLSProtocolError("unexpected_message ...").
+    """
+
+    _NAMES = {
+        2: "ServerHello", 4: "NewSessionTicket", 8: "EncryptedExtensions",
+        11: "Certificate", 13: "CertificateRequest", 15: "CertificateVerify",
+        20: "Finished", 24: "KeyUpdate", 25: "CompressedCertificate",
+    }
+    _TRANSITIONS = {
+        "WAIT_SH": {2: "WAIT_EE"},
+        "WAIT_EE": {8: "WAIT_CERT"},
+        "WAIT_CERT": {11: "WAIT_CV", 25: "WAIT_CV"},
+        "WAIT_CV": {15: "WAIT_FIN"},
+        "WAIT_FIN": {20: "CONNECTED"},
+        "CONNECTED": {4: "CONNECTED", 24: "CONNECTED"},
+    }
+
+    def __init__(self):
+        self.state = "WAIT_SH"
+        self.hrr_seen = False
+
+    @property
+    def done(self) -> bool:
+        return self.state == "CONNECTED"
+
+    def expect(self, hs_type: int, *, is_hrr: bool = False) -> str:
+        if is_hrr:
+            if self.state != "WAIT_SH" or hs_type != _HS_SERVER_HELLO:
+                raise _unexpected("HelloRetryRequest yalnızca ilk ServerHello yerine gelebilir.")
+            if self.hrr_seen:
+                raise _unexpected("ikinci HelloRetryRequest alındı.")
+            self.hrr_seen = True
+            return self.state
+        nxt = self._TRANSITIONS[self.state].get(hs_type)
+        if nxt is None:
+            name = self._NAMES.get(hs_type, f"tip {hs_type}")
+            raise _unexpected(f"{self.state} durumunda beklenmeyen handshake mesajı: {name}.")
+        self.state = nxt
+        return nxt
+
+
+def _nonce(iv: bytes, seq: int) -> bytes:
+    return bytes(a ^ b for a, b in zip(iv, b"\x00" * 4 + seq.to_bytes(8, "big")))
+
+
 class EncryptedSocket:
     """TLS 1.3 record katmanı. AEAD şifreleme/çözme ve sequence number yönetimi."""
 
@@ -73,22 +303,39 @@ class EncryptedSocket:
         self.raw_socket = raw_socket
         self.state = crypto_state
         self.read_buffer = b""
+        self._post_hs_buffer = b""
 
     def _cipher(self, key: bytes):
         if self.state["cipher_name"].startswith("AES"):
             return PureAESGCM(key), True
         return PureChaCha20Poly1305(key), False
 
+    def _invalidate_cipher_cache(self) -> None:
+        """Anahtar değiştiğinde çağrılır (cipher nesnesi önbelleği kancası)."""
+
     def send_record(self, data: bytes, content_type: int = 0x17, use_app_keys: bool = True) -> None:
         if not self.state.get("is_tls13"):
             raise ConnectionError("Yalnızca TLS 1.3 desteklenmektedir.")
+        # RFC 8446 §5.1: TLSPlaintext.length <= 2^14 — büyük veriyi böl.
+        if len(data) > MAX_PLAINTEXT:
+            for i in range(0, len(data), MAX_PLAINTEXT):
+                self._send_one_record(data[i:i + MAX_PLAINTEXT], content_type, use_app_keys)
+            return
+        self._send_one_record(data, content_type, use_app_keys)
 
+    def _send_one_record(self, data: bytes, content_type: int, use_app_keys: bool) -> None:
         key = self.state["app_client_write_key"] if use_app_keys else self.state["client_write_key"]
         iv = self.state["app_client_write_iv"] if use_app_keys else self.state["client_write_iv"]
-        seq = self.state["app_client_seq_num"] if use_app_keys else self.state["client_seq_num"]
+        seq_name = "app_client_seq_num" if use_app_keys else "client_seq_num"
+        seq = self.state[seq_name]
+        if seq > _MAX_SEQ_NUM:
+            self.close()
+            raise TLSProtocolError(
+                "Gönderim sequence number'ı 2^64-1'i aştı — bağlantı kapatıldı (RFC 8446 §5.3)."
+            )
 
         inner = data + struct.pack("!B", content_type)
-        nonce = bytes(a ^ b for a, b in zip(iv, b"\x00" * 4 + seq.to_bytes(8, "big")))
+        nonce = _nonce(iv, seq)
         header = struct.pack("!BHH", 0x17, 0x0303, len(inner) + 16)
 
         cipher, is_aes = self._cipher(key)
@@ -97,21 +344,24 @@ class EncryptedSocket:
         else:
             ct, tag = cipher.encrypt_aead(nonce, inner, header)
 
-        if use_app_keys:
-            self.state["app_client_seq_num"] += 1
-        else:
-            self.state["client_seq_num"] += 1
-
+        self.state[seq_name] = seq + 1
         self.raw_socket.sendall(header + ct + tag)
+
+    def close(self) -> None:
+        try:
+            self.raw_socket.close()
+        except OSError as e:
+            logger.debug("Soket kapatılırken hata yok sayıldı: %s", e)
 
     def recv_record(self, skip_post_handshake: bool = False) -> tuple[bytes, int]:
         """Bir TLS record'u şifresini çözerek döner.
 
         Args:
-            skip_post_handshake: True ise (HTTP katmanı çağırdığında),
-                application aşamasında gelen handshake-tipi record'lar
-                (NewSessionTicket, KeyUpdate) HTTP katmanına iletilmez —
-                yutulur ve bir sonraki application_data record'u döner.
+            skip_post_handshake: Geriye uyumluluk için korunur. Application
+                anahtarları devredeyken gelen handshake-tipi record'lar
+                (NewSessionTicket, KeyUpdate) her zaman burada işlenir/yutulur
+                ve bir sonraki record döner — KeyUpdate işlenmezse sonraki
+                record'lar çözülemez.
 
         TLS 1.3'te handshake biter bitmez sunucu genelde bir NewSessionTicket
         (hs_type=4) gönderir; bu, application anahtarlarıyla ŞİFRELİ bir
@@ -130,6 +380,11 @@ class EncryptedSocket:
             record_header = self.read_buffer[:5]
             rec_type = record_header[0]
             rec_len = struct.unpack("!H", record_header[3:5])[0]
+            if rec_len > MAX_CIPHERTEXT:
+                self.close()
+                raise TLSProtocolError(
+                    f"record_overflow: TLS record uzunluğu {rec_len} > {MAX_CIPHERTEXT} (2^14+256)."
+                )
 
             while len(self.read_buffer) < 5 + rec_len:
                 chunk = self.raw_socket.recv(16384)
@@ -144,6 +399,8 @@ class EncryptedSocket:
                 continue
             if rec_type == 21:  # açık (şifresiz) alert
                 raise ConnectionError(f"Açık TLS Alert Alındı: {payload.hex()}")
+            if rec_type != 23:
+                raise _unexpected(f"şifreli bağlantıda beklenmeyen record tipi {rec_type}.")
 
             if not self.state.get("is_tls13"):
                 raise ConnectionError("Yalnızca TLS 1.3 desteklenmektedir.")
@@ -154,9 +411,15 @@ class EncryptedSocket:
             using_app = self.state.get("using_app_keys")
             key = self.state["app_server_write_key"] if using_app else self.state["server_write_key"]
             iv = self.state["app_server_write_iv"] if using_app else self.state["server_write_iv"]
-            seq = self.state["app_server_seq_num"] if using_app else self.state["server_seq_num"]
+            seq_name = "app_server_seq_num" if using_app else "server_seq_num"
+            seq = self.state[seq_name]
+            if seq > _MAX_SEQ_NUM:
+                self.close()
+                raise TLSProtocolError(
+                    "Alım sequence number'ı 2^64-1'i aştı — bağlantı kapatıldı (RFC 8446 §5.3)."
+                )
 
-            nonce = bytes(a ^ b for a, b in zip(iv, b"\x00" * 4 + seq.to_bytes(8, "big")))
+            nonce = _nonce(iv, seq)
             ct, tag = payload[:-16], payload[-16:]
 
             # AAD, telde GELEN record header'ının birebir kendisidir (RFC 8446 §5.2).
@@ -168,10 +431,11 @@ class EncryptedSocket:
             else:
                 pt = cipher.decrypt_aead(nonce, ct, record_header, tag)
 
-            if using_app:
-                self.state["app_server_seq_num"] += 1
-            else:
-                self.state["server_seq_num"] += 1
+            self.state[seq_name] = seq + 1
+
+            if len(pt) > MAX_PLAINTEXT + 1:
+                self.close()
+                raise TLSProtocolError("record_overflow: çözülmüş TLSInnerPlaintext 2^14+1'i aşıyor.")
 
             # TLSInnerPlaintext: content || content_type || zero-padding
             idx = len(pt) - 1
@@ -184,28 +448,70 @@ class EncryptedSocket:
             inner = pt[:idx]
             inner_type = pt[idx]
 
-            # HTTP katmanı application verisi beklerken gelen post-handshake
-            # handshake mesajlarını (NewSessionTicket=4, KeyUpdate=24) yut.
-            if skip_post_handshake and inner_type == 22:
-                self._handle_post_handshake(inner)
+            # Application aşamasında gelen post-handshake handshake
+            # mesajlarını (NewSessionTicket=4, KeyUpdate=24) işle/yut.
+            if using_app and inner_type == 22:
+                self._process_post_handshake_record(inner)
                 continue
+            if using_app and self._post_hs_buffer:
+                raise _unexpected("bölünmüş handshake mesajı tamamlanmadan başka record geldi.")
 
             return inner, inner_type
 
+    def _process_post_handshake_record(self, data: bytes) -> None:
+        """Bir handshake record'unu mesajlara böler; KeyUpdate record sınırında bitmeli."""
+        buf = self._post_hs_buffer + data
+        while len(buf) >= 4:
+            hs_len = int.from_bytes(buf[1:4], "big")
+            if len(buf) < 4 + hs_len:
+                break
+            msg, buf = buf[:4 + hs_len], buf[4 + hs_len:]
+            if msg[0] == _HS_KEY_UPDATE and buf:
+                raise _unexpected("KeyUpdate record sınırında bitmiyor.")
+            self._handle_post_handshake(msg)
+        self._post_hs_buffer = buf
+
     def _handle_post_handshake(self, msg: bytes) -> None:
-        """Application aşamasında gelen handshake mesajlarını işler/yutar."""
+        """Application aşamasında gelen tek bir handshake mesajını işler."""
         if not msg:
             return
         hs_type = msg[0]
-        if hs_type == 4:      # NewSessionTicket — resumption yok, yok say
+        if hs_type == _HS_NEW_SESSION_TICKET:  # resumption yok, yok say
             return
-        if hs_type == 24:     # KeyUpdate
-            # Doğru yanıt anahtarları döndürmektir; bu basit istemci key update
-            # implemente etmediğinden, sunucu update_requested gönderirse sonraki
-            # record'lar çözülemez. Şimdilik yok sayıyoruz (nadir bir durum).
-            logger.debug("KeyUpdate alındı ama işlenmiyor (implemente edilmedi)")
+        if hs_type == _HS_KEY_UPDATE:
+            self._handle_key_update(msg)
             return
-        logger.debug("Bilinmeyen post-handshake mesajı hs_type=%d, yok sayıldı", hs_type)
+        raise _unexpected(f"handshake sonrası beklenmeyen mesaj hs_type={hs_type}.")
+
+    # ---- KeyUpdate (RFC 8446 §4.6.3, §7.2) ---------------------------------
+    def _handle_key_update(self, msg: bytes) -> None:
+        update_requested = parse_key_update(msg)
+        st = self.state
+        hash_func, key_len = st["hash_func"], st["key_len"]
+
+        st["server_ats"] = next_traffic_secret(st["server_ats"], hash_func)
+        st["app_server_write_key"], st["app_server_write_iv"] = traffic_key_iv(
+            st["server_ats"], key_len, hash_func
+        )
+        st["app_server_seq_num"] = 0
+        st["key_updates_received"] = st.get("key_updates_received", 0) + 1
+        self._invalidate_cipher_cache()
+        logger.debug("Sunucu KeyUpdate işlendi (update_requested=%s)", update_requested)
+
+        if update_requested:
+            self.send_key_update(request_update=False)
+
+    def send_key_update(self, request_update: bool = False) -> None:
+        """Kendi KeyUpdate'imizi ESKİ anahtarla gönderir, sonra c_ats'yi yeniler."""
+        st = self.state
+        self.send_record(build_key_update(request_update), content_type=0x16, use_app_keys=True)
+        hash_func, key_len = st["hash_func"], st["key_len"]
+        st["client_ats"] = next_traffic_secret(st["client_ats"], hash_func)
+        st["app_client_write_key"], st["app_client_write_iv"] = traffic_key_iv(
+            st["client_ats"], key_len, hash_func
+        )
+        st["app_client_seq_num"] = 0
+        self._invalidate_cipher_cache()
 
 
 def _parse_alpn_from_encrypted_extensions(hs_payload: bytes) -> str:
@@ -228,11 +534,46 @@ def _parse_alpn_from_encrypted_extensions(hs_payload: bytes) -> str:
     return ""
 
 
+def _read_server_hello(raw_socket: socket.socket) -> bytes:
+    """Düz (şifresiz) handshake record'larından tam ServerHello mesajını toplar.
+
+    ServerHello birden fazla record'a bölünebilir (RFC 8446 §5.1). Mesajdan
+    sonra aynı düz record'da artık veri kalırsa (şifresiz EE vb.) reddedilir.
+    """
+    buf = b""
+    while True:
+        header = _recv_all(raw_socket, 5)
+        rec_type, _ver, rec_len = struct.unpack("!BHH", header)
+        if rec_len > MAX_PLAINTEXT:
+            raise TLSProtocolError(
+                f"record_overflow: düz record uzunluğu {rec_len} > {MAX_PLAINTEXT}."
+            )
+        payload = _recv_all(raw_socket, rec_len)
+        if rec_type == 21:
+            raise ConnectionError(f"Sunucu el sıkışmayı reddetti (alert): {payload.hex()}")
+        if rec_type != 22:
+            raise _unexpected(f"ServerHello beklenirken beklenmeyen record tipi: {rec_type}")
+        if not payload:
+            raise TLSProtocolError("decode_error: boş handshake record'u.")
+        buf += payload
+        if len(buf) >= 4:
+            if buf[0] != _HS_SERVER_HELLO:
+                raise _unexpected(f"ServerHello (2) beklenirken handshake tipi {buf[0]} geldi.")
+            total = 4 + int.from_bytes(buf[1:4], "big")
+            if total > _MAX_SERVER_HELLO:
+                raise TLSProtocolError("decode_error: ServerHello makul boyutu aşıyor.")
+            if len(buf) == total:
+                return buf
+            if len(buf) > total:
+                raise _unexpected("ServerHello sonrasında şifresiz handshake verisi.")
+
+
 class TLSAdapter:
     @staticmethod
     def negotiate(raw_socket: socket.socket, host: str, profile_name: str) -> EncryptedSocket:
         impersonator = TLSImpersonator(host, profile=profile_name)
         record_bytes, priv_key, _c_rand = impersonator.build_client_hello()
+        sent_session_id = _client_hello_session_id(record_bytes)
 
         raw_socket.sendall(record_bytes)
 
@@ -249,75 +590,30 @@ class TLSAdapter:
             "alpn": "",
         }
         esock = EncryptedSocket(raw_socket, state)
+        order = HandshakeOrderValidator()
 
         # ---- ServerHello ---------------------------------------------------
-        header = _recv_all(raw_socket, 5)
-        rec_type, _ver, rec_len = struct.unpack("!BHH", header)
-        server_hello_payload = _recv_all(raw_socket, rec_len)
+        server_hello_payload = _read_server_hello(raw_socket)
+        sh = parse_server_hello(server_hello_payload, sent_session_id)
 
-        if rec_type == 21:
-            raise ConnectionError(
-                f"Sunucu el sıkışmayı reddetti (alert): {server_hello_payload.hex()}"
-            )
-        if rec_type != 22:
-            raise ConnectionError(f"ServerHello beklenirken beklenmeyen record tipi: {rec_type}")
-
-        state["handshake_messages"] += server_hello_payload
-
-        sh_body = server_hello_payload[4:]
-        if len(sh_body) < 35:
-            raise ConnectionError("ServerHello mesajı bozuk (çok kısa).")
-
-        if sh_body[2:34] == _HELLO_RETRY_REQUEST_RANDOM:
+        if sh["is_hrr"]:
             raise ConnectionError(
                 "Sunucu HelloRetryRequest gönderdi — teklif ettiğimiz key_share grubunu "
                 "(x25519) kabul etmedi. Bu istemci şu an yalnızca tek turlu handshake "
                 "destekliyor; HRR implemente edilmedi."
             )
+        order.expect(_HS_SERVER_HELLO)
+        state["handshake_messages"] += server_hello_payload
 
-        sess_id_len = sh_body[34]
-        offset = 35 + sess_id_len
-        if len(sh_body) < offset + 5:
-            raise ConnectionError("ServerHello mesajı bozuk (cipher suite okunamadı).")
+        cipher_suite = sh["cipher_suite"]
+        state["cipher_name"], state["key_len"], hash_func = suite_params(cipher_suite)
+        state["hash_func"] = hash_func
 
-        cipher_suite = struct.unpack("!H", sh_body[offset:offset + 2])[0]
-        if cipher_suite == 0x1301:
-            state["cipher_name"], state["key_len"], hash_func = "AES", 16, hashlib.sha256
-        elif cipher_suite == 0x1302:
-            state["cipher_name"], state["key_len"], hash_func = "AES", 32, hashlib.sha384
-        elif cipher_suite == 0x1303:
-            state["cipher_name"], state["key_len"], hash_func = "CHACHA20-POLY1305", 32, hashlib.sha256
-        else:
+        if sh["selected_group"] != 0x001D:
             raise ConnectionError(
-                f"Sunucu desteklenmeyen bir cipher suite seçti: 0x{cipher_suite:04x}. "
-                f"Bu istemci yalnızca TLS 1.3 suite'lerini destekler."
+                f"Sunucu x25519 dışında bir grup seçti (0x{(sh['selected_group'] or 0):04x}); desteklenmiyor."
             )
-
-        extensions_len = struct.unpack("!H", sh_body[offset + 3:offset + 5])[0]
-        curr = offset + 5
-        ext_end = min(curr + extensions_len, len(sh_body))
-        is_tls13, server_pub = False, None
-
-        while curr + 4 <= ext_end:
-            ext_type, ext_len = struct.unpack("!HH", sh_body[curr:curr + 4])
-            curr += 4
-            if ext_type == 43 and ext_len >= 2:
-                if struct.unpack("!H", sh_body[curr:curr + 2])[0] == 0x0304:
-                    is_tls13 = True
-            elif ext_type == 51 and ext_len > 2:
-                group, key_len_val = struct.unpack("!HH", sh_body[curr:curr + 4])
-                if group != 0x001D:
-                    raise ConnectionError(
-                        f"Sunucu x25519 dışında bir grup seçti (0x{group:04x}); desteklenmiyor."
-                    )
-                server_pub = sh_body[curr + 4:curr + 4 + key_len_val]
-            curr += ext_len
-
-        if not is_tls13:
-            raise ConnectionError(
-                "Sunucu TLS 1.3 (supported_versions=0x0304) müzakere etmedi. Bu istemci "
-                "TLS 1.2 ve altını desteklemez; downgrade kabul edilmiyor."
-            )
+        server_pub = sh["server_pub"]
         if not server_pub or len(server_pub) != 32:
             raise ConnectionError(
                 "ServerHello geçerli bir x25519 key_share içermiyor — handshake tamamlanamaz."
@@ -339,21 +635,22 @@ class TLSAdapter:
         })
 
         # ---- Şifreli handshake akışı -----------------------------------------
-        finished_received = False
+        # Sıra HandshakeOrderValidator ile zorunlu kılınır:
+        # EE -> (Certificate | CompressedCertificate) -> CertificateVerify -> Finished
         handshake_buffer = b""
-        certificate_seen = False
-        cert_verify_ok = False
         leaf_cert = None
 
-        while not finished_received:
+        while not order.done:
             msg, m_type = esock.recv_record()
             if m_type == 21:
                 raise ConnectionError(f"Sunucudan Şifreli TLS Alert: {msg.hex()}")
             if m_type != 22:
-                continue  # handshake bitmeden application_data beklemiyoruz
+                raise _unexpected(
+                    f"handshake tamamlanmadan content_type={m_type} record'u alındı."
+                )
 
             handshake_buffer += msg
-            while len(handshake_buffer) >= 4:
+            while len(handshake_buffer) >= 4 and not order.done:
                 hs_type = handshake_buffer[0]
                 hs_len = struct.unpack("!I", b"\x00" + handshake_buffer[1:4])[0]
                 if len(handshake_buffer) < 4 + hs_len:
@@ -361,16 +658,14 @@ class TLSAdapter:
                 hs_payload = handshake_buffer[:4 + hs_len]
                 handshake_buffer = handshake_buffer[4 + hs_len:]
 
+                # Sıra kontrolü — mesaj işlenmeden ÖNCE.
+                order.expect(hs_type)
+
                 # ÖNEMLİ: transcript hash'i bu mesaj EKLENMEDEN önce alınmalı.
                 # CertificateVerify kendisinden ÖNCEKİ transcript'i imzalar;
                 # Finished da kendisinden öncekinin MAC'ini taşır.
                 transcript_before = hash_func(state["handshake_messages"]).digest()
                 state["handshake_messages"] += hs_payload
-
-                if hs_type == _HS_NEW_SESSION_TICKET:
-                    # PSK/0-RTT resumption implemente edilmedi; mesaj yalnızca
-                    # handshake akışını bozmamak için okunup yutuluyor.
-                    continue
 
                 if hs_type == _HS_ENCRYPTED_EXTENSIONS:
                     state["alpn"] = _parse_alpn_from_encrypted_extensions(hs_payload)
@@ -392,32 +687,15 @@ class TLSAdapter:
                             f"olası MITM saldırısı: {e}"
                         ) from e
                     state["peer_certificate"] = leaf_cert
-                    certificate_seen = True
 
                 elif hs_type == _HS_CERTIFICATE_VERIFY:
-                    if not certificate_seen:
-                        raise ConnectionError(
-                            "Sunucu Certificate göndermeden CertificateVerify gönderdi — protokol ihlali."
-                        )
                     try:
                         scheme = verify_certificate_verify(hs_payload, leaf_cert, transcript_before)
                     except CertificateValidationError as e:
                         raise ConnectionError(f"TLS kimlik doğrulaması başarısız: {e}") from e
                     logger.debug("CertificateVerify doğrulandı (scheme=0x%04x)", scheme)
-                    cert_verify_ok = True
 
                 elif hs_type == _HS_FINISHED:
-                    if not certificate_seen:
-                        raise ConnectionError(
-                            "Handshake Finished'a ulaştı ama sunucu sertifikası hiç doğrulanmadı — "
-                            "bağlantı reddedildi."
-                        )
-                    if not cert_verify_ok:
-                        raise ConnectionError(
-                            "Sunucu CertificateVerify göndermedi veya doğrulanamadı — sertifikadaki "
-                            "özel anahtara sahip olduğunu kanıtlayamadı. Bağlantı reddedildi."
-                        )
-
                     # RFC 8446 §4.4.4 — server Finished doğrulaması
                     hash_len = hash_func().digest_size
                     s_fin_key = PureCryptoEngine.tls13_hkdf_expand_label(
@@ -431,8 +709,10 @@ class TLSAdapter:
                             "bağlantı reddedildi."
                         )
                     logger.debug("Server Finished doğrulandı")
-                    finished_received = True
-                    break
+
+            if order.done and handshake_buffer:
+                # Finished anahtar değişiminden önce record sınırında bitmeli (§5.1).
+                raise _unexpected("Finished sonrasında aynı record'da ek handshake verisi.")
 
         # ---- Client Finished --------------------------------------------------
         hash_len = hash_func().digest_size
@@ -452,6 +732,8 @@ class TLSAdapter:
         state.update({
             "app_client_write_key": ak, "app_client_write_iv": aiv,
             "app_server_write_key": ask_key, "app_server_write_iv": asiv,
+            "client_ats": c_ats, "server_ats": s_ats,
+            "key_updates_received": 0,
             "using_app_keys": True,
         })
 
