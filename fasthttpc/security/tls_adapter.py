@@ -72,12 +72,60 @@ class EncryptedSocket:
     def __init__(self, raw_socket: socket.socket, crypto_state: dict):
         self.raw_socket = raw_socket
         self.state = crypto_state
-        self.read_buffer = b""
+        # Okuma tamponu: bytearray + okuma ofseti. `bytes += chunk` ve her record'da
+        # dilimleyerek yeni bytes üretmek büyük indirmelerde O(n^2) kopyalamaya yol açıyordu.
+        self.read_buffer = bytearray()
+        self._rbuf_off = 0
+        # AEAD nesneleri anahtar başına bir kez kurulur (OpenSSL context kurulumu
+        # record başına tekrarlanmaz). Anahtar bytes'ı önbellek anahtarı olduğundan
+        # anahtar değişince (handshake->app, KeyUpdate) otomatik olarak yeni nesne oluşur.
+        self._cipher_cache: dict = {}
 
     def _cipher(self, key: bytes):
-        if self.state["cipher_name"].startswith("AES"):
-            return PureAESGCM(key), True
-        return PureChaCha20Poly1305(key), False
+        is_aes = self.state["cipher_name"].startswith("AES")
+        cached = self._cipher_cache.get(key)
+        if cached is None or cached[1] != is_aes:
+            if len(self._cipher_cache) >= 4:
+                self._cipher_cache.clear()
+            cached = (PureAESGCM(key) if is_aes else PureChaCha20Poly1305(key), is_aes)
+            self._cipher_cache[key] = cached
+        return cached
+
+    def _invalidate_cipher_cache(self) -> None:
+        """Anahtar değiştiğinde (KeyUpdate) eski AEAD nesnelerini bırakır."""
+        self._cipher_cache.clear()
+
+    def _fill(self, need: int, eof_msg: str) -> None:
+        """Tamponda okunmamış en az `need` bayt olana kadar soketten okur."""
+        buf = self.read_buffer
+        while len(buf) - self._rbuf_off < need:
+            chunk = self.raw_socket.recv(16384)
+            if not chunk:
+                raise ConnectionResetError(eof_msg)
+            buf += chunk
+
+    def _read_raw_record(self) -> tuple[int, bytes, bytes]:
+        """Telden bir ham TLS record'u okur: (rec_type, 5 baytlık header, payload)."""
+        self._fill(5, "TLS şifreli paket beklenirken bağlantı koptu!")
+        off = self._rbuf_off
+        buf = self.read_buffer
+        record_header = bytes(buf[off:off + 5])
+        rec_type = record_header[0]
+        rec_len = (record_header[3] << 8) | record_header[4]
+
+        self._fill(5 + rec_len, "TLS paket gövdesi okunurken koptu.")
+        off = self._rbuf_off
+        payload = bytes(self.read_buffer[off + 5:off + 5 + rec_len])
+        off += 5 + rec_len
+        if off == len(self.read_buffer):
+            self.read_buffer.clear()
+            off = 0
+        elif off > 65536:
+            # Tüketilmiş baştaki kısmı ara sıra at (amortize O(1)).
+            del self.read_buffer[:off]
+            off = 0
+        self._rbuf_off = off
+        return rec_type, record_header, payload
 
     def send_record(self, data: bytes, content_type: int = 0x17, use_app_keys: bool = True) -> None:
         if not self.state.get("is_tls13"):
@@ -121,24 +169,7 @@ class EncryptedSocket:
         application verisi beklerken handshake record'ları burada yutulmalıdır.
         """
         while True:
-            while len(self.read_buffer) < 5:
-                chunk = self.raw_socket.recv(16384)
-                if not chunk:
-                    raise ConnectionResetError("TLS şifreli paket beklenirken bağlantı koptu!")
-                self.read_buffer += chunk
-
-            record_header = self.read_buffer[:5]
-            rec_type = record_header[0]
-            rec_len = struct.unpack("!H", record_header[3:5])[0]
-
-            while len(self.read_buffer) < 5 + rec_len:
-                chunk = self.raw_socket.recv(16384)
-                if not chunk:
-                    raise ConnectionResetError("TLS paket gövdesi okunurken koptu.")
-                self.read_buffer += chunk
-
-            payload = self.read_buffer[5:5 + rec_len]
-            self.read_buffer = self.read_buffer[5 + rec_len:]
+            rec_type, record_header, payload = self._read_raw_record()
 
             if rec_type == 20:  # change_cipher_spec — TLS 1.3'te uyumluluk için, yok say
                 continue
