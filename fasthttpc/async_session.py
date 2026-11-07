@@ -21,6 +21,7 @@ from .models.response import Response, HTTPStatusError
 from .metrics         import RequestMetrics
 from .cache           import ResponseCache
 from .protocol.http1_parser import HTTP1Parser
+from .tls13 import AsyncTLSStream
 
 
                                                                                
@@ -231,19 +232,8 @@ class AsyncSession:
         cache:           "bool | ResponseCache" = False,
         cache_ttl:       float = 300.0,
     ):
-        # DÜRÜSTLÜK NOTU: AsyncSession, sync Session'ın özel TLS yığınını
-        # KULLANMAZ. asyncio.open_connection stdlib ssl bağlamıyla çalışır,
-        # yani ClientHello Python/OpenSSL parmak izini taşır — Chrome'unkini
-        # değil. Sessizce yok saymak yerine açıkça uyarıyoruz.
-        if impersonate is not None:
-            warnings.warn(
-                "AsyncSession şu anda TLS impersonation DESTEKLEMİYOR: bağlantı "
-                "stdlib ssl ile kurulur ve ClientHello Python/OpenSSL parmak izi "
-                "taşır. Parmak izi gerekiyorsa senkron Session kullanın. Bu uyarıyı "
-                "susturmak için impersonate=None geçin.",
-                UserWarning,
-                stacklevel=2,
-            )
+        # impersonate verilirse TLS, fasthttpc.tls13 çekirdeğiyle (tarayıcı
+        # ClientHello'su) kurulur; impersonate=None -> stdlib ssl.
         self.impersonate   = impersonate
         self.timeout       = timeout
         self.max_redirects = max_redirects
@@ -380,10 +370,20 @@ class AsyncSession:
             try:
                 if metrics: metrics.connect_start = time.monotonic()
 
-                reader, writer = await asyncio.wait_for(
-                    asyncio.open_connection(connect_host, connect_port, ssl=ctx),
-                    timeout=self.timeout,
-                )
+                if self.impersonate is not None:
+                    stream = await asyncio.wait_for(
+                        AsyncTLSStream.connect(
+                            connect_host, connect_port, self.impersonate,
+                            alpn=["http/1.1"], ca_path=getattr(self, "_ca_path", None),
+                        ),
+                        timeout=self.timeout,
+                    )
+                    reader = writer = stream
+                else:
+                    reader, writer = await asyncio.wait_for(
+                        asyncio.open_connection(connect_host, connect_port, ssl=ctx),
+                        timeout=self.timeout,
+                    )
 
                 if metrics:
                     metrics.connect_end = time.monotonic()
