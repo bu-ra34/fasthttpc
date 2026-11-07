@@ -76,6 +76,7 @@ PROFILES = {
         "supported_groups": [
             "GREASE", 0x001D, 0x0017, 0x0018,
         ],
+        "supported_versions": ["GREASE", 0x0304, 0x0303],
         "signature_algorithms": [
             0x0403, 0x0804, 0x0401, 0x0503, 0x0805,
             0x0501, 0x0806, 0x0601,
@@ -114,6 +115,9 @@ PROFILES = {
             "key_share", "compress_certificate",
         ],
         "supported_groups": [0x001D, 0x0017, 0x0018, 0x0019],
+        # Gerçek Firefox x25519 + secp256r1 için iki key_share gönderir.
+        "key_share_groups": [0x001D, 0x0017],
+        "supported_versions": [0x0304, 0x0303],
         "signature_algorithms": [
             0x0403, 0x0503, 0x0603,
             0x0804, 0x0805, 0x0806,
@@ -161,6 +165,7 @@ PROFILES = {
         "supported_groups": [
             "GREASE", 0x001D, 0x0017, 0x0018, 0x0019, 0x0100, 0x0101,
         ],
+        "supported_versions": ["GREASE", 0x0304, 0x0303, 0x0302, 0x0301],
         "signature_algorithms": [
             0x0403, 0x0503, 0x0603,
             0x0804, 0x0805, 0x0806,
