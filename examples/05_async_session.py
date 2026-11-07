@@ -5,8 +5,8 @@ import asyncio
 from fasthttpc import AsyncSession
 
 async def main():
-    # AsyncSession henüz TLS taklidi desteklemiyor; impersonate=None uyarıyı susturur.
-    async with AsyncSession(impersonate=None) as s:
+    # impersonate verilince async tarafta da kendi TLS 1.3 yığını ve tarayıcı parmak izi kullanılır.
+    async with AsyncSession(impersonate="chrome_131") as s:
         r = await s.get("https://httpbin.org/get")
         print(f"Durum: {r.status_code}")
 
