@@ -7,6 +7,8 @@ API) birleştirilmesi. 92 → 418 test, hepsi ağsız.
 
 ### Güvenlik ve doğruluk
 
+- TLS 1.2 ile yanıt veren sunucularda (canlı testte nginx.org) yanıltıcı
+  "session_id eşleşmiyor" hatası yerine net `protocol_version` hatası veriliyor.
 - **KeyUpdate** (RFC 8446 §4.6.3): sunucu anahtar yenilemesi işleniyor,
   `update_requested` gelirse istemci de yeniliyor. Eskiden yok sayılıyor ve
   bağlantı anlamsız bir tag hatasıyla kopuyordu.
