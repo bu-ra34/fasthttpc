@@ -21,6 +21,9 @@ from .models.response import Response, HTTPStatusError
 from .metrics         import RequestMetrics
 from .cache           import ResponseCache
 from .protocol.http1_parser import HTTP1Parser
+from .models.request  import Request
+from .config          import resolve_verify
+from .retry           import Retry
 
 
                                                                                
@@ -230,6 +233,9 @@ class AsyncSession:
         max_connections: int   = 100,                                     
         cache:           "bool | ResponseCache" = False,
         cache_ttl:       float = 300.0,
+        verify:          "bool | str" = True,
+        retries:         "int | Retry | None" = None,
+        transport                     = None,
     ):
         # DÜRÜSTLÜK NOTU: AsyncSession, sync Session'ın özel TLS yığınını
         # KULLANMAZ. asyncio.open_connection stdlib ssl bağlamıyla çalışır,
@@ -246,6 +252,10 @@ class AsyncSession:
             )
         self.impersonate   = impersonate
         self.timeout       = timeout
+        self.verify        = verify
+        self._ca_path      = resolve_verify(verify)   # None → varsayılan güven deposu
+        self.retries       = Retry.from_value(retries)
+        self.transport     = transport
         self.max_redirects = max_redirects
         self.cookies:  dict[str, str] = {}
         self._plugins: list[Plugin]   = []
@@ -293,7 +303,7 @@ class AsyncSession:
 
         async def _warm_one(host: str) -> tuple[str, bool]:
             try:
-                ctx = ssl.create_default_context()
+                ctx = ssl.create_default_context(cafile=self._ca_path)
                 reader, writer = await asyncio.wait_for(
                     asyncio.open_connection(host, 443, ssl=ctx),
                     timeout=self.timeout,
@@ -371,7 +381,7 @@ class AsyncSession:
             metrics.bytes_sent    = len(raw_request)
 
                         
-        ctx = ssl.create_default_context()
+        ctx = ssl.create_default_context(cafile=self._ca_path)
         ctx.set_alpn_protocols(["http/1.1"])
 
         connect_host = u.host
@@ -533,6 +543,52 @@ class AsyncSession:
 
                                                                                 
 
+    # --- Faz 5 kancaları: transport + retry -------------------------------
+
+    async def _send(self, method, url, headers=None, body=b"", metrics=None) -> Response:
+        """Tek isteği transport'a (verilmişse) ya da ağa gönderir."""
+        if self.transport is None:
+            return await self._raw_request(method, url, headers=headers, body=body,
+                                           metrics=metrics)
+        req_dict = await self._run_request_hooks(
+            {"method": method, "url": url, "headers": headers or {}, "body": body}
+        )
+        h = dict(req_dict.get("headers") or {})
+        if self.cookies and not any(k.lower() == "cookie" for k in h):
+            h["Cookie"] = "; ".join(f"{k}={v}" for k, v in self.cookies.items())
+        req = Request(method=req_dict["method"], url=req_dict["url"], headers=h,
+                      data=req_dict.get("body") or None)
+        if "host" not in req.headers:
+            req.headers["Host"] = req.url.host
+        resp = await self.transport.handle_async_request(req)
+        for cs in resp.headers.get_list("set-cookie"):
+            main = cs.split(";")[0].strip()
+            if "=" in main:
+                k, v = main.split("=", 1)
+                self.cookies[k.strip()] = v.strip()
+        return await self._run_response_hooks(resp)
+
+    async def _send_with_retries(self, method, url, **kwargs) -> Response:
+        """``self.retries`` politikasına göre ``_send``'i tekrarlar."""
+        retry = self.retries
+        attempt = 0
+        while True:
+            try:
+                resp = await self._send(method, url, **kwargs)
+            except Exception as e:
+                if not retry.should_retry_error(method, e, attempt):
+                    raise
+                attempt += 1
+                delay = retry.get_delay(attempt)
+            else:
+                if not retry.should_retry_status(method, resp.status_code, attempt):
+                    return resp
+                attempt += 1
+                delay = retry.get_delay(attempt, resp)
+            logger.debug("%d. yeniden deneme %.2fs sonra", attempt, delay)
+            if delay:
+                await asyncio.sleep(delay)
+
     async def request(
         self,
         method:          str,
@@ -567,7 +623,7 @@ class AsyncSession:
         while True:
             attempt = 0
             while True:
-                resp = await self._raw_request(
+                resp = await self._send_with_retries(
                     method, current_url, headers=h, body=body, metrics=metrics
                 )
                 retrying = False
@@ -663,7 +719,8 @@ class AsyncSession:
                                                                                 
 
     async def close(self) -> None:
-        pass                                         
+        if self.transport is not None:
+            self.transport.close()                                         
 
     async def __aenter__(self):
         return self
@@ -692,7 +749,7 @@ class AsyncWebSocket:
         u   = URL(url)
         key = base64.b64encode(os.urandom(16)).decode()
 
-        ctx = ssl.create_default_context()
+        ctx = ssl.create_default_context(cafile=session._ca_path)
         reader, writer = await asyncio.open_connection(u.host, u.port, ssl=ctx)
 
         req = (
