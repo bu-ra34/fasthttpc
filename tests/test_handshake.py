@@ -202,3 +202,17 @@ def test_negotiate_tek_recordda_birden_fazla_mesaj(no_pki):
     flight = [("record", [("hs", 8), ("hs", 11)]), ("record", [("hs", 15), ("hs", 20)])]
     es, _ = _negotiate(FakeTLSServer(flight=flight))
     assert es.state["using_app_keys"]
+
+
+def test_psk_modunda_sertifikasiz_sira():
+    v = HandshakeOrderValidator()
+    v.expect(2)
+    v.psk_accepted = True
+    v.expect(8)
+    v.expect(20)
+    assert v.done
+    v2 = HandshakeOrderValidator(psk_accepted=True)
+    v2.expect(2)
+    v2.expect(8)
+    with pytest.raises(TLSProtocolError, match="unexpected_message"):
+        v2.expect(11)
