@@ -249,7 +249,8 @@ class HandshakeOrderValidator:
 
     ServerHello -> EncryptedExtensions -> (Certificate | CompressedCertificate)
     -> CertificateVerify -> Finished.  Sonrasında yalnızca NewSessionTicket ve
-    KeyUpdate kabul edilir. Tek bir HelloRetryRequest'e izin verilir:
+    KeyUpdate kabul edilir. psk_accepted=True ise EE -> Finished.
+    Tek bir HelloRetryRequest'e izin verilir:
     expect(2, is_hrr=True) sonrası ikinci bir ServerHello beklenir.
     Sıra dışı/tekrar mesaj -> TLSProtocolError("unexpected_message ...").
     """
@@ -268,9 +269,13 @@ class HandshakeOrderValidator:
         "CONNECTED": {4: "CONNECTED", 24: "CONNECTED"},
     }
 
-    def __init__(self):
+    def __init__(self, psk_accepted: bool = False):
         self.state = "WAIT_SH"
         self.hrr_seen = False
+        # PSK resumption kabul edildiyse (ServerHello ext 41) sıra:
+        # EE -> Finished (Certificate/CertificateVerify gönderilmez).
+        # ServerHello işlendikten sonra da set edilebilir.
+        self.psk_accepted = psk_accepted
 
     @property
     def done(self) -> bool:
@@ -283,6 +288,9 @@ class HandshakeOrderValidator:
             if self.hrr_seen:
                 raise _unexpected("ikinci HelloRetryRequest alındı.")
             self.hrr_seen = True
+            return self.state
+        if self.psk_accepted and self.state == "WAIT_EE" and hs_type == _HS_ENCRYPTED_EXTENSIONS:
+            self.state = "WAIT_FIN"
             return self.state
         nxt = self._TRANSITIONS[self.state].get(hs_type)
         if nxt is None:
