@@ -388,7 +388,8 @@ class FakeTLS13Server:
 
     # -- uygulama aşaması API'si
     def send_app(self, data: bytes, pad: int = 0) -> bytes:
-        return self.write.seal(data, 23, pad=pad)
+        return b"".join(self.write.seal(data[i:i + 2 ** 14], 23, pad=pad)
+                        for i in range(0, max(len(data), 1), 2 ** 14))
 
     def send_alert(self, level: int, desc: int) -> bytes:
         return self.write.seal(bytes([level, desc]), 21)
@@ -401,3 +402,51 @@ class FakeTLS13Server:
         out = self.write.seal(hs(24, b"\x01" if request else b"\x00"), 22)
         self._rotate_write()
         return out
+
+
+# ------------------------------------------------- I/O sürücüleri (testler için)
+def http_responder(body: bytes = b"merhaba dunya", extra: bytes = b""):
+    """İstek başlığı tamamlanınca bir HTTP/1.1 yanıtı üreten basit işleyici."""
+    def handle(server: "FakeTLS13Server") -> bytes:
+        buf = b"".join(server.app_in)
+        if b"\r\n\r\n" not in buf:
+            return b""
+        server.app_in.clear()
+        server.requests = getattr(server, "requests", []) + [buf]
+        resp = (b"HTTP/1.1 200 OK\r\nContent-Length: " + str(len(body)).encode() +
+                b"\r\nContent-Type: text/plain\r\nSet-Cookie: s=1\r\n\r\n" + body)
+        return extra + server.send_app(resp)
+    return handle
+
+
+async def async_serve(server: "FakeTLS13Server", reader, writer, handler=None):
+    try:
+        while True:
+            data = await reader.read(65536)
+            if not data:
+                break
+            out = server.receive(data)
+            if handler and server.state == "CONNECTED":
+                out += handler(server)
+            if out:
+                writer.write(out)
+                await writer.drain()
+    finally:
+        writer.close()
+
+
+def sync_serve(server: "FakeTLS13Server", sock, handler=None):
+    try:
+        while True:
+            data = sock.recv(65536)
+            if not data:
+                break
+            out = server.receive(data)
+            if handler and server.state == "CONNECTED":
+                out += handler(server)
+            if out:
+                sock.sendall(out)
+    except OSError:
+        pass
+    finally:
+        sock.close()
