@@ -440,21 +440,28 @@ class Session:
                 send_time = time.monotonic()
 
                                                                             
-                header_buf  = b""
+                # bytearray + kaldığı yerden arama: header'lar çok record'a bölünse
+                # bile birleştirme/arama doğrusal kalır.
+                header_acc  = bytearray()
                 first_byte  = True
-                while b"\r\n\r\n" not in header_buf:
+                sep         = -1
+                while True:
                     chunk = self._read_app_data(conn)
                     if not chunk:
                         break
                     if first_byte and metrics:
                         metrics.first_byte_time = time.monotonic()
                         first_byte = False
-                    header_buf += chunk
+                    search_from = max(0, len(header_acc) - 3)
+                    header_acc += chunk
+                    sep = header_acc.find(b"\r\n\r\n", search_from)
+                    if sep != -1:
+                        break
+                header_buf = bytes(header_acc)
 
                 if not header_buf:
                     raise ConnectionResetError("Sunucu yanıt vermeden bağlantıyı kesti.")
 
-                sep              = header_buf.find(b"\r\n\r\n")
                 headers_raw      = header_buf[:sep]
                 first_body_chunk = header_buf[sep + 4:]
 
