@@ -259,16 +259,25 @@ def _recv_handshake_message(raw_socket: socket.socket, what: str) -> bytes:
     birden çok record'a bölünmüş mesajı birleştirir.
     """
     buf = b""
+    ccs_seen = False
     while True:
         header = _recv_all(raw_socket, 5)
         rec_type, _ver, rec_len = struct.unpack("!BHH", header)
+        if rec_len > 16384:
+            raise ConnectionError(f"record_overflow: düz record uzunluğu {rec_len} > 16384.")
         payload = _recv_all(raw_socket, rec_len)
         if rec_type == 20:
+            # HRR'den sonra sunucu sahte CCS gönderebilir (RFC 8446 §D.4).
+            if payload != b"\x01" or ccs_seen:
+                raise ConnectionError("unexpected_message: geçersiz/tekrarlanan change_cipher_spec.")
+            ccs_seen = True
             continue
         if rec_type == 21:
             raise ConnectionError(f"Sunucu el sıkışmayı reddetti: {describe_alert(payload)}")
         if rec_type != 22:
             raise ConnectionError(f"{what} beklenirken beklenmeyen record tipi: {rec_type}")
+        if not payload:
+            raise ConnectionError("decode_error: boş handshake record'u.")
         buf += payload
         if len(buf) >= 4:
             hs_len = struct.unpack("!I", b"\x00" + buf[1:4])[0]
