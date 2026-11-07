@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import os
 import struct
+import functools
 import datetime
 import warnings
 
@@ -25,7 +26,6 @@ try:
     import certifi
     from cryptography import x509
     from cryptography.x509.verification import PolicyBuilder, Store, VerificationError
-    from cryptography.hazmat.backends import default_backend
     _CERT_VALIDATION_AVAILABLE = True
 except ImportError as _e:
     _CERT_VALIDATION_AVAILABLE = False
@@ -145,16 +145,102 @@ def _parse_tls13_certificate_message(hs_payload: bytes) -> list[bytes]:
     return certs
 
 
-def validate_server_certificate(
-    hs_payload: bytes, hostname: str, ca_path: "str | None" = None
-) -> x509.Certificate:
+# ---------------------------------------------------------------------------
+# Güven deposu (trust store) önbelleği
+#
+# certifi + sistem bundle'ı (~200 kök CA) okumak, PEM'i parse etmek ve Store
+# kurmak handshake başına onlarca ms tutuyordu. Store değiştirilemez (immutable)
+# ve thread-safe olduğundan modül düzeyinde bir kez kurulup paylaşılabilir.
+# Önbellek anahtarı (dosya yolu, mtime_ns, boyut) üçlüleridir: aynı yoldaki
+# dosya değişirse (ör. testlerde yeniden yazılan ca.pem) yeniden yüklenir.
+# ---------------------------------------------------------------------------
+
+_SYSTEM_CA_PATHS = ("/etc/ssl/certs/ca-certificates.crt", "/etc/pki/tls/certs/ca-bundle.crt")
+
+
+def _default_ca_paths() -> tuple:
+    """certifi bundle'ı + bulunan ilk sistem bundle'ı (curl/requests benzeri birleşim)."""
+    paths = [certifi.where()]
+    for sys_ca_path in _SYSTEM_CA_PATHS:
+        if os.path.isfile(sys_ca_path):
+            paths.append(sys_ca_path)
+            break
+    return tuple(paths)
+
+
+def _file_fingerprint(path: str) -> tuple:
+    try:
+        st = os.stat(path)
+        return (os.path.abspath(path), st.st_mtime_ns, st.st_size)
+    except OSError:
+        # Dosya yoksa da anahtar üret; yükleme sırasında anlamlı hata fırlatılır.
+        return (os.path.abspath(path), None, None)
+
+
+@functools.lru_cache(maxsize=16)
+def _build_store(file_keys: tuple):
+    """(yol, mtime, boyut) üçlülerinden Store kurar. lru_cache kendi içinde thread-safe'tir;
+    yarış durumunda en kötü ihtimalle aynı Store iki kez kurulur (doğruluk etkilenmez)."""
+    pem = b""
+    for path, _mtime, _size in file_keys:
+        with open(path, "rb") as f:
+            pem += f.read() + b"\n"
+    with warnings.catch_warnings():
+        # Bazı eski (ama hâlâ geçerli ve yaygın kullanılan) kök CA sertifikaları
+        # RFC 5280'in serial-number pozitiflik kuralına tam uymuyor; bu sadece
+        # bir uyarı, güvenlik açığı değil — CA'nın kendisi hâlâ geçerli.
+        warnings.simplefilter("ignore")
+        certs = x509.load_pem_x509_certificates(pem)
+    return Store(certs)
+
+
+def load_trust_store(ca_path: str | None = None):
+    """Güven deposunu (önbellekli) döner.
+
+    ca_path=None -> certifi + sistem CA bundle'ı.
+    ca_path="ca.pem" -> YALNIZCA o PEM dosyası (requests'in verify="ca.pem" semantiği).
+    """
+    if not _CERT_VALIDATION_AVAILABLE:
+        raise CertificateValidationError(
+            f"Sertifika doğrulama için gerekli kütüphaneler eksik "
+            f"('cryptography' ve 'certifi' paketleri gerekli): {_IMPORT_ERROR}"
+        )
+    paths = _default_ca_paths() if ca_path is None else (os.fspath(ca_path),)
+    try:
+        return _build_store(tuple(_file_fingerprint(p) for p in paths))
+    except Exception as e:
+        raise CertificateValidationError(f"CA bundle yüklenemedi ({', '.join(paths)}): {e}") from e
+
+
+# faz5 dalıyla uyumluluk için takma ad.
+_load_trust_store = load_trust_store
+
+
+def clear_trust_store_cache() -> None:
+    """Önbelleğe alınmış tüm güven depolarını atar (test/benchmark için)."""
+    _build_store.cache_clear()
+
+
+def _validity_error(leaf) -> str | None:
+    now = datetime.datetime.now(datetime.timezone.utc)
+    if now < leaf.not_valid_before_utc:
+        return f"Sertifika henüz geçerli değil (not_valid_before={leaf.not_valid_before_utc})."
+    if now > leaf.not_valid_after_utc:
+        return f"Sertifikanın süresi dolmuş (not_valid_after={leaf.not_valid_after_utc})."
+    return None
+
+
+def validate_server_certificate(hs_payload: bytes, hostname: str, ca_path: str | None = None):
     """
     Sunucudan gelen TLS 1.3 Certificate mesajını doğrular:
-      1. Zincir, güvenilir bir CA'ya (certifi bundle) kadar kurulabiliyor mu?
-         ``ca_path`` verilirse güven kökü YALNIZCA o PEM dosyasıdır
-         (kurumsal/özel CA); certifi ve sistem deposu kullanılmaz.
+      1. Zincir, güvenilir bir CA'ya (certifi + sistem bundle'ı, ya da ca_path) kadar
+         kurulabiliyor mu?
       2. Sertifika süresi geçerli mi (expired/not-yet-valid değil mi)?
       3. Hostname, sertifikanın SAN alanıyla eşleşiyor mu?
+
+    Süre kontrolünü (2) zincirdeki TÜM sertifikalar için cryptography'nin
+    verifier'ı yapar; elle yapılan leaf kontrolü yalnızca doğrulama başarısız
+    olduğunda daha açıklayıcı bir hata mesajı üretmek için kullanılır.
 
     Başarısız olursa CertificateValidationError fırlatır — bu durumda
     çağıran taraf bağlantıyı DERHAL kapatmalı, hiçbir veri alışverişine
@@ -171,58 +257,23 @@ def validate_server_certificate(
     der_certs = _parse_tls13_certificate_message(hs_payload)
 
     try:
-        chain = [x509.load_der_x509_certificate(der, default_backend()) for der in der_certs]
+        chain = [x509.load_der_x509_certificate(der) for der in der_certs]
     except Exception as e:
         raise CertificateValidationError(f"Sertifika parse edilemedi (bozuk DER): {e}") from e
 
     leaf = chain[0]
     intermediates = chain[1:]
 
-    now = datetime.datetime.now(datetime.timezone.utc)
-    if now < leaf.not_valid_before_utc:
-        raise CertificateValidationError(
-            f"Sertifika henüz geçerli değil (not_valid_before={leaf.not_valid_before_utc})."
-        )
-    if now > leaf.not_valid_after_utc:
-        raise CertificateValidationError(
-            f"Sertifikanın süresi dolmuş (not_valid_after={leaf.not_valid_after_utc})."
-        )
-
-    try:
-        ca_bundle_pem = b""
-        if ca_path is not None:
-            with open(ca_path, "rb") as f:
-                ca_bundle_pem = f.read()
-        else:
-            with open(certifi.where(), "rb") as f:
-                ca_bundle_pem += f.read()
-
-        # Sistemin kendi güven deposunu da ekle (ör. kurumsal/sandbox proxy CA'ları
-        # veya yönetici tarafından eklenmiş özel kök sertifikalar için). Bu, curl/requests'in
-        # sistem CA bundle + certifi birleşimiyle çalışma şekline benzer.
-        for sys_ca_path in (() if ca_path is not None else
-                            ("/etc/ssl/certs/ca-certificates.crt", "/etc/pki/tls/certs/ca-bundle.crt")):
-            try:
-                with open(sys_ca_path, "rb") as f:
-                    ca_bundle_pem += b"\n" + f.read()
-                break
-            except OSError:
-                continue
-
-        with warnings.catch_warnings():
-            # Bazı eski (ama hâlâ geçerli ve yaygın kullanılan) kök CA sertifikaları
-            # RFC 5280'in serial-number pozitiflik kuralına tam uymuyor; bu sadece
-            # bir uyarı, güvenlik açığı değil — CA'nın kendisi hâlâ geçerli.
-            warnings.simplefilter("ignore")
-            trust_store = Store(x509.load_pem_x509_certificates(ca_bundle_pem))
-    except Exception as e:
-        raise CertificateValidationError(f"CA bundle yüklenemedi: {e}") from e
+    trust_store = load_trust_store(ca_path)
 
     try:
         builder = PolicyBuilder().store(trust_store).max_chain_depth(32)
         verifier = builder.build_server_verifier(x509.DNSName(hostname))
         verifier.verify(leaf, intermediates)
     except VerificationError as e:
+        validity = _validity_error(leaf)
+        if validity:
+            raise CertificateValidationError(validity) from e
         raise CertificateValidationError(
             f"Sertifika zinciri '{hostname}' için doğrulanamadı (güvenilmeyen CA, "
             f"hostname uyuşmazlığı veya süresi dolmuş ara sertifika olabilir): {e}"
