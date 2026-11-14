@@ -52,6 +52,7 @@ from typing import Callable, Optional
 from ..crypto_math import FastAESGCM, FastChaCha20Poly1305
 from . import cert_validator as _cv
 from .._log import get_logger
+from ..transport.lingering import shutdown_and_drain
 from .alerts import describe_alert
 from .cert_validator import CertificateValidationError
 from .keyshare import (
@@ -1428,5 +1429,7 @@ def negotiate_tls12(raw_socket, host: str, client_hello_record: bytes, server_he
             flush()
     except TLS12Error:
         flush_quiet()          # fatal alert (varsa) best-effort gönder
+        # RST yerine FIN: okunmamış veriyle close() alert'i eş tarafta siler (bkz. lingering).
+        shutdown_and_drain(raw_socket)
         raise
     return sock

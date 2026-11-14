@@ -8,6 +8,7 @@ from __future__ import annotations
 import socket
 from typing import Optional
 
+from ..transport.lingering import shutdown_and_drain
 from .connection import TLSClientConnection
 from ._records import RecordQueue
 
@@ -77,6 +78,8 @@ class SyncTLSSocket:
                     out = self.conn.data_to_send()
                     if out:
                         self.raw_socket.sendall(out)
+                        # RST yerine FIN: okunmamış veriyle close() alert'i eş tarafta siler.
+                        shutdown_and_drain(self.raw_socket)
                 except OSError:
                     pass
                 raise
