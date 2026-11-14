@@ -63,7 +63,18 @@ class SyncTLSSocket:
             data = self.raw_socket.recv(65536)
             if not data:
                 raise ConnectionResetError("TLS şifreli paket beklenirken bağlantı koptu!")
-            self._records.extend(self.conn.receive_data(data))
+            try:
+                self._records.extend(self.conn.receive_data(data))
+            except Exception:
+                # Hata öncesi kuyruğa alınan alert'ler (ör. TLS 1.2 fatal alert /
+                # no_renegotiation uyarıları) best-effort gönderilir.
+                try:
+                    out = self.conn.data_to_send()
+                    if out:
+                        self.raw_socket.sendall(out)
+                except OSError:
+                    pass
+                raise
             out = self.conn.data_to_send()      # ör. KeyUpdate yanıtı
             if out:
                 self.raw_socket.sendall(out)

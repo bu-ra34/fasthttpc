@@ -203,8 +203,9 @@ def parse_server_hello(sh_msg: bytes, sent_session_id: bytes | None = None) -> d
         if random[24:32] in (b"DOWNGRD\x01", b"DOWNGRD\x00"):
             hint = " ServerHello.random DOWNGRD işareti taşıyor — olası downgrade saldırısı."
         raise TLSProtocolError(
-            "protocol_version: Sunucu TLS 1.3 (supported_versions=0x0304) müzakere etmedi. Bu istemci "
-            "TLS 1.2 ve altını desteklemez; downgrade kabul edilmiyor." + hint
+            "protocol_version: Sunucu TLS 1.3 (supported_versions=0x0304) müzakere etmedi ve TLS 1.2 "
+            "(0x0303) de seçmedi. Bu istemci yalnızca TLS 1.3 ve güvenli TLS 1.2 alt kümesini "
+            "destekler; TLS 1.1 ve altı reddedilir." + hint
         )
     # Sürüm kontrolünden SONRA: TLS 1.2 ServerHello'su session_id'mizi geri
     # göndermek zorunda değildir; önce kontrol edilirse kullanıcı TLS 1.2
@@ -627,6 +628,21 @@ def _parse_alpn_from_encrypted_extensions(hs_payload: bytes) -> str:
 def _read_server_hello(raw_socket: socket.socket, allow_ccs: bool = True) -> bytes:
     """Düz (şifresiz) handshake record'larından tam ServerHello mesajını toplar.
 
+    TLS 1.3'te ServerHello sonrasında aynı düz record'da veri kalması protokol
+    ihlalidir; bu sarmalayıcı onu reddeder (TLS 1.2 için bkz. ``_read_server_hello_ex``).
+    """
+    msg, trailing = _read_server_hello_ex(raw_socket, allow_ccs)
+    if trailing:
+        raise _unexpected("ServerHello sonrasında şifresiz handshake verisi.")
+    return msg
+
+
+def _read_server_hello_ex(raw_socket: socket.socket, allow_ccs: bool = True) -> tuple[bytes, bytes]:
+    """(ServerHello, aynı record'da onu izleyen handshake baytları). Ayrıntı: ``_read_server_hello``.
+
+    TLS 1.2 sunucuları ServerHello'yu Certificate/ServerKeyExchange ile AYNI record'a
+    koyabilir; TLS 1.2 yolu bu artık baytları devralır.
+
     ServerHello birden fazla record'a bölünebilir (RFC 8446 §5.1). Mesajdan
     sonra aynı düz record'da artık veri kalırsa (şifresiz EE vb.) reddedilir.
     allow_ccs: mesaj başlamadan önce gelen TEK bir uyumluluk CCS'si (0x01)
@@ -659,22 +675,9 @@ def _read_server_hello(raw_socket: socket.socket, allow_ccs: bool = True) -> byt
             if total > _MAX_SERVER_HELLO:
                 raise TLSProtocolError("decode_error: ServerHello makul boyutu aşıyor.")
             if len(buf) == total:
-                return buf
+                return buf, b""
             if len(buf) > total:
-                raise _unexpected("ServerHello sonrasında şifresiz handshake verisi.")
-
-
-def _tls12_hint(sh_body: bytes) -> str:
-    """TLS 1.2 ServerHello'su için açıklayıcı ek mesaj (TLS 1.2 kapsam dışı)."""
-    if sh_body[:2] != b"\x03\x03":
-        return ""
-    if sh_body[26:34] in (b"DOWNGRD\x01", b"DOWNGRD\x00"):
-        # RFC 8446 §4.1.3: TLS 1.3 destekleyen sunucu daha düşük sürüm seçerse
-        # random'un son 8 byte'ına bu işareti koyar → aktif downgrade saldırısı.
-        return (" UYARI: ServerHello.random downgrade işareti (DOWNGRD) taşıyor — sunucu "
-                "TLS 1.3 destekliyor ama araya giren biri sürümü düşürmüş olabilir.")
-    return (" Sunucu TLS 1.2 ile yanıt verdi; TLS 1.3 desteklemiyor görünüyor. "
-            "TLS 1.2 bilinçli olarak kapsam dışıdır (README).")
+                return buf[:total], buf[total:]
 
 
 _SUITE_HASH = {0x1301: hashlib.sha256, 0x1302: hashlib.sha384, 0x1303: hashlib.sha256}
@@ -830,7 +833,17 @@ class TLSAdapter:
         order = HandshakeOrderValidator()
 
         # ---- ServerHello ---------------------------------------------------
-        server_hello_payload = _read_server_hello(raw_socket)
+        server_hello_payload, sh_trailing = _read_server_hello_ex(raw_socket)
+
+        # TLS 1.2 seçildiyse (legacy_version 0x0303, supported_versions ≠ 0x0304)
+        # güvenli TLS 1.2 alt kümesine dallan (bkz. security/tls12.py).
+        from . import tls12
+        if tls12.is_tls12_server_hello(server_hello_payload):
+            return tls12.negotiate_tls12(
+                raw_socket, host, record_bytes, server_hello_payload, sh_trailing, ca_path=ca_path
+            )
+        if sh_trailing:
+            raise _unexpected("ServerHello sonrasında şifresiz handshake verisi.")
         sh = parse_server_hello(server_hello_payload, sent_session_id)
 
         hrr = None

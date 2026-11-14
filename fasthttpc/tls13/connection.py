@@ -192,6 +192,8 @@ class TLSClientConnection:
         self._cert_seen = False
         self._cv_ok = False
         self._close_sent = False
+        # ServerHello TLS 1.2 seçerse (security/tls12.py) tüm iş buna devredilir.
+        self._t12 = None
 
     # ------------------------------------------------------------------ API
     @property
@@ -217,6 +219,8 @@ class TLSClientConnection:
         """Gönderilmeyi bekleyen tüm byte'ları döner ve tamponu boşaltır."""
         out = bytes(self._outbuf)
         self._outbuf.clear()
+        if self._t12 is not None:
+            out += self._t12.data_to_send()
         return out
 
     def send_application_data(self, data: bytes) -> bytes:
@@ -235,6 +239,9 @@ class TLSClientConnection:
 
         MAX_PLAINTEXT'ten büyük veri birden çok record'a bölünür.
         """
+        if self._t12 is not None:
+            self._t12_call(self._t12.send_record, data, content_type)
+            return
         if self._write is None:
             raise TLSError("Yazma anahtarı yok — handshake başlamadı.")
         if self.state == ST_CLOSED:
@@ -250,12 +257,18 @@ class TLSClientConnection:
         """İstemci kaynaklı KeyUpdate gönderir; yazma anahtarını döndürür."""
         if self.state != ST_CONNECTED:
             raise TLSError("KeyUpdate yalnızca handshake sonrası gönderilebilir.")
+        if self._t12 is not None:
+            raise TLSError("TLS 1.2'de KeyUpdate yoktur.")
         self._seal(C.build_key_update(request_peer), CT_HANDSHAKE)
         self._rotate_write()
         return self.data_to_send()
 
     def close(self) -> bytes:
         """close_notify alert'i üretir (şifreli, handshake sonrası)."""
+        if self._t12 is not None:
+            out = self._t12.close()
+            self.state = ST_CLOSED
+            return out
         if self._write is not None and not self._close_sent and self.state != ST_CLOSED:
             self._seal(b"\x01\x00", CT_ALERT)
             self._close_sent = True
@@ -264,6 +277,8 @@ class TLSClientConnection:
 
     def crypto_state(self) -> dict:
         """EncryptedSocket.state ile uyumlu (salt-okunur) özet."""
+        if self._t12 is not None:
+            return self._t12.crypto_state()
         return {
             "is_tls13": self.cipher_suite is not None,
             "using_app_keys": self.state == ST_CONNECTED,
@@ -284,6 +299,8 @@ class TLSClientConnection:
             raise TLSError("receive_data() initiate()'den önce çağrıldı.")
         if self.state == ST_CLOSED:
             return []
+        if self._t12 is not None:
+            return self._t12_call(self._t12.receive_data, data)
         self._inbuf += data
         events: list[Event] = []
         try:
@@ -298,6 +315,13 @@ class TLSClientConnection:
                 payload = bytes(self._inbuf[5:5 + rlen])
                 del self._inbuf[:5 + rlen]
                 self._handle_record(rtype, header, payload, events)
+                if self._t12 is not None:
+                    # ServerHello TLS 1.2 seçti: kalan baytlar TLS 1.2 çekirdeğinindir.
+                    rest = bytes(self._inbuf)
+                    self._inbuf.clear()
+                    if rest:
+                        events.extend(self._t12_call(self._t12.receive_data, rest))
+                    break
         except TLSError:
             self.state = ST_CLOSED
             raise
@@ -390,6 +414,8 @@ class TLSClientConnection:
             msg = self._hs_buf[:4 + hs_len]
             self._hs_buf = self._hs_buf[4 + hs_len:]
             self._handle_handshake(msg, events)
+            if self._t12 is not None:
+                break                      # kalan baytlar _begin_tls12'de devredildi
             # ServerHello/Finished sonrası anahtar değişir; tamponda kalan veri
             # eski anahtarla gelmiş demektir -> protokol ihlali.
             if self._hs_buf and self._hs_buf_epoch != self._epoch:
@@ -398,7 +424,7 @@ class TLSClientConnection:
     def _handle_handshake(self, msg: bytes, events: list) -> None:
         hs_type = msg[0]
         if self.state == ST_WAIT_SH:
-            self._on_server_hello(msg)
+            self._on_server_hello(msg, events)
             return
         if self.state == ST_WAIT_ENCRYPTED:
             self._on_encrypted_handshake(msg, events)
@@ -409,9 +435,60 @@ class TLSClientConnection:
         raise TLSError(f"unexpected_message: durum={self.state}, hs_type={hs_type}")
 
     # ------------------------------------------------------- ServerHello / HRR
-    def _on_server_hello(self, msg: bytes) -> None:
+    def _begin_tls12(self, msg: bytes, events: list) -> None:
+        """ServerHello TLS 1.2 seçti: güvenli TLS 1.2 alt kümesine devret (security/tls12.py).
+
+        HRR sonrası TLS 1.2 seçimi protokol ihlalidir (sunucu 1.3'ü kabul etmişti).
+        """
+        from ..security import tls12 as _t12mod
+        if self._hrr is not None:
+            raise TLSError("unexpected_message: HelloRetryRequest'ten sonra sunucu TLS 1.2 seçti — "
+                           "protokol ihlali / olası downgrade.")
+        trailing = bytes(self._hs_buf)        # ServerHello'yla aynı record'daki artık handshake baytları
+        self._hs_buf = b""
+        try:
+            self._t12 = _t12mod.TLS12ClientConnection(
+                self.host, self._ch1, ca_path=self.ca_path, cert_validator=self._cert_validator,
+            )
+        except _t12mod.TLS12Error as e:
+            raise TLSError(str(e)) from e
+        self.state = ST_WAIT_ENCRYPTED
+        events.extend(self._t12_call(self._t12.start, msg, trailing))
+
+    def _t12_call(self, fn, *args):
+        """TLS 1.2 çekirdeğini çağırır; hatayı TLSError'a çevirir, durumu senkronlar."""
+        from ..security import tls12 as _t12mod
+        try:
+            res = fn(*args)
+        except _t12mod.TLS12AlertError as e:
+            self.state = ST_CLOSED
+            self._sync_t12()
+            raise TLSAlertError(e.level, e.description, str(e)) from e
+        except _t12mod.TLS12Error as e:
+            self.state = ST_CLOSED
+            self._sync_t12()
+            raise TLSError(str(e)) from e
+        self._sync_t12()
+        return res
+
+    def _sync_t12(self) -> None:
+        t = self._t12
+        self.cipher_suite, self.cipher_name, self.key_len = t.cipher_suite, t.cipher_name, t.key_len
+        self.alpn = t.alpn
+        self.peer_certificate = t.peer_certificate
+        self.signature_scheme = t.signature_scheme
+        if t.closed:
+            self.state = ST_CLOSED
+        elif t.handshake_complete:
+            self.state = ST_CONNECTED
+
+    def _on_server_hello(self, msg: bytes, events: Optional[list] = None) -> None:
         if msg[0] != HS_SERVER_HELLO:
             raise TLSError(f"unexpected_message: ServerHello beklenirken hs_type={msg[0]}")
+        from ..security import tls12 as _t12mod
+        if _t12mod.is_tls12_server_hello(msg):
+            self._begin_tls12(msg, events if events is not None else [])
+            return
         try:
             sh = C.parse_server_hello(msg, self._session_id)
         except C.TLSProtocolError as e:
