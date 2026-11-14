@@ -827,6 +827,11 @@ class Session:
 
                 if not header_buf:
                     raise ConnectionResetError("Sunucu yanıt vermeden bağlantıyı kesti.")
+                if sep == -1:
+                    # CRLF CRLF görülmeden kapanış: yarım başlık bloğu yanıt SAYILMAZ
+                    # (eskiden sep=-1 dilimleri çöp başlık/gövde üretip 200 dönüyordu).
+                    raise ConnectionResetError(
+                        "Sunucu yanıt başlıkları tamamlanmadan bağlantıyı kesti.")
 
                 headers_raw      = header_buf[:sep]
                 first_body_chunk = header_buf[sep + 4:]
