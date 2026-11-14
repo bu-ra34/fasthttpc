@@ -34,7 +34,10 @@ import threading
 import time
 from urllib.parse import parse_qs, urlsplit
 
-import brotli
+try:  # opsiyonel bağımlılık; yalnızca /br yolu kullanır
+    import brotli
+except ImportError:  # pragma: no cover
+    brotli = None
 from cryptography import x509
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import ec
@@ -246,6 +249,9 @@ class YerelSunucu:
             ham = json.dumps({"id": q.get("i", ""), "dolgu": "a" * 5000}).encode()
             if yol == "/gzip":
                 z, enc = gzip.compress(ham), "gzip"
+            elif brotli is None:
+                self._gonder(s, "501 Not Implemented", [], b"brotli kurulu degil")
+                return True
             else:
                 z, enc = brotli.compress(ham), "br"
             self._gonder(s, "200 OK", [("Content-Encoding", enc), ("Content-Type", "application/json")], z)
