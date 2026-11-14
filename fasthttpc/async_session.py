@@ -334,21 +334,39 @@ class AsyncSession:
 
     async def pre_warm(self, hosts: list[str], count: int = 2) -> dict[str, int]:
         """
-        Async pre-warming: asyncio.gather ile paralel TLS handshake.
+        Async pre-warming: asyncio.gather ile paralel bağlantı + TLS handshake.
+
+        ``_connect`` ile aynı yol: ``impersonate`` verilmişse tarayıcı
+        ClientHello'su (AsyncTLSStream), ``proxy``/``proxies``/rotasyon varsa
+        tünel üzerinden. Kurulan HTTP/1.1 bağlantıları keep-alive havuzuna
+        konur (``Limits`` uygulanır), h2 ise önbelleğe alınır; sonraki istekler
+        bu bağlantıları kullanır. ``{host: başarılı bağlantı sayısı}`` döner.
         """
         results: dict[str, int] = {}
 
         async def _warm_one(host: str) -> tuple[str, bool]:
             try:
-                ctx = ssl.create_default_context(cafile=self._ca_path)
-                reader, writer = await asyncio.wait_for(
-                    asyncio.open_connection(host, 443, ssl=ctx),
-                    timeout=self.timeout.connect,
-                )
-                writer.close()
-                await writer.wait_closed()
+                u = URL(f"https://{host}")
+                proxy_cfg, _ = self._select_proxy(u)
+                reader, writer, alpn = await self._connect(u.host, u.port, proxy_cfg)
+            except (OSError, asyncio.TimeoutError, ValueError) as e:  # ssl.SSLError ⊂ OSError
+                logger.debug("Ön ısıtma başarısız %s: %s", host, e)
+                return host, False
+            o = _Opened(reader, writer, alpn, lambda: None, key=self._h1_key(u, proxy_cfg),
+                        loop=asyncio.get_running_loop())
+            try:
+                key = (u.host, u.port, proxy_cfg)
+                if alpn == "h2":
+                    if self._h2_get(key) is None:
+                        await self._start_h2(key, o)
+                        return host, True
+                    await self._h1_finish(o, False)      # zaten canlı h2 var
+                    return host, True
+                if alpn == "http/1.1":
+                    self._origin_proto[key] = "h1"
+                await self._h1_finish(o, True)
                 return host, True
-            except (OSError, asyncio.TimeoutError) as e:  # ssl.SSLError ⊂ OSError
+            except (OSError, asyncio.TimeoutError, ConnectionError) as e:
                 logger.debug("Ön ısıtma başarısız %s: %s", host, e)
                 return host, False
 
@@ -371,25 +389,36 @@ class AsyncSession:
                 return parse_proxy_url(url), url
         return resolve_proxy(self._proxy_spec, u.scheme), None
 
-    async def _connect(self, host: str, port: int, proxy: Optional[ProxyConfig]):
+    async def _connect(self, host: str, port: int, proxy: Optional[ProxyConfig], *,
+                       alpn: Optional[list] = None, tls: bool = True):
         """TCP (+ varsa proxy tüneli) + TLS. ``(reader, writer, alpn)`` döner.
 
         impersonate: tarayıcı ClientHello'su (ALPN = profilin h2, http/1.1
-        listesi); tünel varsa TLS tünelin İÇİNDE, hedef host'a karşı kurulur.
-        impersonate=None: stdlib ssl, yalnızca http/1.1.
+        listesi; ``alpn=`` ile geçersiz kılınabilir, ör. WebSocket için
+        ``["http/1.1"]``); tünel varsa TLS tünelin İÇİNDE, hedef host'a karşı
+        kurulur. impersonate=None: stdlib ssl, yalnızca http/1.1.
+        ``tls=False``: düz TCP (``ws://``), yine proxy tüneli üzerinden olabilir.
         """
         connect_to = self.timeout.connect
 
         async def _go():
+            if not tls:
+                if proxy is None:
+                    reader, writer = await asyncio.open_connection(host, port)
+                else:
+                    reader, writer = await async_connect_via_proxy(
+                        proxy, host, port, timeout=connect_to)
+                return reader, writer, ""
             if self.impersonate is not None:
+                kw = {"alpn": list(alpn)} if alpn is not None else {}
                 if proxy is None:
                     stream = await AsyncTLSStream.connect(
-                        host, port, self.impersonate, ca_path=self._ca_path)
+                        host, port, self.impersonate, ca_path=self._ca_path, **kw)
                 else:
                     reader, writer = await async_connect_via_proxy(proxy, host, port, timeout=connect_to)
                     try:
                         stream = await AsyncTLSStream.negotiate(
-                            reader, writer, host, self.impersonate, ca_path=self._ca_path)
+                            reader, writer, host, self.impersonate, ca_path=self._ca_path, **kw)
                     except BaseException:
                         writer.close()
                         raise
@@ -1100,13 +1129,24 @@ class AsyncSession:
             running = None
         idle = [o for lst in self._idle.values() for o in lst]
         self._idle = {}
+        waits = []
         for o in idle:
             self._drop_conn(o)
             if o.loop is running:
-                try:
-                    await o.writer.wait_closed()
-                except OSError as e:
-                    logger.debug("wait_closed hatası yok sayıldı: %s", e)
+                waits.append((o, asyncio.ensure_future(o.writer.wait_closed())))
+        if waits:
+            # Karşı taraf TLS close_notify'a yanıt vermezse (ssl kapanış zaman aşımı
+            # 30 sn) close() takılmasın: kısa süre bekle, kalanı arka planda kapanır.
+            _, pending = await asyncio.wait([t for _, t in waits], timeout=1.0)
+            for o, t in waits:
+                if t in pending:
+                    t.cancel()
+                    inner = getattr(o.writer, "writer", o.writer)
+                    transport = getattr(inner, "transport", None)
+                    if transport is not None:
+                        transport.abort()       # TCP'yi şimdi bırak
+                elif not t.cancelled() and t.exception() is not None:
+                    logger.debug("wait_closed hatası yok sayıldı: %s", t.exception())
         for c in conns:
             if c.loop is running:
                 await c.close()
@@ -1125,68 +1165,124 @@ class AsyncSession:
                                                                                
 
 class AsyncWebSocket:
-    """asyncio tabanlı WebSocket bağlantısı."""
+    """asyncio tabanlı WebSocket bağlantısı (``ws://`` ve ``wss://``).
+
+    Bağlantı :meth:`AsyncSession._connect` ile kurulur: ``impersonate`` varsa
+    tarayıcı ClientHello'su (ALPN yalnızca ``http/1.1``; WebSocket h2 üzerinden
+    yükseltilemez), ``proxy``/``proxies``/rotasyon varsa proxy tüneli üzerinden.
+    """
 
     GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
 
-    def __init__(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
+    def __init__(self, reader, writer):
         self._reader = reader
         self._writer = writer
-        self._buf    = b""
+        self._buf    = bytearray()
+        self._closed = False
 
     @classmethod
     async def connect(cls, url: str, session: AsyncSession) -> "AsyncWebSocket":
         import base64, hashlib, os
+        from urllib.parse import urlparse
+        from .protocol.http2_parser import _validate_ws_handshake_response
         u   = URL(url)
+        tls = u.scheme in ("wss", "https")
+        # URL modeli şema-varsayılan portu yalnızca http/https için bilir.
+        port = urlparse(str(url)).port or (443 if tls else 80)
         key = base64.b64encode(os.urandom(16)).decode()
+        expected = base64.b64encode(hashlib.sha1((key + cls.GUID).encode()).digest()).decode()
 
-        ctx = ssl.create_default_context(cafile=session._ca_path)
-        reader, writer = await asyncio.open_connection(u.host, u.port, ssl=ctx)
+        proxy_cfg, proxy_url = session._select_proxy(u)
+        try:
+            reader, writer, _ = await session._connect(
+                u.host, port, proxy_cfg, alpn=["http/1.1"], tls=tls)
+        except Exception:
+            if proxy_url and session._rotator:
+                session._rotator.mark_failed(proxy_url)
+            raise
 
-        req = (
-            f"GET {u.raw_path.decode()} HTTP/1.1\r\n"
-            f"Host: {u.host}\r\n"
-            f"Upgrade: websocket\r\n"
-            f"Connection: Upgrade\r\n"
-            f"Sec-WebSocket-Key: {key}\r\n"
-            f"Sec-WebSocket-Version: 13\r\n\r\n"
-        )
-        writer.write(req.encode())
-        await writer.drain()
+        try:
+            default = 443 if tls else 80
+            host = f"[{u.host}]" if ":" in u.host else u.host
+            hostport = host if port == default else f"{host}:{port}"
+            req = (
+                f"GET {u.raw_path.decode()} HTTP/1.1\r\n"
+                f"Host: {hostport}\r\n"
+                f"Upgrade: websocket\r\n"
+                f"Connection: Upgrade\r\n"
+                f"Sec-WebSocket-Key: {key}\r\n"
+                f"Sec-WebSocket-Version: 13\r\n\r\n"
+            )
+            writer.write(req.encode("latin-1"))
+            await asyncio.wait_for(writer.drain(), session.timeout.write)
 
-        resp = b""
-        while b"\r\n\r\n" not in resp:
-            resp += await reader.read(4096)
+            resp = bytearray()
+            while b"\r\n\r\n" not in resp:
+                chunk = await asyncio.wait_for(reader.read(4096), session.timeout.read)
+                if not chunk:
+                    raise ConnectionError(
+                        f"WebSocket Upgrade yanıtı tamamlanmadan bağlantı kapandı: {bytes(resp[:200])!r}")
+                resp += chunk
+                if len(resp) > 65536:
+                    raise ConnectionError("WebSocket Upgrade yanıt başlığı çok büyük.")
+            head, _, leftover = bytes(resp).partition(b"\r\n\r\n")
+            _validate_ws_handshake_response(head, expected)
+        except BaseException:
+            writer.close()
+            raise
 
-        if b"101" not in resp:
-            raise ConnectionError("WebSocket Upgrade başarısız")
-
-        return cls(reader, writer)
+        ws = cls(reader, writer)
+        ws._buf += leftover          # 101'den hemen sonra gelen frame'ler kaybolmasın
+        return ws
 
     async def send_text(self, text: str) -> None:
         from .protocol.http2_parser import WebSocketFrame
-        frame = WebSocketFrame(WebSocketFrame.OP_TEXT, text.encode())
+        frame = WebSocketFrame(WebSocketFrame.OP_TEXT, text.encode("utf-8"))
         self._writer.write(frame.serialize())
         await self._writer.drain()
 
-    async def recv_text(self) -> str:
+    async def send_binary(self, data: bytes) -> None:
+        from .protocol.http2_parser import WebSocketFrame
+        frame = WebSocketFrame(WebSocketFrame.OP_BINARY, bytes(data))
+        self._writer.write(frame.serialize())
+        await self._writer.drain()
+
+    async def recv(self) -> "tuple[int, bytes]":
+        """Tek frame oku. Döner: ``(opcode, payload)``; bağlantı kapanırsa ``(OP_CLOSE, b"")``."""
         from .protocol.http2_parser import WebSocketFrame
         while True:
-            frame, consumed = WebSocketFrame.parse(self._buf)
+            frame, consumed = WebSocketFrame.parse(bytes(self._buf))
             if frame:
-                self._buf = self._buf[consumed:]
+                del self._buf[:consumed]
                 if frame.opcode == WebSocketFrame.OP_PING:
                     pong = WebSocketFrame(WebSocketFrame.OP_PONG, frame.payload)
                     self._writer.write(pong.serialize())
                     await self._writer.drain()
                     continue
-                return frame.payload.decode("utf-8", errors="replace")
+                if frame.opcode == WebSocketFrame.OP_CLOSE:
+                    self._closed = True
+                return frame.opcode, frame.payload
             chunk = await self._reader.read(4096)
             if not chunk:
-                return ""
+                self._closed = True
+                return WebSocketFrame.OP_CLOSE, b""
             self._buf += chunk
 
+    async def recv_text(self) -> str:
+        """Sıradaki frame'in metni (kapanışta ``""``)."""
+        _, payload = await self.recv()
+        return payload.decode("utf-8", errors="replace")
+
     async def close(self) -> None:
+        if not self._closed:
+            from .protocol.http2_parser import WebSocketFrame
+            self._closed = True
+            try:
+                self._writer.write(WebSocketFrame(
+                    WebSocketFrame.OP_CLOSE, (1000).to_bytes(2, "big")).serialize())
+                await asyncio.wait_for(self._writer.drain(), 2.0)
+            except (OSError, asyncio.TimeoutError, RuntimeError) as e:
+                logger.debug("WebSocket CLOSE frame'i gönderilemedi: %s", e)
         self._writer.close()
         try:
             await self._writer.wait_closed()

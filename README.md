@@ -279,6 +279,11 @@ verir veya belgelenmiştir:
   serbest kalır). Havuzdan alınan bağlantı yanıttan hiç bayt gelmeden koparsa
   (ve hata zaman aşımı değilse) istek bir kez taze bağlantıyla yeniden denenir;
   zaman aşımı veya yarım yanıtta yeniden denenmez (POST çift gönderilmez).
+  `AsyncSession.pre_warm` ve `ws_connect` aynı bağlantı yolunu kullanır:
+  `impersonate` ile tarayıcı ClientHello'su (WebSocket'te ALPN yalnızca
+  `http/1.1`), `proxy=` / `proxies=` / rotasyon ile tünel üzerinden; `ws://` ve
+  `wss://` desteklenir. `pre_warm` ısıttığı HTTP/1.1 bağlantılarını keep-alive
+  havuzuna, h2 bağlantısını h2 önbelleğine koyar.
 - **AsyncSession proxy:** `proxy=` / `proxies=` senkron `Session` ile aynı
   anlamdadır (HTTP CONNECT + Basic, SOCKS5 / RFC 1929; `https://` proxy yok).
   Tünelin içinde hem `impersonate` (kendi TLS 1.3 yığını) hem stdlib `ssl`
