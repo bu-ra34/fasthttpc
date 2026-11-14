@@ -912,6 +912,7 @@ class Http2Connection:
         self.goaway: Optional[tuple[int, int]] = None
         self._pending_frames: list[HTTP2Frame] = []
         self._lock = threading.Lock()
+        self._foreign_hblock = bytearray()
         self.debug = debug or __import__("os").environ.get("FASTHTTPC_H2_DEBUG") == "1"
 
     def _dbg(self, msg: str) -> None:
@@ -1099,7 +1100,7 @@ class Http2Connection:
             self._conn_window_send -= len(chunk)
             self._stream_windows[stream_id] -= len(chunk)
 
-    def request(
+    def request_stream(
         self,
         method: str,
         authority: str,
@@ -1107,13 +1108,17 @@ class Http2Connection:
         headers: list[tuple[str, str]],
         body: bytes = b"",
         scheme: str = "https",
-    ) -> tuple[int, list[tuple[str, str]], bytes]:
+    ) -> "H2ClientStream":
+        """İsteği gönderir, yanıt BAŞLIKLARI gelene kadar bekler ve gövdeyi isteğe
+        bağlı (parça parça) okuyan bir :class:`H2ClientStream` döner.
+
+        Bağlantı, akış bitene/``close()`` edilene kadar bu akışa aittir (kilit
+        tutulur): bu minimal istemcide aynı anda tek stream vardır. Geri basınç:
+        DATA frame'leri yalnızca tüketici ``read_chunk()`` çağırdıkça okunur ve
+        WINDOW_UPDATE o anda gönderilir; okunmayan veri sınırsız tamponlanmaz.
         """
-        Tek bir HTTP/2 isteği gönderir ve tam yanıtı bekler.
-        Döner: (status_code, header_listesi, body_bytes)
-        Aynı bağlantı üzerinde ardışık çağrılabilir (her çağrı yeni stream_id alır).
-        """
-        with self._lock:
+        self._lock.acquire()
+        try:
             if self.goaway is not None:
                 raise Http2RefusedError(
                     f"Bağlantı GOAWAY almış (last_stream_id={self.goaway[0]}); yeni stream açılmaz.")
@@ -1129,116 +1134,213 @@ class Http2Connection:
             if body:
                 self._send_data(stream_id, body)
 
-            resp_header_block = bytearray()
-            resp_body = bytearray()
-            status_code = 0
-            resp_headers: list[tuple[str, str]] = []
-            headers_done = False
-            stream_ended = False
+            st = H2ClientStream(self, stream_id)
+            while not st.headers_done and not st.ended:
+                early = self._step(st)
+                if early:
+                    st._early += early
+            return st
+        except BaseException:
+            self._lock.release()
+            raise
 
-            while not stream_ended:
-                frame = self._read_frame()
-                self._dbg(f"gelen frame: {frame!r}")
+    def request(
+        self,
+        method: str,
+        authority: str,
+        path: str,
+        headers: list[tuple[str, str]],
+        body: bytes = b"",
+        scheme: str = "https",
+    ) -> tuple[int, list[tuple[str, str]], bytes]:
+        """
+        Tek bir HTTP/2 isteği gönderir ve tam yanıtı bekler.
+        Döner: (status_code, header_listesi, body_bytes)
+        Aynı bağlantı üzerinde ardışık çağrılabilir (her çağrı yeni stream_id alır).
+        """
+        st = self.request_stream(method, authority, path, headers, body, scheme)
+        out = bytearray()
+        try:
+            while True:
+                c = st.read_chunk()
+                if not c:
+                    break
+                out += c
+        except BaseException:
+            st._release()
+            raise
+        return st.status, st.headers, bytes(out)
 
-                if frame.stream_id != 0 and frame.stream_id != stream_id:
-                    # Bize ait olmayan stream'e ait frame (bu basit modelde beklenmez, yut)
-                    self._dbg(f"  -> beklenmeyen stream_id, yutuluyor (bizim stream={stream_id})")
-                    if frame.type == FrameType.RST_STREAM:
-                        continue
-                    continue
+    _ERR_NAMES = {
+        0: "NO_ERROR", 1: "PROTOCOL_ERROR", 2: "INTERNAL_ERROR",
+        3: "FLOW_CONTROL_ERROR", 4: "SETTINGS_TIMEOUT", 5: "STREAM_CLOSED",
+        6: "FRAME_SIZE_ERROR", 7: "REFUSED_STREAM", 8: "CANCEL",
+        9: "COMPRESSION_ERROR", 10: "CONNECT_ERROR", 11: "ENHANCE_YOUR_CALM",
+        12: "INADEQUATE_SECURITY", 13: "HTTP_1_1_REQUIRED",
+    }
 
-                if frame.type == FrameType.SETTINGS:
-                    self._handle_settings(frame)
-                elif frame.type == FrameType.WINDOW_UPDATE:
-                    self._handle_window_update(frame)
-                elif frame.type == FrameType.PING:
-                    if not (frame.flags & 0x1):
-                        pong = HTTP2Frame(len(frame.payload), FrameType.PING, 0x1, 0, frame.payload)
-                        self.sock.send_record(pong.serialize())
-                elif frame.type == FrameType.GOAWAY:
-                    self._on_goaway(frame, stream_id)
-                elif frame.type == FrameType.RST_STREAM:
-                    err_code = struct.unpack("!I", frame.payload[:4])[0] if len(frame.payload) >= 4 else -1
-                    err_names = {
-                        0: "NO_ERROR", 1: "PROTOCOL_ERROR", 2: "INTERNAL_ERROR",
-                        3: "FLOW_CONTROL_ERROR", 4: "SETTINGS_TIMEOUT", 5: "STREAM_CLOSED",
-                        6: "FRAME_SIZE_ERROR", 7: "REFUSED_STREAM", 8: "CANCEL",
-                        9: "COMPRESSION_ERROR", 10: "CONNECT_ERROR", 11: "ENHANCE_YOUR_CALM",
-                        12: "INADEQUATE_SECURITY", 13: "HTTP_1_1_REQUIRED",
-                    }
-                    err_name = err_names.get(err_code, f"UNKNOWN({err_code})")
-                    raise Http2StreamError(
-                        f"Stream {stream_id} sıfırlandı (RST_STREAM), error_code={err_code} [{err_name}]."
-                    )
-                elif frame.type in (FrameType.HEADERS, FrameType.CONTINUATION):
-                    # HEADERS frame'i PADDED (0x8) ve/veya PRIORITY (0x20)
-                    # flag'leri taşıyabilir. Bu durumda payload'ın BAŞINDA
-                    # pad-length (1 byte) ve/veya priority (5 byte) alanları
-                    # bulunur; bunları AYIKLAMADAN HPACK'e vermek header
-                    # bloğunu bozar ve :status çöp çıkar. Cloudflare ve Google
-                    # bu alanları kullanır, o yüzden h2 yolu patlıyordu.
-                    # CONTINUATION'da bu alanlar YOKTUR.
-                    if frame.type == FrameType.HEADERS:
-                        resp_header_block += _strip_headers_frame_fields(frame)
+    def _send_window_updates(self, stream_id: int, n: int, stream: bool = True) -> None:
+        self.sock.send_record(HTTP2Frame(4, FrameType.WINDOW_UPDATE, 0, 0,
+                                         struct.pack("!I", n)).serialize())
+        if stream:
+            self.sock.send_record(HTTP2Frame(4, FrameType.WINDOW_UPDATE, 0, stream_id,
+                                             struct.pack("!I", n)).serialize())
+
+    def _foreign_frame(self, frame: HTTP2Frame) -> None:
+        """Bizim stream'imize ait olmayan frame (ör. CANCEL ile bırakılan eski stream).
+
+        HPACK durumu bağlantı genelinde olduğundan başlık blokları yine de
+        decode edilir; DATA'nın bağlantı penceresi geri açılır (yoksa her iptal
+        bağlantı penceresini kalıcı daraltırdı)."""
+        if frame.type in (FrameType.HEADERS, FrameType.CONTINUATION):
+            if frame.type == FrameType.HEADERS:
+                self._foreign_hblock = bytearray(_strip_headers_frame_fields(frame))
+            else:
+                self._foreign_hblock += frame.payload
+            if frame.end_headers:
+                blk, self._foreign_hblock = bytes(self._foreign_hblock), bytearray()
+                try:
+                    self._decoder.decode(blk)
+                except HpackDecodingError as e:
+                    self._send_goaway(HpackDecodingError.error_code)
+                    raise Http2ConnectionError(f"COMPRESSION_ERROR: {e}") from e
+        elif frame.type == FrameType.DATA and frame.payload:
+            self._send_window_updates(frame.stream_id, len(frame.payload), stream=False)
+
+    def _step(self, st: "H2ClientStream") -> bytes:
+        """Bir frame okur/işler; DATA ise (padding'siz) gövde baytlarını döner."""
+        frame = self._read_frame()
+        self._dbg(f"gelen frame: {frame!r}")
+        stream_id = st.stream_id
+
+        if frame.stream_id != 0 and frame.stream_id != stream_id:
+            self._dbg(f"  -> beklenmeyen stream_id, yutuluyor (bizim stream={stream_id})")
+            self._foreign_frame(frame)
+            return b""
+
+        if frame.type == FrameType.SETTINGS:
+            self._handle_settings(frame)
+        elif frame.type == FrameType.WINDOW_UPDATE:
+            self._handle_window_update(frame)
+        elif frame.type == FrameType.PING:
+            if not (frame.flags & 0x1):
+                pong = HTTP2Frame(len(frame.payload), FrameType.PING, 0x1, 0, frame.payload)
+                self.sock.send_record(pong.serialize())
+        elif frame.type == FrameType.GOAWAY:
+            self._on_goaway(frame, stream_id)
+        elif frame.type == FrameType.RST_STREAM:
+            err_code = struct.unpack("!I", frame.payload[:4])[0] if len(frame.payload) >= 4 else -1
+            err_name = self._ERR_NAMES.get(err_code, f"UNKNOWN({err_code})")
+            raise Http2StreamError(
+                f"Stream {stream_id} sıfırlandı (RST_STREAM), error_code={err_code} [{err_name}]."
+            )
+        elif frame.type in (FrameType.HEADERS, FrameType.CONTINUATION):
+            # HEADERS frame'i PADDED (0x8) ve/veya PRIORITY (0x20) flag'leri
+            # taşıyabilir; bu alanlar AYIKLANMADAN HPACK'e verilirse header bloğu
+            # bozulur (Cloudflare/Google kullanır). CONTINUATION'da yoktur.
+            if frame.type == FrameType.HEADERS:
+                st._hblock += _strip_headers_frame_fields(frame)
+            else:
+                st._hblock += frame.payload
+            if len(st._hblock) > HPACK_MAX_HEADER_LIST_SIZE:
+                self._send_goaway(0xB)  # ENHANCE_YOUR_CALM
+                raise Http2ConnectionError(
+                    "Sıkıştırılmış header bloğu sınırı aşıldı (HEADERS/CONTINUATION seli)."
+                )
+            if frame.end_headers:
+                try:
+                    decoded = self._decoder.decode(bytes(st._hblock))
+                except HpackDecodingError as e:
+                    self._send_goaway(HpackDecodingError.error_code)
+                    raise Http2ConnectionError(f"COMPRESSION_ERROR: {e}") from e
+                # HPACK durumu bağlantı genelinde: her blok TAM BİR KEZ decode
+                # edilmeli ve tampon sıfırlanmalı (1xx ara yanıtlar, trailer'lar).
+                st._hblock = bytearray()
+                block_status = 0
+                block_headers = []
+                for k, v in decoded:
+                    if k == ":status":
+                        block_status = int(v)
                     else:
-                        resp_header_block += frame.payload
-                    if len(resp_header_block) > HPACK_MAX_HEADER_LIST_SIZE:
-                        self._send_goaway(0xB)  # ENHANCE_YOUR_CALM
-                        raise Http2ConnectionError(
-                            "Sıkıştırılmış header bloğu sınırı aşıldı (HEADERS/CONTINUATION seli)."
-                        )
-                    if frame.end_headers:
-                        try:
-                            decoded = self._decoder.decode(bytes(resp_header_block))
-                        except HpackDecodingError as e:
-                            self._send_goaway(HpackDecodingError.error_code)
-                            raise Http2ConnectionError(f"COMPRESSION_ERROR: {e}") from e
-                        # HPACK durumu bağlantı genelinde tutulduğu için her
-                        # blok TAM OLARAK BİR KEZ decode edilmeli ve tampon
-                        # sıfırlanmalıdır. Sıfırlanmazsa 1xx ara yanıtları ve
-                        # trailer'lar önceki bloğa eklenip HPACK'i bozar.
-                        resp_header_block = bytearray()
+                        block_headers.append((k, v))
+                if 100 <= block_status < 200:
+                    self._dbg(f"  -> ara yanıt {block_status}, yok sayılıyor")
+                elif st.headers_done:
+                    st.headers.extend(block_headers)      # trailer
+                else:
+                    st.headers_done = True
+                    st.status = block_status
+                    st.headers.extend(block_headers)
+            if frame.type == FrameType.HEADERS and frame.end_stream:
+                st.ended = True
+        elif frame.type == FrameType.DATA:
+            # DATA da PADDED olabilir; pencere HAM uzunluk (padding dahil) üzerinden açılır.
+            raw_len = len(frame.payload)
+            data = _strip_data_frame_padding(frame)
+            if frame.end_stream:
+                st.ended = True
+            if raw_len > 0:
+                # Tüketici bu veriyi isteyince (frame ancak o zaman okunur) pencere açılır.
+                self._send_window_updates(stream_id, raw_len)
+            return data
+        # PRIORITY, PUSH_PROMISE vb. bu minimal modelde yok sayılır
+        return b""
 
-                        block_status = 0
-                        block_headers = []
-                        for k, v in decoded:
-                            if k == ":status":
-                                block_status = int(v)
-                            else:
-                                block_headers.append((k, v))
 
-                        if 100 <= block_status < 200:
-                            # Ara yanıt (100-continue, 103 Early Hints):
-                            # nihai yanıt henüz gelmedi, bunu atla.
-                            self._dbg(f"  -> ara yanıt {block_status}, yok sayılıyor")
-                        elif headers_done:
-                            # Gövdeden SONRA gelen HEADERS = trailer
-                            resp_headers.extend(block_headers)
-                        else:
-                            headers_done = True
-                            status_code = block_status
-                            resp_headers.extend(block_headers)
-                    if frame.type == FrameType.HEADERS and frame.end_stream:
-                        stream_ended = True
-                elif frame.type == FrameType.DATA:
-                    # DATA da PADDED olabilir; padding gövdeye dahil edilmemeli.
-                    # Ancak akış kontrolü penceresi HAM uzunluk (padding dahil)
-                    # üzerinden geri açılır — sunucu byte'ı öyle saydı.
-                    ham_uzunluk = len(frame.payload)
-                    resp_body += _strip_data_frame_padding(frame)
-                    if ham_uzunluk > 0:
-                        # basit flow control: aldığımız kadarını hemen geri açıyoruz
-                        wu_conn = HTTP2Frame(4, FrameType.WINDOW_UPDATE, 0, 0,
-                                              struct.pack("!I", ham_uzunluk))
-                        wu_stream = HTTP2Frame(4, FrameType.WINDOW_UPDATE, 0, stream_id,
-                                                struct.pack("!I", ham_uzunluk))
-                        self.sock.send_record(wu_conn.serialize())
-                        self.sock.send_record(wu_stream.serialize())
-                    if frame.end_stream:
-                        stream_ended = True
-                # PRIORITY, PUSH_PROMISE vb. bu minimal modelde yok sayılır
+class H2ClientStream:
+    """:meth:`Http2Connection.request_stream` dönüşü: yanıt başlıkları hazır,
+    gövde ``read_chunk()`` ile parça parça okunur (``b""`` = akış bitti).
 
-            return status_code, resp_headers, bytes(resp_body)
+    Akış bitince (ya da ``close()``/hata) bağlantı kilidi serbest kalır.
+    ``close()`` bitmemiş akışı RST_STREAM(CANCEL) ile iptal eder; bağlantı yaşar.
+    """
+
+    def __init__(self, conn: Http2Connection, stream_id: int):
+        self._conn = conn
+        self.stream_id = stream_id
+        self.status = 0
+        self.headers: list[tuple[str, str]] = []
+        self.headers_done = False
+        self.ended = False
+        self.cancelled = False
+        self.broken = False           # g/ç hatası: bağlantı yeniden kullanılmamalı
+        self._hblock = bytearray()
+        self._early = bytearray()
+        self._released = False
+
+    def _release(self) -> None:
+        if not self._released:
+            self._released = True
+            self._conn._lock.release()
+
+    def read_chunk(self) -> bytes:
+        if self._early:
+            data, self._early = bytes(self._early), bytearray()
+            return data
+        try:
+            while not self.ended:
+                data = self._conn._step(self)
+                if data:
+                    return data
+        except BaseException:
+            self.broken = True
+            self._release()
+            raise
+        self._release()
+        return b""
+
+    def close(self) -> None:
+        """Bitmediyse stream'i iptal eder (CANCEL) ve bağlantıyı serbest bırakır."""
+        if self._released:
+            return
+        if not self.ended:
+            try:
+                self._conn.sock.send_record(HTTP2Frame(
+                    4, FrameType.RST_STREAM, 0, self.stream_id, struct.pack("!I", 8)).serialize())
+                self.cancelled = True
+            except OSError:
+                self.broken = True
+        self._release()
 
 
 class HTTP2Detector:
@@ -1624,104 +1726,13 @@ def iter_content(
     **kwargs,
 ) -> Generator[bytes, None, None]:
     """
-    Büyük response'ları belleğe yüklemeden chunk'lar halinde üretir.
-    Streaming gzip/brotli/zstd decompress dahil.
+    Büyük response'ları belleğe yüklemeden chunk'lar halinde üretir (açılmış
+    gövde). ``session.request(..., stream=True)`` üzerine kuruludur: h1/h2,
+    chunked/Content-Length, yönlendirme ve bağlantı havuzu aynen geçerlidir.
 
     Kullanım:
         for chunk in iter_content(session, "GET", "https://example.com/bigfile"):
             process(chunk)
     """
-    from ..models.urls import URL as FURL
-    from ..security.tls_adapter import TLSAdapter
-    from ..fingerprint import drop_h2_only_defaults, merge_default_headers, order_h1
-
-    u    = FURL(url) if isinstance(url, str) else url
-    req_headers = kwargs.get("headers", {})
-
-    conn = session.pool.acquire(u)
-    if not conn.tls_established:
-        conn.socket = TLSAdapter.negotiate(conn.socket, u.host, session.impersonate)
-        conn.socket.raw_socket.settimeout(session.timeout)
-        conn.tls_established = True
-
-    pairs = [("Host", u.host), ("Connection", "keep-alive")]
-    pairs += merge_default_headers(
-        session.impersonate, session._merged_headers(req_headers))
-    req_str = f"{method} {u.raw_path.decode()} HTTP/1.1\r\n"
-    for k, v in order_h1(session.impersonate,
-                         drop_h2_only_defaults(session.impersonate, pairs)):
-        req_str += f"{k}: {v}\r\n"
-    req_str += "\r\n"
-    conn.socket.send_record(req_str.encode("ascii"))
-
-                
-    hdr_buf = b""
-    while b"\r\n\r\n" not in hdr_buf:
-        msg, mt = conn.socket.recv_record(skip_post_handshake=True)
-        if mt == 23: hdr_buf += msg
-        if not msg: break
-
-    sep        = hdr_buf.find(b"\r\n\r\n")
-    body_start = hdr_buf[sep + 4:]
-
-                             
-    enc = ""
-    for line in hdr_buf[:sep].split(b"\r\n")[1:]:
-        if b"content-encoding" in line.lower():
-            enc = line.split(b":", 1)[1].strip().decode().lower()
-            break
-
-    is_chunked = b"transfer-encoding: chunked" in hdr_buf[:sep].lower()
-
-    decomp = StreamingDecompressor(enc) if enc else None
-
-    def _decompress(data: bytes) -> bytes:
-        return decomp.decompress(data) if decomp else data
-
-    try:
-                              
-        buf = bytearray(body_start)
-
-        if is_chunked:
-            pos = 0
-            while True:
-                                    
-                while b"\r\n" not in bytes(buf[pos:]):
-                    msg, mt = conn.socket.recv_record(skip_post_handshake=True)
-                    if mt == 23: buf.extend(msg)
-                    if not msg: return
-                nl = bytes(buf).find(b"\r\n", pos)
-                sz_line = bytes(buf[pos:nl]).split(b";")[0].strip()
-                try: chunk_sz = int(sz_line, 16)
-                except ValueError: return
-                if chunk_sz == 0: break
-                pos = nl + 2
-                end = pos + chunk_sz
-                while len(buf) < end + 2:
-                    msg, mt = conn.socket.recv_record(skip_post_handshake=True)
-                    if mt == 23: buf.extend(msg)
-                    if not msg: break
-                                               
-                data = bytes(buf[pos:end])
-                pos  = end + 2
-                for i in range(0, len(data), chunk_size):
-                    yield _decompress(data[i:i + chunk_size])
-        else:
-                                                         
-            while True:
-                if len(buf) >= chunk_size:
-                    yield _decompress(bytes(buf[:chunk_size]))
-                    buf = buf[chunk_size:]
-                msg, mt = conn.socket.recv_record(skip_post_handshake=True)
-                if mt == 23:
-                    buf.extend(msg)
-                elif not msg:
-                    break
-            if buf:
-                yield _decompress(bytes(buf))
-            if decomp:
-                tail = decomp.flush()
-                if tail:
-                    yield tail
-    finally:
-        session.pool.release(conn)
+    with session.request(method, url, stream=True, **kwargs) as r:
+        yield from r.iter_bytes(chunk_size)
