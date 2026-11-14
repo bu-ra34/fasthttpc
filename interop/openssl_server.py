@@ -46,7 +46,7 @@ class SServer:
             self.proc = subprocess.Popen(
                 [OPENSSL, "s_server", "-accept", f"127.0.0.1:{self.port}", *self.args],
                 stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                cwd=self.cwd, env={**os.environ, "OPENSSL_CONF": "/dev/null"})
+                cwd=self.cwd, env={**os.environ, "OPENSSL_CONF": os.devnull})
             threading.Thread(target=self._pump, daemon=True).start()
             if self._wait_ready():
                 return self
