@@ -200,7 +200,7 @@ def test_async_session_impersonate_tls13_cekirdegini_kullanir(tmp_path, monkeypa
             assert resp.body == b"parmak izi tamam"
             assert s.cookies.get("s") == "1"
             ch = servers[0].client_hellos[0]
-            assert ch["alpn"] == ["http/1.1"]
+            assert ch["alpn"] == ["h2", "http/1.1"]      # profilin ALPN'i (artık sabit değil)
             assert ch["exts"][0][5:].decode() == "localhost"     # SNI
             assert servers[0].requests[0].startswith(b"GET /yol HTTP/1.1\r\n")
             await s.close()
