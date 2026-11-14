@@ -52,7 +52,10 @@ class SyncH3Connection:
                         data = self._sock.recv(65535)
                     except (BlockingIOError, InterruptedError):
                         break
-                    except ConnectionRefusedError:
+                    except (ConnectionRefusedError, ConnectionResetError):
+                        # Linux: ECONNREFUSED. Windows: önceki gönderime ICMP port unreachable
+                        # gelince SONRAKİ recv WSAECONNRESET (10054, ConnectionResetError) verir
+                        # (SIO_UDP_CONNRESET). İkisi de aynı: eş bu porta dinlemiyor.
                         raise Http3Error("UDP: bağlantı reddedildi (ICMP port unreachable)") from None
                     core.receive(data, self._target)
             core.handle_timer()
