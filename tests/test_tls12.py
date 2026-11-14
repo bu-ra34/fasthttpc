@@ -478,8 +478,9 @@ def test_fake_hello_request_no_renegotiation_uyarisi(pki, files):
 def test_fake_hello_request_seli_kapatir(pki, files):
     srv, es, t = _run_fake(pki, files, tamper={"hello_request_flood"})
     with pytest.raises(ConnectionError, match="no_renegotiation|renegotiation"):
-        es.send_record(b"x")
-        for _ in range(5):            # echo + HelloRequest'ler; son okumadan sonra RST olmasın
+        # Uygulama verisi GÖNDERİLMEZ: sunucunun yanıtı (echo) istemci kapandıktan sonra
+        # gelirse RST oluşur ve sunucu alert'leri okuyamadan kaybedebilir.
+        for _ in range(tls12.MAX_HELLO_REQUESTS + 2):
             es.recv_record(skip_post_handshake=True)
     es.close()
     t.join(5)
