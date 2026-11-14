@@ -59,6 +59,7 @@ from .keyshare import (
     generate_key_share,
     group_name,
 )
+from . import mtls as _mtls
 from .tls_adapter import TLSProtocolError
 from ..tls13.events import (
     ApplicationData,
@@ -759,7 +760,8 @@ class HandshakeOrder12:
       WAIT_TAIL -> [NewSessionTicket] -> ChangeCipherSpec(kayıt katmanı) -> WAIT_FIN
       WAIT_FIN  -> Finished -> CONNECTED
 
-    CertificateRequest ayrı ve AÇIK bir hatayla reddedilir (istemci sertifikası yok).
+    mTLS (RFC 5246 §7.3): CertificateRequest YALNIZCA ServerKeyExchange'ten sonra, ServerHelloDone'dan
+    önce ve en fazla bir kez geçerlidir (durum WAIT_SHD'de kalır); başka konumda/tekrar -> unexpected_message.
     """
 
     _NAMES = {
@@ -774,6 +776,7 @@ class HandshakeOrder12:
         self.ticket_ok = ticket_ok
         self.status_ok = status_ok
         self.ticket_seen = False
+        self.cert_request_seen = False
 
     @property
     def done(self) -> bool:
@@ -784,10 +787,9 @@ class HandshakeOrder12:
 
     def expect(self, hs_type: int) -> str:
         st = self.state
-        if hs_type == HS_CERTIFICATE_REQUEST and st in ("AFTER_CERT", "WAIT_SKE", "WAIT_SHD"):
-            raise _err(AL_UNSUPPORTED_CERTIFICATE, "unsupported_certificate",
-                       "Sunucu istemci sertifikası istedi (CertificateRequest) — istemci "
-                       "kimlik doğrulaması desteklenmiyor; bağlantı reddedildi.")
+        if hs_type == HS_CERTIFICATE_REQUEST and st == "WAIT_SHD" and not self.cert_request_seen:
+            self.cert_request_seen = True
+            return st
         nxt = None
         if st == "WAIT_SH" and hs_type == HS_SERVER_HELLO:
             nxt = "WAIT_CERT"
@@ -822,6 +824,7 @@ class HandshakeOrder12:
         """``expect`` ile aynı denetim, ama durumu DEĞİŞTİRMEDEN."""
         probe = HandshakeOrder12(self.ticket_ok, self.status_ok)
         probe.state, probe.ticket_seen = self.state, self.ticket_seen
+        probe.cert_request_seen = self.cert_request_seen
         probe.expect(hs_type)
 
     def on_ccs(self) -> None:
@@ -862,8 +865,12 @@ class TLS12ClientConnection:
     """
 
     def __init__(self, host: str, client_hello_msg: bytes, *, ca_path: Optional[str] = None,
-                 cert_validator: Optional[Callable] = None):
+                 cert_validator: Optional[Callable] = None, client_cert=None):
         self.host = host
+        self._client_cert = client_cert
+        self._cert_req: "Optional[_mtls.CertRequest12]" = None
+        self.client_cert_sent = False
+        self.client_signature_scheme: Optional[int] = None
         self.ca_path = ca_path
         self._cert_validator = cert_validator
         self._ch_msg = bytes(client_hello_msg)
@@ -1121,6 +1128,12 @@ class TLS12ClientConnection:
         elif t == HS_SERVER_KEY_EXCHANGE:
             self._transcript += msg
             self._on_server_key_exchange(msg)
+        elif t == HS_CERTIFICATE_REQUEST:
+            self._transcript += msg
+            try:
+                self._cert_req = _mtls.parse_certificate_request_12(msg)
+            except _mtls.MtlsProtocolError as e:
+                raise TLS12Error(str(e), e.alert) from e
         elif t == HS_SERVER_HELLO_DONE:
             self._transcript += msg
             if len(msg) != 4:
@@ -1202,10 +1215,31 @@ class TLS12ClientConnection:
         except ValueError as e:
             raise _illegal(f"sunucunun ECDHE anahtarı geçersiz ({group_name(ske.group)}): {e}") from e
 
+        # mTLS (RFC 5246 §7.4.6): istemci Certificate, ClientKeyExchange'ten ÖNCE gider. Uygun
+        # sertifika/şema yoksa sıfır sertifikalı Certificate (sunucu karar verir).
+        cert_msg = cv_scheme = None
+        if self._cert_req is not None:
+            cv_scheme = _mtls.select_scheme_12(self._client_cert, self._cert_req)
+            cert_msg = _mtls.build_certificate_12(self._client_cert if cv_scheme is not None else None)
+            self._transcript += cert_msg
         cke = _hs(HS_CLIENT_KEY_EXCHANGE, bytes([len(my_pub)]) + my_pub)
         self._transcript += cke
+        # RFC 7627 §3: session_hash ClientKeyExchange'e KADAR (CertificateVerify HARİÇ) alınır.
         session_hash = suite.hash_alg(bytes(self._transcript)).digest()
         master = extended_master_secret(suite.hash_alg, pms, session_hash)
+        cv_msg = None
+        if cv_scheme is not None:
+            # RFC 5246 §7.4.8: imza, CKE dahil önceki tüm handshake mesajları üzerinedir; Finished
+            # transcript'i CertificateVerify'ı da kapsar.
+            try:
+                cv_msg = _mtls.build_certificate_verify_12(
+                    self._client_cert, cv_scheme, bytes(self._transcript))
+            except _mtls.ClientCertError as e:
+                raise TLS12Error(f"internal_error: istemci CertificateVerify imzalanamadı: {e}",
+                                 AL_INTERNAL_ERROR) from e
+            self._transcript += cv_msg
+            self.client_signature_scheme = cv_scheme
+            self.client_cert_sent = True
         ckey, skey, civ, siv = derive_key_block(suite, master, self._sh.random, self._ch.random)
         self._pending_read = RecordCipher(suite, skey, siv)
         write = RecordCipher(suite, ckey, civ)
@@ -1215,7 +1249,11 @@ class TLS12ClientConnection:
         self._transcript += fin
         self._master = master
 
+        if cert_msg is not None:
+            self._out += _record(CT_HANDSHAKE, cert_msg)
         self._out += _record(CT_HANDSHAKE, cke)
+        if cv_msg is not None:
+            self._out += _record(CT_HANDSHAKE, cv_msg)
         self._out += _record(CT_CHANGE_CIPHER_SPEC, b"\x01")
         self._write = write                    # CCS'ten sonra: Finished şifreli gider
         self._write_active = True
@@ -1248,7 +1286,7 @@ class TLS12ClientConnection:
 # Senkron yol
 # --------------------------------------------------------------------------
 def negotiate_tls12(raw_socket, host: str, client_hello_record: bytes, server_hello_msg: bytes,
-                    trailing: bytes = b"", *, ca_path: Optional[str] = None):
+                    trailing: bytes = b"", *, ca_path: Optional[str] = None, client_cert=None):
     """TLS 1.2 el sıkışmasını tamamlar ve EncryptedSocket arayüzlü bir nesne döner.
 
     ``client_hello_record``: gönderdiğimiz ClientHello (5 bayt record başlığı DAHİL).
@@ -1257,7 +1295,7 @@ def negotiate_tls12(raw_socket, host: str, client_hello_record: bytes, server_he
     """
     from ..tls13.sync_socket import SyncTLSSocket
 
-    conn = TLS12ClientConnection(host, client_hello_record[5:], ca_path=ca_path)
+    conn = TLS12ClientConnection(host, client_hello_record[5:], ca_path=ca_path, client_cert=client_cert)
     sock = SyncTLSSocket(raw_socket, conn)
 
     def flush() -> None:

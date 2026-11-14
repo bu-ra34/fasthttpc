@@ -271,7 +271,12 @@ class Fake12Server:
     """
 
     def __init__(self, pki, *, suite=0xC02F, sigalg=None, group=0x001D, tamper=(), alpn=None,
-                 split_flight=False, ticket=True, key=None, handler=None):
+                 split_flight=False, ticket=True, key=None, handler=None, cr_body=None):
+        # cr_body: verilirse (bayt) GEÇERLİ bir CertificateRequest gövdesi gönderilir ve istemci
+        # Certificate/CertificateVerify mesajları alınıp kaydedilir (client_cert_ders, client_cv_ok).
+        self.cr_body = cr_body
+        self.client_cert_ders = None
+        self.client_cv_ok = None
         self.pki, self.suite, self.group = pki, suite, group
         self.tamper = set(tamper)
         self.alpn = alpn
@@ -465,7 +470,9 @@ class Fake12Server:
             msgs += [shd, ske]
         else:
             msgs.append(ske)
-            if "cert_request" in T:
+            if self.cr_body is not None:
+                msgs.append(hs(13, self.cr_body))
+            elif "cert_request" in T:
                 msgs.append(hs(13, b"\x01\x01\x00\x00\x00"))
             msgs.append(shd)
         for m in msgs:
@@ -484,6 +491,19 @@ class Fake12Server:
         if t == 21:
             self.alerts.append(cke_rec)
             return
+        if self.cr_body is not None:
+            assert t == 22 and cke_rec[0] == 11, "CertificateRequest sonrası istemci Certificate bekleniyordu"
+            body = cke_rec[4:]
+            ln = int.from_bytes(body[:3], "big")
+            assert ln == len(body) - 3
+            ders, p = [], 3
+            while p < len(body):
+                n = int.from_bytes(body[p:p + 3], "big")
+                ders.append(body[p + 3:p + 3 + n])
+                p += 3 + n
+            self.client_cert_ders = ders
+            transcript += cke_rec
+            t, _h, cke_rec = self._read_rec(sock)
         assert t == 22, f"CKE bekleniyordu, tip {t}"
         self.cke_seen = True
         cke = cke_rec
@@ -502,6 +522,13 @@ class Fake12Server:
         ckey, skey = kb[:klen], kb[klen:2 * klen]
         civ, siv = kb[2 * klen:2 * klen + ivlen], kb[2 * klen + ivlen:]
 
+        if self.client_cert_ders:
+            # RFC 5246 §7.4.8: CertificateVerify, CKE'den sonra; imza CKE dahil transcript üzerinde
+            t, _h, cv_rec = self._read_rec(sock)
+            assert t == 22 and cv_rec[0] == 15, f"CertificateVerify bekleniyordu, tip {t}"
+            self.client_cv_msg = cv_rec
+            self.client_cv_transcript = bytes(transcript)
+            transcript += cv_rec
         t, _h, ccs = self._read_rec(sock)
         assert t == 20 and ccs == b"\x01", f"CCS bekleniyordu, tip {t}"
         t, _h, fin_rec = self._read_rec(sock)
