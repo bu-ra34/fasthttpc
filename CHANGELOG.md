@@ -68,6 +68,12 @@ Python 3.10–3.13.
 - Proxy tünelinde PSK bilet anahtarı hedef yerine proxy portunu kullanıyordu.
 - Alert mesajları ham hex yerine adlandırılmış; bozuk CCS reddi.
 - HelloRequest seli testi deterministik hale getirildi (RST yarışı).
+- **HTTP/2 GOAWAY (RFC 9113 §6.8):** senkron yol her GOAWAY'i ölümcül sayıyordu;
+  NO_ERROR ile düzgün kapanan sunucularda (canlı soak'ta www.debian.org) istek
+  düşüyordu. Kapsanan stream tamamlanır, kapsanmayan istek yeni bağlantıda
+  güvenle tekrarlanır, GOAWAY almış bağlantı yeniden kullanılmaz.
+- Canlı soak: 20 dk, ~2000 istek, düzeltme öncesi tek hata (yukarıdaki);
+  rapor `interop/CANLI_SOAK.md`.
 
 ## [0.4.0] — 2026-11-14
 

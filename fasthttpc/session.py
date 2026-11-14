@@ -24,7 +24,8 @@ from .transport.connection_pool import ConnectionPool
 from .security.tls_adapter      import TLSAdapter
 from .security.alerts          import describe_alert
 from .protocol.http1_parser     import HTTP1Parser
-from .protocol.http2_parser     import Http2Connection, Http2StreamError, Http2ConnectionError
+from .protocol.http2_parser     import (Http2Connection, Http2StreamError, Http2ConnectionError,
+                                         Http2RefusedError)
 from .metrics    import RequestMetrics
 from .cache      import ResponseCache
 from .buffer     import AdaptiveReceiver, get_pool
@@ -72,6 +73,10 @@ def _proxy_spec(proxy, proxies):
         resolve_proxy(spec, scheme)  # hatalı URL'i erken (Session kurulurken) yakala
     return spec
 
+
+
+class _H2Refused(ConnectionError):
+    """HTTP/2 isteği sunucu tarafından İŞLENMEDİ (GOAWAY); güvenle yeniden denenebilir."""
 
 class Session:
     """
@@ -193,6 +198,8 @@ class Session:
                 headers=h2_headers,
                 body=req.body,
             )
+        except Http2RefusedError as e:
+            raise _H2Refused(f"HTTP/2 isteği işlenmedi: {e}") from e
         except (Http2StreamError, Http2ConnectionError) as e:
             raise ConnectionError(f"HTTP/2 isteği başarısız: {e}") from e
 
@@ -475,6 +482,10 @@ class Session:
 
                 if conn.h2_conn is not None:
                     resp = self._send_h2_request(conn, req, metrics, cache_entry, method, url)
+                    if conn.h2_conn.goaway is not None:
+                        # Sunucu GOAWAY ile kapatıyor: yanıt tamam ama bağlantı
+                        # yeniden kullanılmaz (RFC 9113 §6.8).
+                        conn.close()
                     self.pool.release(conn)
                     if metrics and metrics.request_start:
                         resp.elapsed = time.monotonic() - metrics.request_start
@@ -615,13 +626,16 @@ class Session:
                     conn.close()
                     self.pool.release(conn)  # close() semaphore'a dokunmaz
                     conn = None
-                    if (not is_new_conn and not got_bytes
+                    if isinstance(e, _H2Refused) or (
+                            not is_new_conn and not got_bytes
                             and not isinstance(e, TimeoutError)):
                         # Yeniden kullanılan bağlantı sunucu tarafında kapanmış
                         # olabilir; yanıttan HİÇ bayt gelmediyse ve hata zaman aşımı
                         # değilse yeniden denemek güvenlidir. Zaman aşımı (sunucu
                         # isteği işliyor olabilir) ya da yarım yanıt YENİDEN
                         # DENENMEZ: POST çift gönderilir, bekleme süresi katlanır.
+                        # GOAWAY ile işlenmediği bildirilen h2 isteği (yeni
+                        # bağlantıda bile) güvenle yeniden denenir.
                         retry_count += 1
                         logger.debug("Bayat bağlantı, yeniden deneniyor (%s)", e)
                         continue
