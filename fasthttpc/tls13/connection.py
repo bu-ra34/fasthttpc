@@ -27,7 +27,9 @@ from ..crypto_math import (
     FastAESGCM as _AESGCM,
     FastChaCha20Poly1305 as _ChaCha,
 )
-from ..tls_crafter import TLSImpersonator
+from ..tls_crafter import (
+    TLSImpersonator, alps_accepted, build_client_encrypted_extensions,
+)
 from ..security import cert_validator as _cv
 from ..security.cert_validator import CertificateValidationError
 from . import _compat as C
@@ -499,6 +501,8 @@ class TLSClientConnection:
 
         if hs_type == HS_ENCRYPTED_EXTENSIONS:
             self.alpn = parse_alpn(msg)
+            self._send_client_ee = alps_accepted(
+                getattr(self._imp, "alps_advertised", False), msg, self.alpn)
 
         elif hs_type in (HS_CERTIFICATE, HS_COMPRESSED_CERTIFICATE):
             if hs_type == HS_COMPRESSED_CERTIFICATE:
@@ -555,8 +559,15 @@ class TLSClientConnection:
         # Server Finished dahil transcript -> application secret'lar
         th_sf = self._hash(self._transcript).digest()
         hlen = self._hash().digest_size
+        if getattr(self, "_send_client_ee", False):
+            # ALPS kabul edildi: istemci EncryptedExtensions Finished'tan ÖNCE
+            # gider, transcript'e girer (application secret'lar ise SERVER
+            # Finished'a kadar olan th_sf'ten türer).
+            cee = build_client_encrypted_extensions()
+            self._seal(cee, CT_HANDSHAKE)
+            self._transcript += cee
         fkey = _P.tls13_hkdf_expand_label(self._c_hts, "finished", b"", hlen, hash_alg=self._hash)
-        mac = hmac.new(fkey, th_sf, self._hash).digest()
+        mac = hmac.new(fkey, self._hash(self._transcript).digest(), self._hash).digest()
         finished = bytes([HS_FINISHED]) + len(mac).to_bytes(3, "big") + mac
         self._seal(finished, CT_HANDSHAKE)          # handshake anahtarıyla
         self._transcript += finished

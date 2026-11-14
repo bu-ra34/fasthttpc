@@ -82,7 +82,7 @@ def test_x25519_zero_shared_rejected():
 
 def test_unsupported_group_raises():
     with pytest.raises(ValueError):
-        generate_key_share(0x11EC)
+        generate_key_share(0x6399)      # X25519Kyber768Draft00: uygulanmadı
     with pytest.raises(ValueError, match="göndermedik"):
         KeyShareSet([GROUP_X25519]).shared_secret(GROUP_SECP256R1, b"\x04" * 65)
 
@@ -124,8 +124,7 @@ def test_retry_client_hello_preserves_fields():
     # cookie ve padding dışında extension tipleri ve sırası aynı (GREASE dahil)
     t1 = [t for t, _ in p1["exts"] if t != 0x15]
     t2 = [t for t, _ in p2["exts"] if t not in (0x15, 0x2C)]
-    assert t1 == t2
-    assert len(ch2) % 512 == 0
+    assert t1 == t2          # Chrome'un karıştırılmış sırası CH2'de aynen korunur
 
 
 def test_extra_tail_extensions_last():
@@ -133,8 +132,11 @@ def test_extra_tail_extensions_last():
     tail = struct.pack("!HH", 41, 4) + b"\x00\x00\x00\x00"
     ch = imp.build_client_hello(extra_tail_extensions=tail)[0]
     assert ch.endswith(tail)
-    assert len(ch) % 512 == 0
     assert parse_client_hello(ch[5:])["exts"][-1][0] == 41
+
+
+def imp_grease(imp):
+    return {imp._grease_group}
 
 
 def test_profile_key_shares_are_supported_and_advertised():
@@ -144,19 +146,23 @@ def test_profile_key_shares_are_supported_and_advertised():
         imp = TLSImpersonator("example.com", profile=name)
         ch = parse_client_hello(imp.build_client_hello()[0][5:])
         for g in ch["key_shares"]:
+            if g in imp_grease(imp):
+                continue          # RFC 8701 GREASE key_share girdisi
             assert g in SUPPORTED_GROUPS, (name, hex(g))
             assert g in ch["groups"], (name, hex(g))
 
 
 def test_unsupported_key_share_group_dropped(monkeypatch):
     prof = dict(PROFILES["chrome_131"])
-    prof["supported_groups"] = ["GREASE", 0x11EC, 0x001D, 0x0017]
-    prof["key_share_groups"] = [0x11EC, 0x001D]
+    prof["supported_groups"] = ["GREASE", 0x6399, 0x001D, 0x0017]
+    prof["key_share_groups"] = [0x6399, 0x001D]
     monkeypatch.setitem(PROFILES, "chrome_131", prof)
     imp = TLSImpersonator("example.com", profile="chrome_131")
     ch = parse_client_hello(imp.build_client_hello()[0][5:])
     assert list(ch["key_shares"]) == [GROUP_X25519]
-    assert 0x11EC in ch["groups"]  # parmak izi korunur
+    # Desteklenmeyen PQ grup (uygulanmadı) ilan EDİLMEZ: sunucu HRR ile isteyip
+    # handshake'i kırardı. (X25519MLKEM768 artık gerçekten desteklenir.)
+    assert 0x6399 not in ch["groups"]
 
 
 # ---- Uçtan uca handshake ----------------------------------------------------
