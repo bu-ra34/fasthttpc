@@ -31,6 +31,9 @@ include = ["fasthttpc*"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["."]
+markers = [
+    "interop: bağımsız TLS sunucularına (openssl s_server, tlslite-ng) karşı uyumluluk testleri; varsayılan çalıştırmada da koşar",
+]
 
 [tool.ruff]
 target-version = "py310"
