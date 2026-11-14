@@ -896,16 +896,20 @@ class Http2Connection:
         if frame.stream_id == 0:
             self._conn_window_send += increment
         else:
-            self._stream_windows[frame.stream_id] = (
-                self._stream_windows.get(frame.stream_id, self._peer_settings["initial_window_size"])
-                + increment
-            )
+            # Yalnızca bilinen (şu an açık) stream'ler: bitmiş bir stream için geç
+            # gelen WINDOW_UPDATE sözlüğe sonsuza dek kalacak bir girdi eklemesin.
+            if frame.stream_id in self._stream_windows:
+                self._stream_windows[frame.stream_id] += increment
 
     # -- İstek gönderme ---------------------------------------------------
 
     def _next_id(self) -> int:
         sid = self._next_stream_id
         self._next_stream_id += 2
+        # İstekler bağlantı kilidi altında ardışık işlenir; önceki stream'ler
+        # bitmiştir. Temizlenmezse uzun ömürlü bağlantıda istek başına bir
+        # girdi sızar (soak testinde ~70 bayt/istek).
+        self._stream_windows.clear()
         self._stream_windows[sid] = self._peer_settings["initial_window_size"]
         return sid
 

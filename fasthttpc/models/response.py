@@ -30,6 +30,7 @@ class Response:
         request:     Bu yanıtı oluşturan istek objesi
         history:     Redirect zinciri (önceki Response listesi)
         elapsed:     İsteğin toplam süresi (saniye cinsinden float)
+        http_version: Yanıtın taşındığı protokol ("HTTP/1.1" veya "HTTP/2")
     """
 
     def __init__(
@@ -45,7 +46,8 @@ class Response:
         self.body: bytes                   = body
         self.request                       = request
         self.history: List["Response"]     = []
-        self.elapsed: float                = elapsed          
+        self.elapsed: float                = elapsed
+        self.http_version: str             = "HTTP/1.1"   # "HTTP/2" ise h2 üzerinden geldi
 
                                                                               
 
