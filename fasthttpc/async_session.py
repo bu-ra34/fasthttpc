@@ -35,7 +35,7 @@ from .retry           import Retry
 from .tls13 import AsyncTLSStream
 from .protocol.async_h2 import AsyncHttp2Connection, H2StreamRefused
 from .protocol.http2_parser import Http2ConnectionError, Http2StreamError
-from .transport.proxy import ProxyConfig, async_connect_via_proxy, parse_proxy_url, resolve_proxy
+from .transport.proxy import ProxyConfig, ProxyError, async_connect_via_proxy, parse_proxy_url, resolve_proxy
 from .transport.happy_eyeballs import CONNECTION_ATTEMPT_DELAY
 
 
@@ -555,13 +555,15 @@ class AsyncSession:
         if proxy is None and self.resolver is not None:
             host = await B.wait_for(self._resolve(host), connect_to)   # DoH: TCP IP'ye, TLS/SNI özgün ada
 
+        progress: dict = {}
+
         async def _go():
             if not tls:
                 if proxy is None:
                     reader, writer = await B.open_connection(host, port)
                 else:
                     reader, writer = await async_connect_via_proxy(
-                        proxy, host, port, timeout=connect_to)
+                        proxy, host, port, timeout=connect_to, progress=progress)
                 return reader, writer, ""
             if self.impersonate is not None:
                 kw = {"alpn": list(alpn)} if alpn is not None else {}
@@ -572,7 +574,7 @@ class AsyncSession:
                         host, port, self.impersonate, server_hostname=sni,
                         ca_path=self._ca_path, client_cert=self.client_cert, **kw)
                 else:
-                    reader, writer = await async_connect_via_proxy(proxy, host, port, timeout=connect_to)
+                    reader, writer = await async_connect_via_proxy(proxy, host, port, timeout=connect_to, progress=progress)
                     try:
                         stream = await AsyncTLSStream.negotiate(
                             reader, writer, sni, self.impersonate, ca_path=self._ca_path,
@@ -589,7 +591,7 @@ class AsyncSession:
                 reader, writer = await B.open_connection(
                     host, port, ssl=ctx, server_hostname=sni)
             else:
-                reader, writer = await async_connect_via_proxy(proxy, host, port, timeout=connect_to)
+                reader, writer = await async_connect_via_proxy(proxy, host, port, timeout=connect_to, progress=progress)
                 try:
                     if hasattr(writer, "start_tls"):   # Python 3.11+
                         await writer.start_tls(ctx, server_hostname=sni)
@@ -600,7 +602,15 @@ class AsyncSession:
                     raise
             return reader, writer, "http/1.1"
 
-        return await B.wait_for(_go(), connect_to)
+        try:
+            return await B.wait_for(_go(), connect_to)
+        except asyncio.TimeoutError as e:
+            if proxy is not None and not progress.get("proxy_tcp"):
+                # Süre proxy'ye TCP bağlanırken doldu (iç zamanlayıcıyla yarışı dıştaki kazandı):
+                # senkron yol ve async_connect_via_proxy ile aynı anlam -> ProxyError.
+                raise ProxyError(f"Proxy'ye bağlanılamadı ({proxy.host}:{proxy.port}): "
+                                 f"zaman aşımı") from e
+            raise
 
     async def _resolve(self, host: str) -> str:
         """DoH çözücüyle (senkron, thread'de) IP'ye çevirir; hata olursa özgün ad."""
