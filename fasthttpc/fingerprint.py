@@ -116,6 +116,37 @@ PROFILES = {
                 "cookie", "priority",
             ],
         },
+        # Varsayılan gezinme başlıkları [CI] curl_chrome131 betiği (başlık
+        # değerleri) — Content-Length/Content-Type/Origin/Referer'in gerçek
+        # Chrome'daki göreli yeri DOĞRULANMADI. Priority yalnızca h2'de.
+        "http_headers": {
+            "default": [
+                ("sec-ch-ua", '"Google Chrome";v="131", "Chromium";v="131", "Not_A Brand";v="24"'),
+                ("sec-ch-ua-mobile", "?0"),
+                ("sec-ch-ua-platform", '"Windows"'),
+                ("Upgrade-Insecure-Requests", "1"),
+                ("User-Agent", None),                # profilin user_agent'ı
+                ("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,"
+                           "image/avif,image/webp,image/apng,*/*;q=0.8,"
+                           "application/signed-exchange;v=b3;q=0.7"),
+                ("Sec-Fetch-Site", "none"),
+                ("Sec-Fetch-Mode", "navigate"),
+                ("Sec-Fetch-User", "?1"),
+                ("Sec-Fetch-Dest", "document"),
+                ("Accept-Encoding", None),           # kurulu kodlayıcılara göre
+                ("Accept-Language", "en-US,en;q=0.9"),
+                ("Priority", "u=0, i"),
+            ],
+            "accept_encoding": ["gzip", "deflate", "br", "zstd"],
+            "h1_header_order": [
+                "host", "connection", "content-length", "sec-ch-ua",
+                "sec-ch-ua-mobile", "sec-ch-ua-platform",
+                "upgrade-insecure-requests", "user-agent", "content-type",
+                "accept", "origin", "sec-fetch-site", "sec-fetch-mode",
+                "sec-fetch-user", "sec-fetch-dest", "referer",
+                "accept-encoding", "accept-language", "cookie",
+            ],
+        },
     },
 
     # Firefox 133. TLS: [CC][CI][TC] (extension sırası/JA3 [CC]; sabit sıra,
@@ -168,6 +199,33 @@ PROFILES = {
                 "sec-fetch-site", "sec-fetch-user", "cookie", "priority", "te",
             ],
         },
+        # [CI] curl_firefox133 başlık değerleri (bellekten; Accept'teki
+        # image/* listesi ve TE: trailers'ın h2'ye özgülüğü doğrulanmadı).
+        # h1 sırası doğrulanmadı.
+        "http_headers": {
+            "default": [
+                ("User-Agent", None),
+                ("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,"
+                           "image/avif,image/webp,image/png,image/svg+xml,*/*;q=0.8"),
+                ("Accept-Language", "en-US,en;q=0.5"),
+                ("Accept-Encoding", None),
+                ("Upgrade-Insecure-Requests", "1"),
+                ("Sec-Fetch-Dest", "document"),
+                ("Sec-Fetch-Mode", "navigate"),
+                ("Sec-Fetch-Site", "none"),
+                ("Sec-Fetch-User", "?1"),
+                ("Priority", "u=0, i"),
+                ("TE", "trailers"),
+            ],
+            "accept_encoding": ["gzip", "deflate", "br", "zstd"],
+            "h1_header_order": [
+                "host", "user-agent", "accept", "accept-language",
+                "accept-encoding", "content-type", "content-length", "origin",
+                "referer", "cookie", "connection", "upgrade-insecure-requests",
+                "sec-fetch-dest", "sec-fetch-mode", "sec-fetch-site",
+                "sec-fetch-user",
+            ],
+        },
     },
 
     # Safari 18.0 (macOS). TLS: [TC] Safari_IOS_18_0 + [CI] curl_safari180
@@ -179,7 +237,7 @@ PROFILES = {
     # JA4 öneki t13d2014h2 [SW]: 20 suite / 14 extension (padding 21 dahil).
     "safari_18": {
         "user_agent": (
-            "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_7) "
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
             "AppleWebKit/605.1.15 (KHTML, like Gecko) "
             "Version/18.0 Safari/605.1.15"
         ),
@@ -214,9 +272,33 @@ PROFILES = {
             "headers_priority": (0, False, 256),
             "pseudo_header_order": [":method", ":scheme", ":authority", ":path"],
             "header_order": [
-                "sec-fetch-dest", "user-agent", "accept", "sec-fetch-site",
-                "sec-fetch-mode", "accept-language", "priority",
-                "accept-encoding", "cookie",
+                "sec-fetch-dest", "user-agent", "upgrade-insecure-requests",
+                "accept", "sec-fetch-site", "sec-fetch-mode",
+                "accept-language", "priority", "accept-encoding", "cookie",
+            ],
+        },
+        # [CI] curl_safari180 (bellekten). Safari UA'sı macOS sürümünü hep
+        # 10_15_7 olarak dondurur. upgrade-insecure-requests'in sırası ve h1
+        # sırası doğrulanmadı. Safari zstd İLAN ETMEZ.
+        "http_headers": {
+            "default": [
+                ("Sec-Fetch-Dest", "document"),
+                ("User-Agent", None),
+                ("Upgrade-Insecure-Requests", "1"),
+                ("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"),
+                ("Sec-Fetch-Site", "none"),
+                ("Sec-Fetch-Mode", "navigate"),
+                ("Accept-Language", "en-US,en;q=0.9"),
+                ("Priority", "u=0, i"),
+                ("Accept-Encoding", None),
+            ],
+            "accept_encoding": ["gzip", "deflate", "br"],
+            "h1_header_order": [
+                "host", "sec-fetch-dest", "user-agent",
+                "upgrade-insecure-requests", "accept", "content-type",
+                "content-length", "origin", "sec-fetch-site",
+                "sec-fetch-mode", "referer", "accept-language",
+                "accept-encoding", "cookie", "connection",
             ],
         },
     },
@@ -240,6 +322,16 @@ PROFILES = {
             "headers_priority": None,
             "pseudo_header_order": [":method", ":authority", ":scheme", ":path"],
             "header_order": [],
+        },
+        # Tarayıcı taklidi yok: yalnızca gerekli/zararsız başlıklar (sıra serbest).
+        "http_headers": {
+            "default": [
+                ("User-Agent", None),
+                ("Accept", "*/*"),
+                ("Accept-Encoding", None),
+            ],
+            "accept_encoding": ["gzip", "deflate", "br", "zstd"],
+            "h1_header_order": [],
         },
     },
 }
@@ -588,3 +680,76 @@ def ja4_for_profile(profile_name: str | None = None) -> str:
 
     ch, _, _ = TLSImpersonator("example.com", profile=profile_name).build_client_hello()
     return ja4_from_client_hello(ch)
+
+
+
+# ---------------------------------------------------------------------------
+# Profil başına varsayılan HTTP başlıkları
+# ---------------------------------------------------------------------------
+
+# h2'ye özgü: h1'de gerçek tarayıcılar göndermez (değer profil varsayılanıyla
+# aynıysa h1 serileştirmesinde atılır).
+H1_DROPPED_DEFAULTS = ("priority", "te")
+
+
+def accept_encoding_for(profile_name: str | None) -> str:
+    """Profilin Accept-Encoding değeri: yalnızca AÇABİLDİĞİMİZ kodlamalar.
+
+    br yalnızca brotli, zstd yalnızca zstandard kuruluysa; aksi halde sunucu
+    açamayacağımız bir gövde yollardı.
+    """
+    from .protocol.http1_parser import _BROTLI, _ZSTD
+    available = {"gzip": True, "deflate": True, "br": _BROTLI, "zstd": _ZSTD}
+    spec = get_profile(profile_name)["http_headers"]["accept_encoding"]
+    return ", ".join(e for e in spec if available.get(e))
+
+
+def default_headers(profile_name: str | None) -> list[tuple[str, str]]:
+    """Profilin varsayılan (navigasyon) başlıkları, profil sırasında.
+
+    Adlar h1 yazımındadır (h2'de küçük harfe çevrilir).
+    """
+    profile = get_profile(profile_name)
+    out = []
+    for name, value in profile["http_headers"]["default"]:
+        if name == "User-Agent":
+            value = profile["user_agent"]
+        elif name == "Accept-Encoding":
+            value = accept_encoding_for(profile_name)
+        out.append((name, value))
+    return out
+
+
+def merge_default_headers(profile_name: str | None, headers) -> list[tuple[str, str]]:
+    """Varsayılanlar < ``headers`` (kullanıcı başlıkları geçersiz kılar).
+
+    ``headers`` bir ``Headers``/dict/(k, v) listesi olabilir; değeri ``None``
+    olan başlık varsayılanı da kaldırır (requests'teki gibi). Kullanıcı
+    başlığı varsayılanla aynı adsa kullanıcının yazımı ve değeri kullanılır.
+    Sıralama burada yapılmaz (h2: ``h2_request_headers``, h1: ``order_h1``).
+    """
+    items = list(headers.items()) if hasattr(headers, "items") else list(headers or [])
+    user = {k.lower(): v for k, v in items}
+    out = [(k, v) for k, v in default_headers(profile_name) if k.lower() not in user]
+    out.extend((k, v) for k, v in items if v is not None)
+    return out
+
+
+def order_h1(profile_name: str | None, pairs: "list[tuple[str, str]]") -> "list[tuple[str, str]]":
+    """HTTP/1.1 başlıklarını profilin ``h1_header_order``'ına göre dizer
+    (listede olmayanlar orijinal göreli sırayla sona)."""
+    order = get_profile(profile_name)["http_headers"]["h1_header_order"]
+    if not order:
+        return list(pairs)
+    rank = {n: i for i, n in enumerate(order)}
+    keyed = sorted(enumerate(pairs),
+                   key=lambda t: (rank.get(t[1][0].lower(), len(rank)), t[0]))
+    return [kv for _, kv in keyed]
+
+
+def drop_h2_only_defaults(profile_name: str | None,
+                          pairs: "list[tuple[str, str]]") -> "list[tuple[str, str]]":
+    """h1 için: değeri profil varsayılanı olan priority/te başlıklarını at."""
+    defaults = {k.lower(): v for k, v in default_headers(profile_name)}
+    return [(k, v) for k, v in pairs
+            if not (k.lower() in H1_DROPPED_DEFAULTS and defaults.get(k.lower()) == v)]

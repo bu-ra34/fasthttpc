@@ -32,6 +32,7 @@ from .config     import Limits, resolve_verify
 from .retry      import Retry
 from .multipart  import encode_multipart
 from .cookies    import CookieJar
+from .fingerprint import drop_h2_only_defaults, merge_default_headers, order_h1
 from ._log       import get_logger
 
 logger = get_logger("session")
@@ -91,6 +92,10 @@ class Session:
                          verilirse istekler ağ yerine buna gönderilir.
         limits:          Opsiyonel :class:`~fasthttpc.config.Limits`; verilirse
                          ``max_connections`` parametresini geçersiz kılar.
+        headers:         Oturum düzeyi varsayılan başlıklar (``s.headers`` ile
+                         değiştirilebilir). Öncelik: profilin tarayıcı
+                         başlıkları < ``headers`` < istek başlıkları; değeri
+                         ``None`` olan başlık varsayılanı kaldırır.
 
     Örnek::
 
@@ -114,8 +119,13 @@ class Session:
         limits:          "Limits | None"              = None,
         proxies                                       = None,
         proxy                                         = None,
+        headers                                       = None,
     ):
         self.impersonate   = impersonate
+        # Oturum düzeyi varsayılan başlıklar (requests gibi mutable): profilin
+        # tarayıcı başlıklarını geçersiz kılar, istek başlıkları bunları.
+        self.headers       = Headers(headers)
+        self._rotator      = None
         self.timeout       = Timeout.from_value(timeout)
         self.max_redirects = max_redirects
         self.verify        = verify
@@ -390,22 +400,17 @@ class Session:
             extra_headers["Content-Type"] = mp_ct
             files = None
 
+        # Profilin tarayıcı başlıkları (User-Agent, Accept-Encoding, sec-ch-ua...)
+        # + kullanıcı başlıkları; kullanıcınınki varsayılanı geçersiz kılar.
         req = Request(method=method, url=url, data=data, json=json,
-                      headers=headers, files=files)
+                      headers=merge_default_headers(self.impersonate, headers or {}),
+                      files=files)
         for k, v in extra_headers.items():
             req.headers[k] = v
 
                                
         if "host"       not in req.headers: req.headers["Host"]       = req.url.host
         if "connection" not in req.headers: req.headers["Connection"] = "keep-alive"
-        if "accept-encoding" not in req.headers:
-            req.headers["Accept-Encoding"] = "gzip, deflate"
-        if "user-agent" not in req.headers:
-            req.headers["User-Agent"] = (
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/131.0.0.0 Safari/537.36"
-            )
         # Çerezler yalnızca domain/path/Secure kurallarına uyanlar arasından
         # seçilir; redirect başka bir host'a giderse oraya gönderilmez.
         cookie_header = self.cookie_jar.header_for(
@@ -430,10 +435,13 @@ class Session:
                 metrics.connect_start = time.monotonic()
 
             conn = None
+            rot_proxy = None
             is_new_conn = False
             got_bytes = False
             try:
-                conn = self.pool.acquire(req.url, timeout=self.timeout.pool)
+                rot_proxy = self._rotator.next() if self._rotator is not None else None
+                acq = {"proxy": rot_proxy} if rot_proxy is not None else {}
+                conn = self.pool.acquire(req.url, timeout=self.timeout.pool, **acq)
                 is_new_conn = not conn.tls_established
                 logger.debug("conn id=%s yeni=%s tls=%s h2=%s",
                              id(conn), is_new_conn, conn.tls_established,
@@ -472,8 +480,11 @@ class Session:
 
                                  
                 req_lines = [f"{req.method} {req.url.raw_path.decode('ascii')} HTTP/1.1"]
-                for k, v in req.headers.raw:
-                    req_lines.append(f"{k.decode('ascii')}: {v.decode('ascii')}")
+                h1_pairs = [(k.decode("latin-1"), v.decode("latin-1")) for k, v in req.headers.raw]
+                h1_pairs = order_h1(self.impersonate,
+                                    drop_h2_only_defaults(self.impersonate, h1_pairs))
+                for k, v in h1_pairs:
+                    req_lines.append(f"{k}: {v}")
                 raw_bytes = "\r\n".join(req_lines).encode("ascii") + b"\r\n\r\n" + req.body
 
                 if metrics: metrics.bytes_sent = len(raw_bytes)
@@ -595,6 +606,9 @@ class Session:
                 # conn döngü başında None'a çekiliyor: acquire() patlarsa bir
                 # ÖNCEKİ turdan kalan bayat bağlantıyı ikinci kez release edip
                 # semaphore sayacını bozmuyoruz.
+                if (conn is None and rot_proxy is not None
+                        and not isinstance(e, TimeoutError)):
+                    self._rotator.mark_failed(rot_proxy)   # proxy'ye bağlanılamadı
                 if conn is not None:
                     conn.close()
                     self.pool.release(conn)  # close() semaphore'a dokunmaz
@@ -632,7 +646,8 @@ class Session:
             return self._raw_request(method, url, data=data, json=json,
                                      headers=headers, files=files, metrics=metrics)
         req = Request(method=method, url=url, data=data, json=json,
-                      headers=headers, files=files)
+                      headers={k: v for k, v in dict(headers or {}).items() if v is not None},
+                      files=files)
         if "host" not in req.headers:
             req.headers["Host"] = req.url.host
         cookie_header = self.cookie_jar.header_for(
@@ -683,6 +698,7 @@ class Session:
         redirect_count = 0
         history: list[Response] = []
         metrics = RequestMetrics(request_start=time.monotonic())
+        headers = self._merged_headers(headers)
 
         while True:
             resp = self._send_with_retries(
@@ -730,6 +746,20 @@ class Session:
 
                                                                                 
 
+    def _merged_headers(self, headers) -> dict:
+        """Oturum başlıkları + istek başlıkları (istek kazanır; büyük/küçük harf
+        duyarsız). ``None`` değerler, varsayılanı kaldırmak için korunur."""
+        merged: dict = {}
+        index: dict = {}
+        for src in (self.headers, headers or {}):
+            for k, v in (src.items() if hasattr(src, "items") else src):
+                lk = k.lower()
+                if lk in index:
+                    del merged[index[lk]]
+                index[lk] = k
+                merged[k] = v
+        return merged
+
     def get(self, url, headers=None, allow_redirects=True) -> Response:
         return self.request("GET", url, headers=headers, allow_redirects=allow_redirects)
 
@@ -765,6 +795,9 @@ class Session:
     def head(self, url, headers=None) -> Response:
         return self.request("HEAD", url, headers=headers, allow_redirects=False)
 
+    def options(self, url, headers=None, allow_redirects=True) -> Response:
+        return self.request("OPTIONS", url, headers=headers, allow_redirects=allow_redirects)
+
                                                                                 
 
     def pre_warm(self, hosts: list[str], count: int = 2) -> dict[str, int]:
@@ -776,6 +809,20 @@ class Session:
 
     def pool_stats(self) -> dict:
         return self.pool.stats()
+
+    def set_proxies(self, proxies: list[str], strategy: str = "round_robin") -> "Session":
+        """Proxy listesini ayarla ve rotasyonu etkinleştir (``AsyncSession`` ile aynı).
+
+        Rotasyon etkinken her istek için sıradaki proxy (``proxy=``/``proxies=``
+        yerine) kullanılır; bağlantılar proxy başına ayrı havuzlanır. Bağlantı
+        kurulamayan proxy devre dışı bırakılır.
+        """
+        from .async_session import ProxyRotator
+        from .transport.proxy import parse_proxy_url
+        for url in proxies:
+            parse_proxy_url(url)   # hatalı URL'i erken yakala
+        self._rotator = ProxyRotator(proxies, strategy=strategy)
+        return self
 
                                                                                 
 
