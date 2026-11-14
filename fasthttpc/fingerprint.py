@@ -305,15 +305,28 @@ PROFILES = {
 
     # Tarayıcı taklidi yapmayan yalın profil: h2 değerleri ESKİ sabit
     # davranışla aynıdır (connection WINDOW_UPDATE yok, PRIORITY yok).
+    # Parmak izi önemsizdir, UYUMLULUK önemlidir: TLS 1.2 sunucularla da
+    # konuşabilsin diye TLS 1.2 AEAD suite'leri, EMS (RFC 7627),
+    # renegotiation_info (RFC 5746), ec_point_formats, supported_versions'ta
+    # 0x0303, session_ticket/status_request ve TLS 1.2 imza şemaları (RSA-PKCS1
+    # dahil) ilan edilir.
     "default": {
         "user_agent": "fasthttpc/2.0",
-        "cipher_suites": [0x1301, 0x1302, 0x1303],
-        "extensions_order": [
-            "sni", "alpn", "supported_groups",
-            "signature_algorithms", "supported_versions", "key_share",
+        "cipher_suites": [
+            0x1301, 0x1302, 0x1303,
+            0xC02B, 0xC02F, 0xC02C, 0xC030, 0xCCA9, 0xCCA8,
         ],
-        "supported_groups": [0x001D, 0x0017],
-        "signature_algorithms": [0x0403, 0x0804],
+        "extensions_order": [
+            "sni", "extended_master_secret", "renegotiation_info",
+            "supported_groups", "ec_point_formats", "session_ticket", "alpn",
+            "status_request", "signature_algorithms", "supported_versions",
+            "key_share",
+        ],
+        "supported_groups": [0x001D, 0x0017, 0x0018],
+        "supported_versions": [0x0304, 0x0303],
+        "signature_algorithms": [
+            0x0403, 0x0804, 0x0401, 0x0503, 0x0805, 0x0501, 0x0806, 0x0601,
+        ],
         "alpn": ["http/1.1"],
         "h2": {
             "settings": [(1, 65536), (2, 0), (4, 65535), (6, 262144)],
