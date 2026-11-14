@@ -18,6 +18,7 @@ from dataclasses import dataclass
 from typing import Any, Callable, Optional, AsyncGenerator, Union
 from .models.urls     import URL
 from .models.headers  import Headers
+from .fingerprint     import drop_h2_only_defaults, merge_default_headers, order_h1
 from .models.response import Response, HTTPStatusError
 from .metrics         import RequestMetrics
 from .cache           import ResponseCache
@@ -272,6 +273,7 @@ class AsyncSession:
         proxies                       = None,
         proxy                         = None,
         resolver                      = None,
+        headers                       = None,
     ):
         # impersonate verilirse TLS, fasthttpc.tls13 çekirdeğiyle (tarayıcı
         # ClientHello'su) kurulur ve profilin ALPN'i (h2, http/1.1) kullanılır;
@@ -279,6 +281,9 @@ class AsyncSession:
         # impersonate=None -> stdlib ssl, yalnızca HTTP/1.1.
         from .session import _proxy_spec
         self.impersonate   = impersonate
+        # Oturum düzeyi varsayılan başlıklar (mutable; Session ile aynı öncelik:
+        # profil başlıkları < headers < istek başlıkları; None değer kaldırır).
+        self.headers       = Headers(headers)
         self.timeout       = Timeout.from_value(timeout)
         self.verify        = verify
         self._ca_path      = resolve_verify(verify)   # None → varsayılan güven deposu
@@ -836,7 +841,8 @@ class AsyncSession:
         got_bytes = False        # yanıttan en az 1 bayt geldi mi (yeniden deneme güvenliği)
         try:
             req_line = f"{method} {u.raw_path.decode()} HTTP/1.1\r\n"
-            for k, v in req_headers.items():
+            for k, v in order_h1(self.impersonate, drop_h2_only_defaults(
+                    self.impersonate, list(req_headers.items()))):
                 req_line += f"{k}: {v}\r\n"
             req_line += "\r\n"
             raw_request = req_line.encode("ascii") + (raw_body or b"")
@@ -923,17 +929,14 @@ class AsyncSession:
         req_dict = {"method": method, "url": url, "headers": headers or {}, "body": body}
         req_dict = await self._run_request_hooks(req_dict)
 
-        req_headers = {
-            "Host":            u.host,
-            "Connection":      "keep-alive",
-            "Accept-Encoding": HTTP1Parser.supported_encodings(),
-            "User-Agent": (
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/131.0.0.0 Safari/537.36"
-            ),
-        }
-        req_headers.update(req_dict.get("headers", {}))
+        # Profilin tarayıcı başlıkları (User-Agent, Accept-Encoding, sec-ch-ua...)
+        # + kullanıcı başlıkları (geçersiz kılar); büyük/küçük harf duyarsız.
+        hh = Headers(merge_default_headers(self.impersonate, req_dict.get("headers") or {}))
+        if "host" not in hh:
+            hh["Host"] = u.host
+        if "connection" not in hh:
+            hh["Connection"] = "keep-alive"
+        req_headers = {k.decode("latin-1"): v.decode("latin-1") for k, v in hh.raw}
         cookie_header = self._cookie_header(u)
         if cookie_header and not any(k.lower() == "cookie" for k in req_headers):
             req_headers["Cookie"] = cookie_header
@@ -1008,7 +1011,7 @@ class AsyncSession:
         req_dict = await self._run_request_hooks(
             {"method": method, "url": url, "headers": headers or {}, "body": body}
         )
-        h = dict(req_dict.get("headers") or {})
+        h = {k: v for k, v in dict(req_dict.get("headers") or {}).items() if v is not None}
         cookie_header = self._cookie_header(URL(req_dict["url"]))
         if cookie_header and not any(k.lower() == "cookie" for k in h):
             h["Cookie"] = cookie_header
@@ -1055,7 +1058,7 @@ class AsyncSession:
 
         url = str(url)
         body    = b""
-        h       = dict(headers or {})
+        h       = self._merged_headers(headers)
 
         if files is not None:
             body, ct = encode_multipart(
@@ -1135,6 +1138,20 @@ class AsyncSession:
             redirect_cnt += 1
 
                                                                                 
+
+    def _merged_headers(self, headers) -> dict:
+        """Oturum başlıkları + istek başlıkları (istek kazanır; büyük/küçük harf
+        duyarsız). ``None`` değerler, varsayılanı kaldırmak için korunur."""
+        merged: dict = {}
+        index: dict = {}
+        for src in (self.headers, headers or {}):
+            for k, v in (src.items() if hasattr(src, "items") else src):
+                lk = k.lower()
+                if lk in index:
+                    del merged[index[lk]]
+                index[lk] = k
+                merged[k] = v
+        return merged
 
     async def get(self, url, headers: Optional[dict] = None, allow_redirects: bool = True) -> Response:
         return await self.request("GET", url, headers=headers, allow_redirects=allow_redirects)
