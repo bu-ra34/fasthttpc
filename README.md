@@ -249,13 +249,27 @@ Bilinmeyen bir profil adı `ValueError` fırlatır; sessizce `default`'a düşme
 Bunlar bilinçli olarak eksiktir, sessiz hata değildir — hepsi açık hata mesajı
 verir veya belgelenmiştir:
 
-- **AsyncSession yalnızca HTTP/1.1 konuşur.** `impersonate` verilince TLS
-  sans-IO çekirdekle (`fasthttpc.tls13`) kurulur ve ClientHello parmak izi
-  senkron taraftakiyle aynıdır (JA3). ALPN `http/1.1` olarak sabit olduğundan
-  JA4'ün ALPN alanı profilden farklıdır. `impersonate=None` verilirse stdlib
-  `ssl` kullanılır. `AsyncSession.pre_warm` ve async WebSocket hâlâ stdlib
-  `ssl` kullanır.
-- **HTTP/2 multiplexing yok.** İstekler aynı bağlantıda sıralı gider.
+- **AsyncSession HTTP/2:** `impersonate` verilince ALPN profilin kendi listesidir
+  (`h2, http/1.1`; JA3 ve JA4 senkron taraftakiyle aynı). Sunucu `h2` seçerse
+  `fasthttpc.protocol.async_h2` ile gerçek multiplexing yapılır: aynı bağlantıda
+  eşzamanlı çok istek (`asyncio.gather`), akış kontrolü, SETTINGS, GOAWAY (işlenmeyen
+  stream'ler yeni bağlantıda yeniden denenir), RST_STREAM, PING ack. SETTINGS
+  kümesi/sırası senkron taraftan türetilir; pseudo-header sırası ve HPACK
+  kodlaması aynıdır. Sunucu `http/1.1` seçerse (veya `impersonate=None`, stdlib
+  `ssl`) istek başına bir bağlantıyla HTTP/1.1 kullanılır; async HTTP/1.1'de
+  bağlantı havuzlama (keep-alive) yoktur. `AsyncSession.pre_warm` ve async
+  WebSocket hâlâ stdlib `ssl` kullanır ve proxy desteklemez.
+- **AsyncSession proxy:** `proxy=` / `proxies=` senkron `Session` ile aynı
+  anlamdadır (HTTP CONNECT + Basic, SOCKS5 / RFC 1929; `https://` proxy yok).
+  Tünelin içinde hem `impersonate` (kendi TLS 1.3 yığını) hem stdlib `ssl`
+  çalışır; stdlib `ssl` + proxy Python 3.11+ gerektirir. `set_proxies([...])`
+  rotasyonu artık proxy'yi gerçekten kullanır ve `proxy=`'yi geçersiz kılar.
+  `AsyncSession` ayrıca `Timeout` (connect/read/write/pool; read, hareketsizlik
+  süresidir) ve `Limits` (`max_connections` = toplam eşzamanlı bağlantı,
+  `keepalive_expiry` h2 bağlantıları için) kabul eder. `max_keepalive_connections`
+  async tarafta uygulanmaz.
+- Async HTTP/2'de sunucu PUSH_PROMISE'i protokol hatasıdır (ENABLE_PUSH=0 ilan
+  edilir); öncelik (PRIORITY) gönderilmez, yok sayılır.
 - **TLS 1.2 bilinçli olarak kapsam dışıdır.** fasthttpc yalnızca TLS 1.3
   konuşur. Profiller gerçek tarayıcılar gibi `supported_versions` içinde
   0x0303'ü ve TLS 1.2 cipher suite'lerini *ilan eder* (parmak izi doğruluğu
@@ -279,7 +293,7 @@ verir veya belgelenmiştir:
 - `Session` thread-safe değildir; thread başına bir tane kullanın.
 - **`verify=False` yok** (bilinçli; yukarıya bakın).
 - `Timeout.write` senkron tarafta ayrı uygulanmıyor (soket `read` zaman aşımını
-  kullanır); `AsyncSession` yalnızca tek bir `timeout` float'ı kabul eder.
+  kullanır); `AsyncSession` `write`'ı drain süresine uygular.
 
 ## Modül yapısı
 

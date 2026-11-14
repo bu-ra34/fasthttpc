@@ -14,7 +14,8 @@ from ._log import get_logger
 logger = get_logger("async")
 import time
 import threading
-from typing import Any, Callable, Optional, AsyncGenerator
+from dataclasses import dataclass
+from typing import Any, Callable, Optional, AsyncGenerator, Union
 from .models.urls     import URL
 from .models.headers  import Headers
 from .models.response import Response, HTTPStatusError
@@ -22,9 +23,12 @@ from .metrics         import RequestMetrics
 from .cache           import ResponseCache
 from .protocol.http1_parser import HTTP1Parser
 from .models.request  import Request
-from .config          import resolve_verify
+from .config          import Limits, Timeout, resolve_verify
 from .retry           import Retry
 from .tls13 import AsyncTLSStream
+from .protocol.async_h2 import AsyncHttp2Connection, H2StreamRefused
+from .protocol.http2_parser import Http2ConnectionError, Http2StreamError
+from .transport.proxy import ProxyConfig, async_connect_via_proxy, parse_proxy_url, resolve_proxy
 
 
                                                                                
@@ -203,6 +207,15 @@ class ProxyRotator:
                                 
                                                                                
 
+@dataclass
+class _Opened:
+    """Yeni açılmış bağlantı + havuz slotunu geri veren ``release``."""
+    reader:  Any
+    writer:  Any
+    alpn:    str
+    release: Callable[[], None]
+
+
 class AsyncSession:
     """
     asyncio tabanlı async HTTP istemcisi.
@@ -229,28 +242,41 @@ class AsyncSession:
     def __init__(
         self,
         impersonate:     str   = "chrome_131",
-        timeout:         float = 30.0,
+        timeout:         "Union[float, int, Timeout]" = 30.0,
         max_redirects:   int   = 10,
-        max_connections: int   = 100,                                     
+        max_connections: int   = 100,
         cache:           "bool | ResponseCache" = False,
         cache_ttl:       float = 300.0,
         verify:          "bool | str" = True,
         retries:         "int | Retry | None" = None,
         transport                     = None,
+        limits:          "Limits | None" = None,
+        proxies                       = None,
+        proxy                         = None,
     ):
         # impersonate verilirse TLS, fasthttpc.tls13 çekirdeğiyle (tarayıcı
-        # ClientHello'su) kurulur; impersonate=None -> stdlib ssl.
+        # ClientHello'su) kurulur ve profilin ALPN'i (h2, http/1.1) kullanılır;
+        # sunucu h2 seçerse HTTP/2 (multiplexing) konuşulur.
+        # impersonate=None -> stdlib ssl, yalnızca HTTP/1.1.
+        from .session import _proxy_spec
         self.impersonate   = impersonate
-        self.timeout       = timeout
+        self.timeout       = Timeout.from_value(timeout)
         self.verify        = verify
         self._ca_path      = resolve_verify(verify)   # None → varsayılan güven deposu
         self.retries       = Retry.from_value(retries)
         self.transport     = transport
         self.max_redirects = max_redirects
+        self.limits        = limits if limits is not None else Limits(max_connections=max_connections)
+        self._proxy_spec   = _proxy_spec(proxy, proxies)
         self.cookies:  dict[str, str] = {}
         self._plugins: list[Plugin]   = []
         self._rotator: Optional[ProxyRotator] = None
-        self._sem     = asyncio.Semaphore(max_connections)
+        self._sem     = asyncio.Semaphore(self.limits.max_connections)
+        # HTTP/2: (host, port, proxy) -> canlı bağlantı; kaynak protokol önbelleği
+        self._h2:           dict[tuple, AsyncHttp2Connection] = {}
+        self._origin_proto: dict[tuple, str] = {}
+        self._origin_locks: dict[tuple, asyncio.Lock] = {}
+        self._bg_tasks:     set[asyncio.Task] = set()
 
         if isinstance(cache, ResponseCache):
             self._cache: Optional[ResponseCache] = cache
@@ -279,7 +305,13 @@ class AsyncSession:
                                                                                
 
     def set_proxies(self, proxies: list[str], strategy: str = "round_robin") -> "AsyncSession":
-        """Proxy listesini ayarla ve rotasyonu etkinleştir."""
+        """Proxy listesini ayarla ve rotasyonu etkinleştir.
+
+        Rotasyon etkinken her istek için seçilen proxy (``proxy=``/``proxies=``
+        yerine) GERÇEKTEN kullanılır; URL'ler burada doğrulanır.
+        """
+        for url in proxies:
+            parse_proxy_url(url)   # hatalı URL'i erken yakala
         self._rotator = ProxyRotator(proxies, strategy=strategy)
         return self
 
@@ -296,7 +328,7 @@ class AsyncSession:
                 ctx = ssl.create_default_context(cafile=self._ca_path)
                 reader, writer = await asyncio.wait_for(
                     asyncio.open_connection(host, 443, ssl=ctx),
-                    timeout=self.timeout,
+                    timeout=self.timeout.connect,
                 )
                 writer.close()
                 await writer.wait_closed()
@@ -314,6 +346,316 @@ class AsyncSession:
 
                                                                                
 
+    # --- proxy seçimi ve bağlantı kurulumu ---------------------------------
+
+    def _select_proxy(self, u: URL) -> "tuple[Optional[ProxyConfig], Optional[str]]":
+        """(ProxyConfig, rotator URL'i). Rotasyon açıksa o, değilse proxy=/proxies=."""
+        if self._rotator is not None:
+            url = self._rotator.next()
+            if url:
+                return parse_proxy_url(url), url
+        return resolve_proxy(self._proxy_spec, u.scheme), None
+
+    async def _connect(self, host: str, port: int, proxy: Optional[ProxyConfig]):
+        """TCP (+ varsa proxy tüneli) + TLS. ``(reader, writer, alpn)`` döner.
+
+        impersonate: tarayıcı ClientHello'su (ALPN = profilin h2, http/1.1
+        listesi); tünel varsa TLS tünelin İÇİNDE, hedef host'a karşı kurulur.
+        impersonate=None: stdlib ssl, yalnızca http/1.1.
+        """
+        connect_to = self.timeout.connect
+
+        async def _go():
+            if self.impersonate is not None:
+                if proxy is None:
+                    stream = await AsyncTLSStream.connect(
+                        host, port, self.impersonate, ca_path=self._ca_path)
+                else:
+                    reader, writer = await async_connect_via_proxy(proxy, host, port, timeout=connect_to)
+                    try:
+                        stream = await AsyncTLSStream.negotiate(
+                            reader, writer, host, self.impersonate, ca_path=self._ca_path)
+                    except BaseException:
+                        writer.close()
+                        raise
+                return stream, stream, stream.conn.alpn
+            ctx = ssl.create_default_context(cafile=self._ca_path)
+            ctx.set_alpn_protocols(["http/1.1"])
+            if proxy is None:
+                reader, writer = await asyncio.open_connection(host, port, ssl=ctx)
+            else:
+                reader, writer = await async_connect_via_proxy(proxy, host, port, timeout=connect_to)
+                try:
+                    if not hasattr(writer, "start_tls"):   # Python < 3.11
+                        raise NotImplementedError(
+                            "Proxy üzerinden stdlib ssl (impersonate=None) Python 3.11+ "
+                            "gerektirir; impersonate=... kullanın.")
+                    await writer.start_tls(ctx, server_hostname=host)
+                except BaseException:
+                    writer.close()
+                    raise
+            return reader, writer, "http/1.1"
+
+        return await asyncio.wait_for(_go(), connect_to)
+
+    async def _open(self, u: URL, proxy: Optional[ProxyConfig], metrics) -> "_Opened":
+        """Havuz slotu alır, bağlanır. Slot ``release()`` ile geri verilir."""
+        try:
+            await asyncio.wait_for(self._sem.acquire(), self.timeout.pool)
+        except asyncio.TimeoutError:
+            raise asyncio.TimeoutError(
+                f"Bağlantı havuzu {self.timeout.pool} sn içinde boşalmadı "
+                f"(max_connections={self.limits.max_connections}).") from None
+        released = False
+
+        def release() -> None:
+            nonlocal released
+            if not released:
+                released = True
+                self._sem.release()
+
+        try:
+            if metrics:
+                metrics.connect_start = time.monotonic()
+            reader, writer, alpn = await self._connect(u.host, u.port, proxy)
+        except BaseException:
+            release()
+            raise
+        if metrics:
+            metrics.connect_end = time.monotonic()
+            metrics.tls_end     = time.monotonic()
+        return _Opened(reader, writer, alpn, release)
+
+    def _h2_get(self, key: tuple) -> Optional[AsyncHttp2Connection]:
+        """Kaynak için yeniden kullanılabilir canlı HTTP/2 bağlantısı (yoksa None)."""
+        conn = self._h2.get(key)
+        if conn is None:
+            return None
+        drop = False
+        try:
+            loop_ok = conn.loop is asyncio.get_running_loop()
+        except RuntimeError:
+            loop_ok = False
+        expiry = self.limits.keepalive_expiry
+        if not loop_ok or not conn.usable:
+            drop = True
+        elif expiry is not None and conn.active_streams == 0 \
+                and time.monotonic() - conn.last_used > expiry:
+            drop = True
+        if drop:
+            del self._h2[key]
+            if loop_ok and not conn.closed:
+                task = asyncio.ensure_future(conn.close())
+                self._bg_tasks.add(task)
+                task.add_done_callback(self._bg_tasks.discard)
+            return None
+        return conn
+
+    async def _start_h2(self, key: tuple, opened: "_Opened") -> AsyncHttp2Connection:
+        stream = opened.writer          # AsyncTLSStream: read/write/drain/close/wait_closed
+        conn = AsyncHttp2Connection(
+            stream, read_timeout=self.timeout.read, write_timeout=self.timeout.write,
+            on_close=opened.release,
+        )
+        try:
+            await asyncio.wait_for(conn.start(), self.timeout.connect)
+        except BaseException:
+            await conn.close()
+            opened.release()
+            raise
+        self._h2[key] = conn
+        return conn
+
+    async def _exchange(self, method: str, u: URL, proxy: Optional[ProxyConfig],
+                        req_headers: dict, raw_body: bytes, metrics):
+        """Bağlantıyı bulur/kurar ve isteği h2 veya HTTP/1.1 ile yapar.
+
+        ``(status, Headers, body_raw, send_time)`` döner.
+        """
+        key = (u.host, u.port, proxy)
+        for attempt in (0, 1):
+            conn = self._h2_get(key)
+            opened = None
+            if conn is not None:
+                if metrics:
+                    metrics.connection_reused = True
+                    metrics.connect_start = metrics.connect_end = time.monotonic()
+            elif self.impersonate is not None and self._origin_proto.get(key) != "h1":
+                # Protokol henüz bilinmiyor: aynı kaynağa eşzamanlı gelen isteklerin
+                # tek bir h2 bağlantısını paylaşabilmesi için ilk el sıkışma serileşir.
+                async with self._origin_locks.setdefault(key, asyncio.Lock()):
+                    conn = self._h2_get(key)
+                    if conn is None:
+                        opened = await self._open(u, proxy, metrics)
+                        if opened.alpn == "h2":
+                            conn = await self._start_h2(key, opened)
+                            opened = None
+                        else:
+                            self._origin_proto[key] = "h1"
+            else:
+                opened = await self._open(u, proxy, metrics)
+
+            if conn is not None:
+                try:
+                    return await self._h2_exchange(conn, method, u, req_headers, raw_body, metrics)
+                except H2StreamRefused as e:
+                    if attempt == 0:
+                        logger.debug("h2 stream işlenmedi, yeni bağlantıda yeniden: %s", e)
+                        continue
+                    raise ConnectionError(f"HTTP/2 isteği başarısız: {e}") from e
+            return await self._h1_exchange(opened, method, u, req_headers, raw_body, metrics)
+        raise ConnectionError("Tüm bağlantı denemeleri başarısız oldu.")  # pragma: no cover
+
+    # RFC 7540 §8.1.2.2: bağlantıya özgü başlıklar h2'de yasaktır; Host -> :authority.
+    _H2_SKIP = frozenset({"host", "connection", "keep-alive", "proxy-connection",
+                          "transfer-encoding", "upgrade"})
+
+    async def _h2_exchange(self, conn: AsyncHttp2Connection, method: str, u: URL,
+                           req_headers: dict, raw_body: bytes, metrics):
+        h2_headers = [(k.lower(), str(v)) for k, v in req_headers.items()
+                      if k.lower() not in self._H2_SKIP]
+        host = f"[{u.host}]" if ":" in u.host else u.host
+        authority = host if u.port == 443 else f"{host}:{u.port}"
+        if metrics:
+            metrics.bytes_sent = len(raw_body) + sum(len(k) + len(v) for k, v in h2_headers)
+        send_time = time.monotonic()
+        try:
+            r = await conn.request(method, authority, u.raw_path.decode("latin-1"),
+                                   h2_headers, raw_body)
+        except H2StreamRefused:
+            raise
+        except (Http2StreamError, Http2ConnectionError) as e:
+            raise ConnectionError(f"HTTP/2 isteği başarısız: {e}") from e
+        if metrics:
+            metrics.first_byte_time = r.first_byte_time or time.monotonic()
+        headers = Headers()
+        for k, v in r.headers:
+            headers.add(k, v)
+        return r.status, headers, r.body, send_time
+
+    @staticmethod
+    async def _h1_read_body(reader, method: str, status: int, headers: Headers,
+                            first: bytes, read_to: Optional[float]) -> bytes:
+        """HTTP/1.1 gövdesi (RFC 9112 §6.3). Eksik gövde ConnectionResetError'dır."""
+        async def more() -> bytes:
+            return await asyncio.wait_for(reader.read(4096), timeout=read_to)
+
+        if method.upper() == "HEAD" or status in (204, 304) or 100 <= status < 200:
+            return b""          # gövde YOK: bağlantıdan veri beklenmez
+
+        buf = bytearray(first)
+        if "chunked" in headers.get("transfer-encoding", "").lower():
+            out = bytearray()
+            pos = 0
+            while True:
+                nl = buf.find(b"\r\n", pos)
+                while nl == -1:
+                    c = await more()
+                    if not c:
+                        raise ConnectionResetError("Chunked gövde yarıda kesildi.")
+                    buf.extend(c)
+                    nl = buf.find(b"\r\n", pos)
+                try:
+                    sz = int(bytes(buf[pos:nl]).split(b";")[0].strip(), 16)
+                except ValueError:
+                    raise ConnectionError("Geçersiz chunk boyutu.") from None
+                pos = nl + 2
+                if sz == 0:
+                    return bytes(out)       # trailer'lar yok sayılır
+                while len(buf) < pos + sz + 2:
+                    c = await more()
+                    if not c:
+                        raise ConnectionResetError("Chunked gövde yarıda kesildi.")
+                    buf.extend(c)
+                out.extend(buf[pos:pos + sz])
+                pos += sz + 2
+                if pos > 65536:             # işlenmiş kısmı at
+                    del buf[:pos]
+                    pos = 0
+
+        cl = headers.get("content-length", "").strip()
+        if cl.isdigit():
+            n = int(cl)
+            while len(buf) < n:
+                c = await more()
+                if not c:
+                    raise ConnectionResetError(
+                        f"Yanıt gövdesi eksik: {len(buf)}/{n} bayt alındı.")
+                buf.extend(c)
+            return bytes(buf[:n])
+
+        while True:                          # bağlantı kapanana kadar (HTTP/1.0)
+            try:
+                c = await asyncio.wait_for(reader.read(4096), timeout=2.0)
+            except (ConnectionResetError, asyncio.TimeoutError):
+                break
+            if not c:
+                break
+            buf.extend(c)
+        return bytes(buf)
+
+    async def _h1_exchange(self, opened: "_Opened", method: str, u: URL,
+                           req_headers: dict, raw_body: bytes, metrics):
+        """Tek bağlantıda tek HTTP/1.1 isteği; bağlantı sonunda kapatılır."""
+        reader, writer = opened.reader, opened.writer
+        read_to = self.timeout.read
+        try:
+            req_line = f"{method} {u.raw_path.decode()} HTTP/1.1\r\n"
+            for k, v in req_headers.items():
+                req_line += f"{k}: {v}\r\n"
+            req_line += "\r\n"
+            raw_request = req_line.encode("ascii") + (raw_body or b"")
+            if metrics:
+                metrics.bytes_sent = len(raw_request)
+
+            writer.write(raw_request)
+            await asyncio.wait_for(writer.drain(), self.timeout.write)
+            send_time = time.monotonic()
+
+            hdr_acc = bytearray()
+            sep     = -1
+            while True:
+                chunk = await asyncio.wait_for(reader.read(4096), timeout=read_to)
+                if not chunk: break
+                if not hdr_acc and metrics:
+                    metrics.first_byte_time = time.monotonic()
+                search_from = max(0, len(hdr_acc) - 3)
+                hdr_acc += chunk
+                sep = hdr_acc.find(b"\r\n\r\n", search_from)
+                if sep != -1:
+                    break
+            hdr_buf = bytes(hdr_acc)
+            if sep == -1:
+                raise ConnectionResetError("Sunucu yanıt başlıkları tamamlanmadan bağlantıyı kesti.")
+
+            headers_raw      = hdr_buf[:sep]
+            first_body_chunk = hdr_buf[sep + 4:]
+
+            lines = headers_raw.split(b"\r\n")
+            status_code = 0
+            try:
+                status_code = int(lines[0].decode("ascii", errors="ignore").split(" ", 2)[1])
+            except (IndexError, ValueError):
+                logger.debug("Status satırı ayrıştırılamadı: %r", lines[0][:80])
+
+            resp_headers = Headers()
+            for line in lines[1:]:
+                if b":" not in line: continue
+                k, _, v = line.partition(b":")
+                resp_headers._list.append((k.strip(), k.strip().lower(), v.strip()))
+
+            body_raw = await self._h1_read_body(reader, method, status_code, resp_headers,
+                                                first_body_chunk, read_to)
+
+            return status_code, resp_headers, bytes(body_raw), send_time
+        finally:
+            writer.close()
+            try:
+                await writer.wait_closed()
+            except OSError as e:  # ssl kapanış hataları dahil
+                logger.debug("wait_closed hatası yok sayıldı: %s", e)
+            opened.release()
+
     async def _raw_request(
         self,
         method:  str,
@@ -322,17 +664,14 @@ class AsyncSession:
         body:    bytes           = b"",
         metrics: Optional[RequestMetrics] = None,
     ) -> Response:
-        """Tek async HTTP/1.1 isteği."""
+        """Tek async HTTP isteği (ALPN'e göre HTTP/2 veya HTTP/1.1)."""
         u = URL(url) if isinstance(url, str) else url
 
-                        
-        proxy = self._rotator.next() if self._rotator else None
+        proxy_cfg, proxy = self._select_proxy(u)
 
-                      
         req_dict = {"method": method, "url": url, "headers": headers or {}, "body": body}
         req_dict = await self._run_request_hooks(req_dict)
 
-                        
         req_headers = {
             "Host":            u.host,
             "Connection":      "keep-alive",
@@ -347,7 +686,6 @@ class AsyncSession:
         if self.cookies:
             req_headers["Cookie"] = "; ".join(f"{k}={v}" for k, v in self.cookies.items())
 
-                        
         cache_entry = None
         if self._cache and method.upper() == "GET":
             cache_entry = self._cache.get(url, method)
@@ -359,195 +697,55 @@ class AsyncSession:
         if raw_body:
             req_headers["Content-Length"] = str(len(raw_body))
 
-                   
-        req_line = f"{method} {u.raw_path.decode()} HTTP/1.1\r\n"
-        for k, v in req_headers.items():
-            req_line += f"{k}: {v}\r\n"
-        req_line += "\r\n"
-        raw_request = req_line.encode("ascii") + (raw_body or b"")
-
         if metrics:
             metrics.request_start = time.monotonic()
-            metrics.bytes_sent    = len(raw_request)
 
-                        
-        ctx = ssl.create_default_context(cafile=self._ca_path)
-        ctx.set_alpn_protocols(["http/1.1"])
+        try:
+            status_code, resp_headers, body_raw, send_time = await self._exchange(
+                method, u, proxy_cfg, req_headers, raw_body, metrics)
 
-        connect_host = u.host
-        connect_port = u.port
+            if metrics:
+                metrics.transfer_end   = time.monotonic()
+                metrics.bytes_received = len(body_raw)
+                metrics.total_end      = time.monotonic()
 
-        async with self._sem:
-            try:
-                if metrics: metrics.connect_start = time.monotonic()
+            ce  = resp_headers.get("content-encoding", "").lower()
+            body_final = HTTP1Parser._decompress(bytes(body_raw), ce)
 
-                if self.impersonate is not None:
-                    stream = await asyncio.wait_for(
-                        AsyncTLSStream.connect(
-                            connect_host, connect_port, self.impersonate,
-                            alpn=["http/1.1"], ca_path=getattr(self, "_ca_path", None),
-                        ),
-                        timeout=self.timeout,
-                    )
-                    reader = writer = stream
-                else:
-                    reader, writer = await asyncio.wait_for(
-                        asyncio.open_connection(connect_host, connect_port, ssl=ctx),
-                        timeout=self.timeout,
-                    )
+            for cs in resp_headers.get_list("set-cookie"):
+                main = cs.split(";")[0].strip()
+                if "=" in main:
+                    k, v = main.split("=", 1)
+                    self.cookies[k.strip()] = v.strip()
 
-                if metrics:
-                    metrics.connect_end = time.monotonic()
-                    metrics.tls_end     = time.monotonic()
+            resp = Response(status_code=status_code, headers=resp_headers, body=body_final)
 
-                writer.write(raw_request)
-                await writer.drain()
-                send_time = time.monotonic()
+            if metrics:
+                resp.metrics = metrics
 
-                            
-                hdr_acc = bytearray()
-                sep     = -1
-                while True:
-                    chunk = await asyncio.wait_for(reader.read(4096), timeout=self.timeout)
-                    if not chunk: break
-                    if not hdr_acc and metrics:
-                        metrics.first_byte_time = time.monotonic()
-                    search_from = max(0, len(hdr_acc) - 3)
-                    hdr_acc += chunk
-                    sep = hdr_acc.find(b"\r\n\r\n", search_from)
-                    if sep != -1:
-                        break
-                hdr_buf = bytes(hdr_acc)
+            if status_code == 304 and cache_entry:
+                resp = cache_entry.response
 
-                headers_raw      = hdr_buf[:sep]
-                first_body_chunk = hdr_buf[sep + 4:]
+            if self._cache and method.upper() == "GET":
+                self._cache.store(url, method, resp)
 
-                                  
-                lines = headers_raw.split(b"\r\n")
-                status_code = 0
-                try:
-                    status_code = int(lines[0].decode("ascii", errors="ignore").split(" ", 2)[1])
-                except (IndexError, ValueError):
-                    logger.debug("Status satırı ayrıştırılamadı: %r", lines[0][:80])
+            if proxy and self._rotator and metrics and metrics.first_byte_time:
+                ttfb = (metrics.first_byte_time - send_time) * 1000
+                self._rotator.update_perf(proxy, ttfb)
 
-                resp_headers = Headers()
-                for line in lines[1:]:
-                    if b":" not in line: continue
-                    k, _, v = line.partition(b":")
-                    resp_headers._list.append((k.strip(), k.strip().lower(), v.strip()))
+            resp = await self._run_response_hooks(resp)
+            return resp
 
-                      
-                is_chunked    = "chunked" in resp_headers.get("transfer-encoding", "").lower()
-                cl_str        = resp_headers.get("content-length", "")
-                content_length = int(cl_str.strip()) if cl_str else None
-
-                body_raw = bytearray(first_body_chunk)
-
-                if is_chunked:
-                    pos = 0
-                    while True:
-                        while b"\r\n" not in bytes(body_raw[pos:]):
-                            c = await asyncio.wait_for(reader.read(4096), timeout=self.timeout)
-                            if not c: break
-                            body_raw.extend(c)
-                        nl = bytes(body_raw).find(b"\r\n", pos)
-                        if nl == -1: break
-                        sz = int(bytes(body_raw[pos:nl]).split(b";")[0].strip(), 16)
-                        if sz == 0: break
-                        pos = nl + 2
-                        end = pos + sz
-                        while len(body_raw) < end + 2:
-                            c = await asyncio.wait_for(reader.read(4096), timeout=self.timeout)
-                            if not c: break
-                            body_raw.extend(c)
-                        pos = end + 2
-                            
-                    decoded = bytearray()
-                    p2 = 0
-                    raw_b = bytes(body_raw)
-                    while p2 < len(raw_b):
-                        nl2 = raw_b.find(b"\r\n", p2)
-                        if nl2 == -1: break
-                        try: sz2 = int(raw_b[p2:nl2].split(b";")[0].strip(), 16)
-                        except ValueError: break
-                        if sz2 == 0: break
-                        p2 = nl2 + 2
-                        decoded.extend(raw_b[p2:p2 + sz2])
-                        p2 += sz2 + 2
-                    body_raw = decoded
-
-                elif content_length is not None:
-                    while len(body_raw) < content_length:
-                        c = await asyncio.wait_for(reader.read(min(4096, content_length - len(body_raw))), timeout=self.timeout)
-                        if not c: break
-                        body_raw.extend(c)
-                    body_raw = body_raw[:content_length]
-
-                else:
-                    while True:
-                        try:
-                            c = await asyncio.wait_for(reader.read(4096), timeout=2.0)
-                            if not c: break
-                            body_raw.extend(c)
-                        except asyncio.TimeoutError:
-                            break
-
-                if metrics:
-                    metrics.transfer_end   = time.monotonic()
-                    metrics.bytes_received = len(body_raw)
-                    metrics.total_end      = time.monotonic()
-
-                            
-                ce  = resp_headers.get("content-encoding", "").lower()
-                body_final = HTTP1Parser._decompress(bytes(body_raw), ce)
-
-                                 
-                for cs in resp_headers.get_list("set-cookie"):
-                    main = cs.split(";")[0].strip()
-                    if "=" in main:
-                        k, v = main.split("=", 1)
-                        self.cookies[k.strip()] = v.strip()
-
-                resp = Response(status_code=status_code, headers=resp_headers, body=body_final)
-
-                if metrics:
-                    resp.metrics = metrics                              
-
-                     
-                if status_code == 304 and cache_entry:
-                    resp = cache_entry.response
-
-                             
-                if self._cache and method.upper() == "GET":
-                    self._cache.store(url, method, resp)
-
-                                     
-                if proxy and self._rotator and metrics and metrics.first_byte_time:
-                    ttfb = (metrics.first_byte_time - send_time) * 1000
-                    self._rotator.update_perf(proxy, ttfb)
-
-                writer.close()
-                try:
-                    await writer.wait_closed()
-                except OSError as e:  # ssl kapanış hataları dahil
-                    logger.debug("wait_closed hatası yok sayıldı: %s", e)
-
-                              
-                resp = await self._run_response_hooks(resp)
-                return resp
-
-            except Exception as e:
-                if proxy and self._rotator:
-                    self._rotator.mark_failed(proxy)
-                                   
-                for plugin in self._plugins:
-                    e2 = await plugin.on_error(e)
-                    if e2 is None:
-                        return Response(0, body=b"")
-                raise
+        except Exception as e:
+            if proxy and self._rotator:
+                self._rotator.mark_failed(proxy)
+            for plugin in self._plugins:
+                e2 = await plugin.on_error(e)
+                if e2 is None:
+                    return Response(0, body=b"")
+            raise
 
                                                                                 
-
     # --- Faz 5 kancaları: transport + retry -------------------------------
 
     async def _send(self, method, url, headers=None, body=b"", metrics=None) -> Response:
@@ -724,6 +922,14 @@ class AsyncSession:
                                                                                 
 
     async def close(self) -> None:
+        conns, self._h2 = list(self._h2.values()), {}
+        try:
+            running = asyncio.get_running_loop()
+        except RuntimeError:
+            running = None
+        for c in conns:
+            if c.loop is running:
+                await c.close()
         if self.transport is not None:
             self.transport.close()                                         
 
