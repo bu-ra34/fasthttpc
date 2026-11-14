@@ -31,6 +31,7 @@ from .cache      import ResponseCache
 from .buffer     import AdaptiveReceiver, get_pool
 from .timeout    import Timeout
 from .config     import Limits, resolve_verify
+from .security.client_cert import ClientCert
 from .retry      import Retry
 from .multipart  import encode_multipart
 from .cookies    import CookieJar
@@ -256,6 +257,10 @@ class Session:
         event_hooks:     httpx tarzı ``{"request": [fn], "response": [fn]}``.
         trust_env:       ``True`` iken ``.netrc`` (``NETRC`` env dahil) kimliği kullanılır.
         params:          Her isteğe eklenen varsayılan sorgu parametreleri.
+        cert:            İstemci sertifikası (mTLS), YALNIZCA oturum düzeyinde: ``"client.pem"``
+                         (sertifika+anahtar), ``("cert.pem", "key.pem")``, ``("cert.pem", "key.pem",
+                         "parola")`` veya ``ClientCert.from_pkcs12(yol, parola)``. Bağlantı havuzu ve
+                         TLS bilet önbelleği anahtarına sertifika kimliği girer.
         headers:         Oturum düzeyi varsayılan başlıklar (``s.headers`` ile
                          değiştirilebilir). Öncelik: profilin tarayıcı
                          başlıkları < ``headers`` < istek başlıkları; değeri
@@ -291,6 +296,8 @@ class Session:
         event_hooks:     "dict | None"                = None,
         trust_env:       bool                         = True,
         params                                        = None,
+        *,
+        cert                                          = None,
     ):
         # Eski sunucu uyumluluk modu: YALNIZCA açıkça True verilirse TLS 1.2 CBC/statik RSA/EMS'siz
         # sunucular kabul edilir (sertifika doğrulaması ve DOWNGRD kontrolü AYNEN sürer).
@@ -305,6 +312,10 @@ class Session:
         self.trust_env     = trust_env
         self.params        = params
         self._plugins: list[Plugin] = []
+        # mTLS (oturum düzeyi): cert= yol | (cert, key) | (cert, key, parola) | ClientCert.
+        # Yükleme hatası burada (kurucuda) ClientCertError(ValueError) olarak yükselir.
+        self.client_cert   = ClientCert.coerce(cert)
+        self._owns_cert    = self.client_cert is not None and not isinstance(cert, ClientCert)
         # Oturum düzeyi varsayılan başlıklar (requests gibi mutable): profilin
         # tarayıcı başlıklarını geçersiz kılar, istek başlıkları bunları.
         self.headers       = Headers(headers)
@@ -322,6 +333,7 @@ class Session:
             timeout=self.timeout.connect_timeout,
             resolver=resolver,
             proxy=_proxy_spec(proxy, proxies),
+            tls_scope=self.client_cert.identity if self.client_cert is not None else None,
         )
         self.limits.apply_to_pool(self.pool)
         self.cookie_jar = CookieJar()
@@ -340,6 +352,12 @@ class Session:
         self._has_proxy = bool(_proxy_spec(proxy, proxies))
         from .http3.options import Http3Options
         _h3opts = Http3Options.from_value(http3)
+        if _h3opts is not None and self.client_cert is not None:
+            # HTTP/3 yolu istemci sertifikası (mTLS) göndermez: cert= varken h3 KULLANILMAZ
+            # (aksi halde istek sertifikasız bir QUIC bağlantısıyla gidebilirdi).
+            if _h3opts.mode == "force":
+                raise ValueError("http3='force' ile cert= (mTLS) birlikte kullanılamaz.")
+            _h3opts = None
         if _h3opts is not None:
             from .http3.manager import SyncHttp3
             self._h3 = SyncHttp3(_h3opts, self._ca_path, impersonate)
@@ -738,6 +756,7 @@ class Session:
                         conn.socket, req.url.host, self.impersonate,
                         ca_path=self._ca_path, port=req.url.port,
                         **self._legacy_kw(),
+                        **({"client_cert": self.client_cert} if self.client_cert is not None else {}),
                     )
                     conn.socket.raw_socket.settimeout(self._tmo().read_timeout)
                     conn.tls_established = True
@@ -1294,7 +1313,8 @@ class Session:
         return self.pool.prewarm(
             hosts, count=count,
             tls_negotiate_fn=functools.partial(TLSAdapter.negotiate, ca_path=self._ca_path,
-                                               **self._legacy_kw()),
+                                               **self._legacy_kw(),
+                                               client_cert=self.client_cert),
             impersonate=self.impersonate,
         )
 
@@ -1335,6 +1355,8 @@ class Session:
         if self._h3 is not None:
             self._h3.close()
         self.pool.close_all()
+        if self.client_cert is not None and self._owns_cert:
+            self.client_cert.close()          # özel anahtar referansını bırak
         if self.transport is not None:
             self.transport.close()
 

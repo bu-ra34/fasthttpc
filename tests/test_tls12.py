@@ -149,7 +149,9 @@ def test_handshake_order_normal_akis():
     ([2, 11, 22], "AFTER_CERT"),                  # status_request kabul edilmemişti
     ([2, 11, 12, 14, 4], "NewSessionTicket"),     # session_ticket kabul edilmemişti
     ([2, 11, 12, 14, 20], "ChangeCipherSpec olmadan"),
-    ([2, 11, 12, 13], "CertificateRequest"),
+    ([2, 11, 13], "CertificateRequest"),          # SKE'den önce
+    ([2, 11, 12, 13, 13], "CertificateRequest"),  # tekrar
+    ([2, 11, 12, 13, 14, 13], "CertificateRequest"),
     ([2, 2], "WAIT_CERT"),
 ])
 def test_handshake_order_sira_disi_reddedilir(seq, match):
