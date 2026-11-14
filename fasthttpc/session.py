@@ -31,11 +31,16 @@ from .cache      import ResponseCache
 from .buffer     import AdaptiveReceiver, get_pool
 from .timeout    import Timeout
 from .config     import Limits, resolve_verify
+from .security.client_cert import ClientCert
 from .retry      import Retry
 from .multipart  import encode_multipart
 from .cookies    import CookieJar
 from .fingerprint import drop_h2_only_defaults, merge_default_headers, order_h1
 from ._log       import get_logger
+from . import _api
+from ._api       import USE_CLIENT_DEFAULT
+from .auth       import resolve_auth, netrc_credentials, BasicAuth
+from .plugins    import Plugin, RetryPlugin, call_sync
 
 logger = get_logger("session")
 
@@ -75,6 +80,151 @@ def _proxy_spec(proxy, proxies):
 
 
 
+_DISCARD_LIMIT = 65536
+
+
+def _discard_stream(resp: Response) -> None:
+    """Yönlendirme yanıtının gövdesini (küçükse) tüketir ki h1 bağlantısı havuza
+    dönsün; büyükse/hata olursa yanıt kapatılır."""
+    try:
+        n = 0
+        for c in resp.iter_raw():
+            n += len(c)
+            if n > _DISCARD_LIMIT:
+                break
+    except Exception as e:  # noqa: BLE001 - yönlendirme gövdesi önemsiz
+        logger.debug("yönlendirme gövdesi okunamadı: %s", e)
+    resp.close()
+
+
+class _StreamContext:
+    """``Session.stream(...)`` dönüşü: ``with`` bloğunda Response verir, çıkışta kapatır."""
+
+    def __init__(self, session, method, url, kwargs):
+        self._args = (session, method, url, kwargs)
+        self._resp = None
+
+    def __enter__(self) -> Response:
+        session, method, url, kwargs = self._args
+        self._resp = session.request(method, url, stream=True, **kwargs)
+        return self._resp
+
+    def __exit__(self, *exc) -> None:
+        if self._resp is not None:
+            self._resp.close()
+
+
+class _H1BodyStream:
+    """HTTP/1.1 akış gövdesi: bağlantının sahibi. Gövde bitince bağlantı (yeniden
+    kullanılabilirse) havuza döner; erken ``close()``/hata -> bağlantı kapatılır."""
+
+    def __init__(self, session: "Session", conn, gen, reusable: bool,
+                 metrics: "RequestMetrics | None", header_bytes: int = 0):
+        self._s, self._conn, self._gen = session, conn, gen
+        self._reusable, self._metrics = reusable, metrics
+        self._received = header_bytes
+        self._done = False
+
+    def read_chunk(self) -> bytes:
+        if self._done:
+            return b""
+        try:
+            chunk = next(self._gen)
+        except StopIteration:
+            self._finish(self._reusable)
+            return b""
+        except BaseException:
+            self._finish(False)
+            raise
+        self._received += len(chunk)
+        return chunk
+
+    def _finish(self, reuse: bool) -> None:
+        if self._done:
+            return
+        self._done = True
+        conn = self._conn
+        m = self._metrics
+        if m:
+            m.transfer_end = m.total_end = time.perf_counter()
+            m.bytes_received = self._received
+        if not reuse:
+            conn.close()
+        self._s.pool.release(conn)    # kapalı bağlantıyı havuza koymaz, slotu iade eder
+
+    def close(self) -> None:
+        self._gen.close()
+        self._finish(False)
+
+    def __del__(self):
+        try:
+            if not self._done:
+                self.close()
+        except Exception:  # noqa: BLE001 - yorumlayıcı kapanışı
+            pass
+
+
+class _H2BodyStream:
+    """HTTP/2 akış gövdesi. Bitince bağlantı havuza döner (GOAWAY varsa kapatılır);
+    erken ``close()`` stream'i RST_STREAM(CANCEL) ile iptal eder, bağlantı yaşar."""
+
+    def __init__(self, session: "Session", conn, h2_stream, metrics):
+        self._s, self._conn, self._st = session, conn, h2_stream
+        self._metrics, self._received = metrics, 0
+        self._done = False
+
+    def read_chunk(self) -> bytes:
+        if self._done:
+            return b""
+        try:
+            chunk = self._st.read_chunk()
+        except BaseException as e:
+            self._finish()
+            if isinstance(e, (Http2StreamError, Http2ConnectionError)):
+                raise ConnectionError(f"HTTP/2 isteği başarısız: {e}") from e
+            raise
+        if not chunk:
+            self._finish()
+            return b""
+        self._received += len(chunk)
+        return chunk
+
+    def _finish(self) -> None:
+        if self._done:
+            return
+        self._done = True
+        conn, st = self._conn, self._st
+        m = self._metrics
+        if m:
+            m.transfer_end = m.total_end = time.perf_counter()
+            m.bytes_received = self._received
+        if st.broken or conn.h2_conn.goaway is not None:
+            conn.close()
+        self._s.pool.release(conn)
+
+    def close(self) -> None:
+        if self._done:
+            return
+        self._st.close()          # bitmediyse CANCEL; kilidi bırakır
+        self._finish()
+
+    def __del__(self):
+        try:
+            if not self._done:
+                self.close()
+        except Exception:  # noqa: BLE001
+            pass
+def _no_await(out):
+    """Senkron oturumda hook coroutine döndürürse açık bir hata ver."""
+    import inspect
+    if inspect.isawaitable(out):
+        if hasattr(out, "close"):
+            out.close()
+        raise TypeError("Hook coroutine döndürdü; senkron Session yalnızca düz fonksiyon "
+                        "hook'larını destekler (async hook için AsyncSession kullanın).")
+    return out
+
+
 class _H2Refused(ConnectionError):
     """HTTP/2 isteği sunucu tarafından İŞLENMEDİ (GOAWAY); güvenle yeniden denenebilir."""
 
@@ -98,6 +248,19 @@ class Session:
                          verilirse istekler ağ yerine buna gönderilir.
         limits:          Opsiyonel :class:`~fasthttpc.config.Limits`; verilirse
                          ``max_connections`` parametresini geçersiz kılar.
+        auth:            Oturum düzeyi kimlik: ``("kullanici", "parola")`` (Basic),
+                         :class:`~fasthttpc.auth.BasicAuth` / ``DigestAuth`` /
+                         ``BearerAuth`` ya da özel (requests ``__call__`` veya httpx
+                         ``auth_flow``). ``s.auth`` ile değiştirilebilir.
+        hooks:           requests tarzı ``{"response": [fn, ...]}``; ``fn(response, **kw)``
+                         yeni Response döndürebilir.
+        event_hooks:     httpx tarzı ``{"request": [fn], "response": [fn]}``.
+        trust_env:       ``True`` iken ``.netrc`` (``NETRC`` env dahil) kimliği kullanılır.
+        params:          Her isteğe eklenen varsayılan sorgu parametreleri.
+        cert:            İstemci sertifikası (mTLS), YALNIZCA oturum düzeyinde: ``"client.pem"``
+                         (sertifika+anahtar), ``("cert.pem", "key.pem")``, ``("cert.pem", "key.pem",
+                         "parola")`` veya ``ClientCert.from_pkcs12(yol, parola)``. Bağlantı havuzu ve
+                         TLS bilet önbelleği anahtarına sertifika kimliği girer.
         headers:         Oturum düzeyi varsayılan başlıklar (``s.headers`` ile
                          değiştirilebilir). Öncelik: profilin tarayıcı
                          başlıkları < ``headers`` < istek başlıkları; değeri
@@ -126,8 +289,33 @@ class Session:
         proxies                                       = None,
         proxy                                         = None,
         headers                                       = None,
+        http3:           "bool | str | object"        = False,
+        legacy_tls:      bool                         = False,
+        auth                                          = None,
+        hooks:           "dict | None"                = None,
+        event_hooks:     "dict | None"                = None,
+        trust_env:       bool                         = True,
+        params                                        = None,
+        *,
+        cert                                          = None,
     ):
+        # Eski sunucu uyumluluk modu: YALNIZCA açıkça True verilirse TLS 1.2 CBC/statik RSA/EMS'siz
+        # sunucular kabul edilir (sertifika doğrulaması ve DOWNGRD kontrolü AYNEN sürer).
+        # Bkz. security/tls12_legacy.py ve README "Legacy TLS".
+        from .security.tls12_legacy import normalize_legacy
+        self.legacy_tls    = normalize_legacy(legacy_tls)
         self.impersonate   = impersonate
+        # requests/httpx uyumu: oturum düzeyi kimlik, hook'lar ve varsayılan params.
+        self.auth          = auth
+        self.hooks         = _api.normalize_hooks(hooks)
+        self.event_hooks   = _api.normalize_event_hooks(event_hooks)
+        self.trust_env     = trust_env
+        self.params        = params
+        self._plugins: list[Plugin] = []
+        # mTLS (oturum düzeyi): cert= yol | (cert, key) | (cert, key, parola) | ClientCert.
+        # Yükleme hatası burada (kurucuda) ClientCertError(ValueError) olarak yükselir.
+        self.client_cert   = ClientCert.coerce(cert)
+        self._owns_cert    = self.client_cert is not None and not isinstance(cert, ClientCert)
         # Oturum düzeyi varsayılan başlıklar (requests gibi mutable): profilin
         # tarayıcı başlıklarını geçersiz kılar, istek başlıkları bunları.
         self.headers       = Headers(headers)
@@ -145,6 +333,7 @@ class Session:
             timeout=self.timeout.connect_timeout,
             resolver=resolver,
             proxy=_proxy_spec(proxy, proxies),
+            tls_scope=self.client_cert.identity if self.client_cert is not None else None,
         )
         self.limits.apply_to_pool(self.pool)
         self.cookie_jar = CookieJar()
@@ -158,6 +347,20 @@ class Session:
 
         self._receiver = AdaptiveReceiver()
         self._pool     = get_pool()
+        # HTTP/3 (opsiyonel, aioquic): True -> Alt-Svc keşfi + h2'ye düşüş, "force" -> doğrudan h3.
+        self._h3 = None
+        self._has_proxy = bool(_proxy_spec(proxy, proxies))
+        from .http3.options import Http3Options
+        _h3opts = Http3Options.from_value(http3)
+        if _h3opts is not None and self.client_cert is not None:
+            # HTTP/3 yolu istemci sertifikası (mTLS) göndermez: cert= varken h3 KULLANILMAZ
+            # (aksi halde istek sertifikasız bir QUIC bağlantısıyla gidebilirdi).
+            if _h3opts.mode == "force":
+                raise ValueError("http3='force' ile cert= (mTLS) birlikte kullanılamaz.")
+            _h3opts = None
+        if _h3opts is not None:
+            from .http3.manager import SyncHttp3
+            self._h3 = SyncHttp3(_h3opts, self._ca_path, impersonate)
 
                                                                                
 
@@ -168,7 +371,19 @@ class Session:
         "transfer-encoding", "upgrade",
     })
 
-    def _send_h2_request(self, conn, req, metrics, cache_entry, method, url) -> Response:
+    def _legacy_kw(self) -> dict:
+        """legacy_tls kapalıyken HİÇ kwarg geçirilmez (varsayılan çağrılar bit bit aynı kalır)."""
+        return {"legacy_tls": True} if self.legacy_tls else {}
+
+    @staticmethod
+    def _tls_info(conn) -> "dict | None":
+        from .security.tls12_legacy import tls_info
+        sock = getattr(conn, "socket", None)
+        state = getattr(sock, "state", None)
+        return tls_info(state) if isinstance(state, dict) else None
+
+    def _send_h2_request(self, conn, req, metrics, cache_entry, method, url,
+                         stream: bool = False) -> Response:
         """HTTP/2 üzerinden tek bir isteği gönderir ve Response nesnesi döner."""
         # HTTP header değerleri RFC 7230 gereği ISO-8859-1 (latin-1) alfabesindedir;
         # ascii decode, Türkçe/aksanlı karakter içeren Accept-Language, Cookie vb.
@@ -190,27 +405,47 @@ class Session:
         default_port = 443 if req.url.scheme == "https" else 80
         authority = host if req.url.port == default_port else f"{host}:{req.url.port}"
 
+        h2_stream = None
         try:
-            status_code, resp_header_pairs, body_raw = conn.h2_conn.request(
-                method=req.method,
-                authority=authority,
-                path=req.url.raw_path.decode("latin-1"),
-                headers=h2_headers,
-                body=req.body,
-            )
+            if stream:
+                h2_stream = conn.h2_conn.request_stream(
+                    method=req.method, authority=authority,
+                    path=req.url.raw_path.decode("latin-1"),
+                    headers=h2_headers, body=req.body,
+                )
+                status_code, resp_header_pairs, body_raw = (
+                    h2_stream.status, list(h2_stream.headers), b"")
+            else:
+                status_code, resp_header_pairs, body_raw = conn.h2_conn.request(
+                    method=req.method,
+                    authority=authority,
+                    path=req.url.raw_path.decode("latin-1"),
+                    headers=h2_headers,
+                    body=req.body,
+                )
         except Http2RefusedError as e:
             raise _H2Refused(f"HTTP/2 isteği işlenmedi: {e}") from e
         except (Http2StreamError, Http2ConnectionError) as e:
             raise ConnectionError(f"HTTP/2 isteği başarısız: {e}") from e
 
         if metrics:
-            metrics.first_byte_time = time.monotonic()
-            metrics.transfer_end    = time.monotonic()
+            metrics.first_byte_time = time.perf_counter()
+            metrics.transfer_end    = time.perf_counter()
             metrics.bytes_received  = len(body_raw)
 
         resp_headers = Headers()
         for k, v in resp_header_pairs:
             resp_headers.add(k, v)
+
+        if h2_stream is not None:
+            resp = Response(status_code=status_code, headers=resp_headers,
+                            stream=_H2BodyStream(self, conn, h2_stream, metrics))
+            resp.request = req
+            resp.http_version = "HTTP/2"
+            if metrics:
+                resp.metrics = metrics
+            self._update_cookies(resp_headers, req.url)
+            return resp
 
         ce = resp_headers.get("content-encoding", "").lower()
         body_raw = HTTP1Parser._decompress(body_raw, ce)
@@ -218,8 +453,9 @@ class Session:
         resp         = Response(status_code=status_code, headers=resp_headers, body=body_raw)
         resp.request = req
         resp.http_version = "HTTP/2"
+        resp.tls_info = self._tls_info(conn)
         if metrics:
-            metrics.total_end = time.monotonic()
+            metrics.total_end = time.perf_counter()
             resp.metrics = metrics
 
         self._update_cookies(resp_headers, req.url)
@@ -229,16 +465,55 @@ class Session:
 
         return resp
 
+    def _h3_attempt(self, req, metrics, cache_entry, method, url) -> "Response | None":
+        """HTTP/3 denemesi: Response ya da None (h2/h1'e düş). Ayrıntı: fasthttpc.http3."""
+        if self._has_proxy or self._rotator is not None:
+            # UDP bir HTTP proxy'sinden geçemez.
+            if self._h3.state.force:
+                raise ConnectionError("http3='force' bir HTTP proxy ile kullanılamaz (UDP).")
+            return None
+        t = self.timeout
+        timeout = t.total if t.total is not None else t.read_timeout
+        h3_headers = [(k.decode("latin-1").lower(), v.decode("latin-1")) for k, v in req.headers.raw]
+        h3_headers = [(k, v) for k, v in h3_headers
+                      if k != "host" and k not in self._H2_FORBIDDEN_HEADERS]
+        if metrics:
+            metrics.bytes_sent = len(req.body) + sum(len(k) + len(v) for k, v in h3_headers)
+        r = self._h3.exchange(req.url.host, req.url.port, method,
+                              req.url.raw_path.decode("latin-1"), h3_headers, req.body, timeout)
+        if r is None:
+            return None
+        status_code, resp_headers, body = r
+        resp = Response(status_code=status_code, headers=resp_headers, body=body)
+        resp.request = req
+        resp.http_version = "HTTP/3"
+        if metrics:
+            metrics.first_byte_time = metrics.transfer_end = metrics.total_end = time.perf_counter()
+            metrics.bytes_received = len(body)
+            resp.metrics = metrics
+            if metrics.request_start:
+                resp.elapsed = time.perf_counter() - metrics.request_start
+        self._update_cookies(resp_headers, req.url)
+        if status_code == 304 and cache_entry:
+            cached = cache_entry.response
+            cached.request = req
+            if metrics:
+                cached.metrics = metrics
+            return cached
+        if self._cache and method.upper() == "GET":
+            self._cache.store(str(url), method, resp)
+        return resp
+
     def _read_app_data(self, conn) -> bytes:
         """Sadece Application Data döner; post-handshake handshake mesajları
         (NewSessionTicket vb.) TLS katmanında yutulur."""
         dl = conn.conn_data.get("deadline")
         while True:
             if dl is not None:
-                kalan = dl - time.monotonic()
+                kalan = dl - time.perf_counter()
                 if kalan <= 0:
                     raise TimeoutError("İstek toplam süre sınırını (Timeout.total) aştı.")
-                conn.socket.raw_socket.settimeout(min(self.timeout.read_timeout, kalan))
+                conn.socket.raw_socket.settimeout(min(self._tmo().read_timeout, kalan))
             msg, m_type = conn.socket.recv_record(skip_post_handshake=True)
             if m_type == 23:
                 return msg
@@ -274,8 +549,13 @@ class Session:
         metrics: RequestMetrics | None = None,
         framing: str | None = None,
     ) -> bytes:
+        """Gövdeyi tamamen toplar (bkz. :meth:`_iter_body`)."""
+        return b"".join(self._iter_body(conn, first_body_chunk, headers, framing))
+
+    def _iter_body(self, conn, first_body_chunk: bytes, headers: Headers,
+                   framing: str | None = None):
         """
-        Headers parse edildikten sonra body'yi güvenilir biçimde toplar.
+        Headers parse edildikten sonra body'yi PARÇA PARÇA üretir (boş parça yok).
 
         Chunked: proper chunk state-machine (TLS record boundary sorununu çözer)
         Content-Length: tam miktar okunana kadar devam et; eksik gelirse
@@ -287,58 +567,61 @@ class Session:
         if framing is None:
             framing = self._body_framing("GET", 200, headers)
         if framing == "none":
-            return b""
+            return
         if framing == "chunked":
-            return self._collect_chunked(conn, first_body_chunk)
+            yield from self._iter_chunked(conn, first_body_chunk)
+            return
 
         if framing == "length":
             content_length = int(headers.get("content-length", "").strip())
-            body = bytearray(first_body_chunk)
-            while len(body) < content_length:
+            remaining = content_length
+            chunk = first_body_chunk
+            while True:
+                if chunk:
+                    piece = chunk[:remaining]
+                    remaining -= len(piece)
+                    if piece:
+                        yield bytes(piece)
+                if remaining <= 0:
+                    return
                 chunk = self._read_app_data(conn)
                 if not chunk:
                     raise ConnectionResetError(
-                        f"Yanıt gövdesi eksik: {len(body)}/{content_length} bayt alındı."
+                        f"Yanıt gövdesi eksik: {content_length - remaining}/{content_length} bayt alındı."
                     )
-                body.extend(chunk)
-            return bytes(body[:content_length])
 
-        body = bytearray(first_body_chunk)
+        if first_body_chunk:
+            yield bytes(first_body_chunk)
         while True:
             try:
                 chunk = self._read_app_data(conn)
             except ConnectionResetError:
-                break  # close_notify'sız EOF: bağlantı-kapanışlı gövdenin sonu
+                return  # close_notify'sız EOF: bağlantı-kapanışlı gövdenin sonu
             if not chunk:
-                break
-            body.extend(chunk)
-        return bytes(body)
+                return
+            yield chunk
 
-    def _collect_chunked(self, conn, first_chunk: bytes) -> bytes:
+    def _iter_chunked(self, conn, first_chunk: bytes):
         """
-        Proper chunked state-machine.
-        TLS record sınırlarından bağımsız çalışır:
-        Yeterli veri olmadığında recv_record() ile daha fazla alır.
+        Proper chunked state-machine (üreteç).
+        TLS record sınırlarından bağımsız çalışır: yeterli veri olmadığında
+        recv_record() ile daha fazla alır. Bellek: en çok bir chunk + bir record.
         """
-        buf    = bytearray(first_chunk)
-        result = bytearray()
-        pos    = 0
+        buf = bytearray(first_chunk)
+
+        def fill() -> None:
+            more = self._read_app_data(conn)
+            if not more:
+                raise ConnectionResetError("Chunked gövde yarıda kesildi.")
+            buf.extend(more)
 
         while True:
-                                                                           
-            while True:
-                nl = buf.find(b"\r\n", pos)
-                if nl != -1:
-                    break
-                                     
-                more = self._read_app_data(conn)
-                if not more:
-                    raise ConnectionResetError("Chunked gövde yarıda kesildi.")
-                buf.extend(more)
-
-            size_line = bytes(buf[pos:nl]).split(b";")[0].strip()
-            pos = nl + 2             
-
+            nl = buf.find(b"\r\n")
+            while nl == -1:
+                fill()
+                nl = buf.find(b"\r\n")
+            size_line = bytes(buf[:nl]).split(b";")[0].strip()
+            del buf[:nl + 2]
             try:
                 chunk_size = int(size_line, 16)
             except ValueError:
@@ -348,31 +631,26 @@ class Session:
                 # Trailer satırlarını ve kapanış boş satırını TÜKET; aksi hâlde
                 # artan baytlar keep-alive bağlantıda bir sonraki yanıtı bozar.
                 while True:
-                    nl = buf.find(b"\r\n", pos)
+                    nl = buf.find(b"\r\n")
                     while nl == -1:
-                        more = self._read_app_data(conn)
-                        if not more:
-                            raise ConnectionResetError("Chunked gövde yarıda kesildi.")
-                        buf.extend(more)
-                        nl = buf.find(b"\r\n", pos)
-                    bos = nl == pos
-                    pos = nl + 2
+                        fill()
+                        nl = buf.find(b"\r\n")
+                    bos = nl == 0
+                    del buf[:nl + 2]
                     if bos:
-                        break
-                break
+                        return
 
-                                                                           
-            end = pos + chunk_size
-            while len(buf) < end + 2:                      
-                more = self._read_app_data(conn)
-                if not more:
-                    raise ConnectionResetError("Chunked gövde yarıda kesildi.")
-                buf.extend(more)
-
-            result.extend(buf[pos:end])
-            pos = end + 2                      
-
-        return bytes(result)
+            remaining = chunk_size
+            while remaining > 0:
+                if not buf:
+                    fill()
+                take = min(remaining, len(buf))
+                yield bytes(buf[:take])
+                del buf[:take]
+                remaining -= take
+            while len(buf) < 2:       # chunk sonu CRLF
+                fill()
+            del buf[:2]
 
                                                                                
 
@@ -385,6 +663,7 @@ class Session:
         headers  = None,
         files    = None,
         metrics: RequestMetrics | None = None,
+        stream:  bool = False,
     ) -> Response:
         """
         Ham HTTP isteği gönderir. Redirect, cache, retry döngüsü bu metodun üzerinde yönetilir.
@@ -397,6 +676,7 @@ class Session:
             headers: Ek başlıklar
             files:   Dosya yükleme — multipart/form-data olarak encode edilir
             metrics: İstek metrikleri objesi
+            stream:  True ise gövde OKUNMADAN döner (bkz. ``Response.iter_*``)
         """
                                          
         extra_headers: dict = {}
@@ -438,10 +718,15 @@ class Session:
                 for k, v in cond.items():
                     req.headers[k] = v
 
+        if self._h3 is not None:
+            h3_resp = self._h3_attempt(req, metrics, cache_entry, method, url)
+            if h3_resp is not None:
+                return h3_resp
+
         retry_count = 0
         while retry_count < 2:
             if metrics:
-                metrics.connect_start = time.monotonic()
+                metrics.connect_start = time.perf_counter()
 
             conn = None
             rot_proxy = None
@@ -450,7 +735,9 @@ class Session:
             try:
                 rot_proxy = self._rotator.next() if self._rotator is not None else None
                 acq = {"proxy": rot_proxy} if rot_proxy is not None else {}
-                conn = self.pool.acquire(req.url, timeout=self.timeout.pool, **acq)
+                if self._tmo() is not self.timeout:    # istek düzeyi timeout=
+                    acq["connect_timeout"] = self._tmo().connect_timeout
+                conn = self.pool.acquire(req.url, timeout=self._tmo().pool, **acq)
                 is_new_conn = not conn.tls_established
                 logger.debug("conn id=%s yeni=%s tls=%s h2=%s",
                              id(conn), is_new_conn, conn.tls_established,
@@ -458,20 +745,22 @@ class Session:
 
                 if metrics:
                     metrics.connection_reused = not is_new_conn
-                    metrics.connect_end       = time.monotonic()
+                    metrics.connect_end       = time.perf_counter()
 
                      
                 if is_new_conn:
-                    if metrics: metrics.tls_start = time.monotonic()
+                    if metrics: metrics.tls_start = time.perf_counter()
                     logger.debug("%s profili ile TLS el sıkışması başlıyor (%s)",
                                  self.impersonate, req.url.host)
                     conn.socket = TLSAdapter.negotiate(
                         conn.socket, req.url.host, self.impersonate,
                         ca_path=self._ca_path, port=req.url.port,
+                        **self._legacy_kw(),
+                        **({"client_cert": self.client_cert} if self.client_cert is not None else {}),
                     )
-                    conn.socket.raw_socket.settimeout(self.timeout.read_timeout)
+                    conn.socket.raw_socket.settimeout(self._tmo().read_timeout)
                     conn.tls_established = True
-                    if metrics: metrics.tls_end = time.monotonic()
+                    if metrics: metrics.tls_end = time.perf_counter()
                     alpn = conn.socket.state.get("alpn", "")
                     if alpn == "h2":
                         logger.debug("TLS 1.3 kuruldu (ALPN: h2)")
@@ -481,14 +770,20 @@ class Session:
                         logger.debug("TLS 1.3 kuruldu (ALPN: http/1.1)")
 
                 if conn.h2_conn is not None:
-                    resp = self._send_h2_request(conn, req, metrics, cache_entry, method, url)
+                    resp = self._send_h2_request(conn, req, metrics, cache_entry, method, url,
+                                                 stream=stream)
+                    if resp._stream is not None:
+                        # Bağlantıyı akış yönetir (bitince/close'ta havuza döner).
+                        if metrics and metrics.request_start:
+                            resp.elapsed = time.perf_counter() - metrics.request_start
+                        return resp
                     if conn.h2_conn.goaway is not None:
                         # Sunucu GOAWAY ile kapatıyor: yanıt tamam ama bağlantı
                         # yeniden kullanılmaz (RFC 9113 §6.8).
                         conn.close()
                     self.pool.release(conn)
                     if metrics and metrics.request_start:
-                        resp.elapsed = time.monotonic() - metrics.request_start
+                        resp.elapsed = time.perf_counter() - metrics.request_start
                     return resp
 
                                  
@@ -502,11 +797,11 @@ class Session:
 
                 if metrics: metrics.bytes_sent = len(raw_bytes)
 
-                total = self.timeout.total
+                total = self._tmo().total
                 if total is not None:
-                    conn.conn_data["deadline"] = time.monotonic() + total
+                    conn.conn_data["deadline"] = time.perf_counter() + total
                 conn.socket.send_record(raw_bytes)
-                send_time = time.monotonic()
+                send_time = time.perf_counter()
 
                                                                             
                 # bytearray + kaldığı yerden arama: header'lar çok record'a bölünse
@@ -521,7 +816,7 @@ class Session:
                         break
                     got_bytes = True
                     if first_byte and metrics:
-                        metrics.first_byte_time = time.monotonic()
+                        metrics.first_byte_time = time.perf_counter()
                         first_byte = False
                     search_from = max(0, len(header_acc) - 3)
                     header_acc += chunk
@@ -532,6 +827,11 @@ class Session:
 
                 if not header_buf:
                     raise ConnectionResetError("Sunucu yanıt vermeden bağlantıyı kesti.")
+                if sep == -1:
+                    # CRLF CRLF görülmeden kapanış: yarım başlık bloğu yanıt SAYILMAZ
+                    # (eskiden sep=-1 dilimleri çöp başlık/gövde üretip 200 dönüyordu).
+                    raise ConnectionResetError(
+                        "Sunucu yanıt başlıkları tamamlanmadan bağlantıyı kesti.")
 
                 headers_raw      = header_buf[:sep]
                 first_body_chunk = header_buf[sep + 4:]
@@ -562,12 +862,37 @@ class Session:
                                                                            
                                                                     
                 framing  = self._body_framing(req.method, status_code, resp_headers)
+                conn_hdr = resp_headers.get("connection", "").lower()
+                http10   = lines[0].upper().startswith(b"HTTP/1.0")
+                if stream and framing != "none" and not (
+                        framing == "length"
+                        and int(resp_headers.get("content-length", "0").strip()) == 0):
+                    # Akış: gövdeyi OKUMADAN dön. Toplam süre sınırı (deadline)
+                    # akışa uygulanmaz; her okuma read_timeout ile sınırlıdır.
+                    if conn.conn_data.pop("deadline", None) is not None:
+                        conn.socket.raw_socket.settimeout(self.timeout.read_timeout)
+                    reusable = not ("close" in conn_hdr or framing == "eof"
+                                    or (http10 and "keep-alive" not in conn_hdr))
+                    gen = self._iter_body(conn, first_body_chunk, resp_headers, framing)
+                    resp = Response(status_code=status_code, headers=resp_headers,
+                                    stream=_H1BodyStream(self, conn, gen, reusable, metrics,
+                                                         len(headers_raw) + 4))
+                    resp.request = req
+                    if metrics:
+                        metrics.transfer_end = time.perf_counter()
+                        resp.metrics = metrics
+                        if metrics.first_byte_time:
+                            conn.update_ttfb((metrics.first_byte_time - send_time) * 1000)
+                    self._update_cookies(resp_headers, req.url)
+                    if metrics and metrics.request_start:
+                        resp.elapsed = time.perf_counter() - metrics.request_start
+                    return resp
                 body_raw = self._collect_body(conn, first_body_chunk, resp_headers, metrics, framing)
                 if conn.conn_data.pop("deadline", None) is not None:
-                    conn.socket.raw_socket.settimeout(self.timeout.read_timeout)
+                    conn.socket.raw_socket.settimeout(self._tmo().read_timeout)
 
                 if metrics:
-                    metrics.transfer_end   = time.monotonic()
+                    metrics.transfer_end   = time.perf_counter()
                     metrics.bytes_received = len(headers_raw) + 4 + len(body_raw)
                     if metrics.first_byte_time:
                         ttfb_ms = (metrics.first_byte_time - send_time) * 1000
@@ -579,9 +904,10 @@ class Session:
 
                 resp         = Response(status_code=status_code, headers=resp_headers, body=body_raw)
                 resp.request = req
+                resp.tls_info = self._tls_info(conn)
 
                 if metrics:
-                    metrics.total_end = time.monotonic()
+                    metrics.total_end = time.perf_counter()
                     resp.metrics = metrics                              
 
                 self._update_cookies(resp_headers, req.url)
@@ -598,8 +924,6 @@ class Session:
                 if self._cache and method.upper() == "GET":
                     self._cache.store(str(url), method, resp)
 
-                conn_hdr = resp_headers.get("connection", "").lower()
-                http10   = lines[0].upper().startswith(b"HTTP/1.0")
                 if ("close" in conn_hdr or framing == "eof"
                         or (http10 and "keep-alive" not in conn_hdr)):
                     # Yeniden kullanılamaz: kapat VE havuza iade et. release()
@@ -612,7 +936,7 @@ class Session:
                     self.pool.release(conn)
 
                 if metrics and metrics.request_start:
-                    resp.elapsed = time.monotonic() - metrics.request_start
+                    resp.elapsed = time.perf_counter() - metrics.request_start
                 return resp
 
             except (ConnectionResetError, ConnectionError, TimeoutError, OSError) as e:
@@ -655,27 +979,57 @@ class Session:
 
     # --- Faz 5 kancaları: transport + retry -------------------------------
 
-    def _send(self, method, url, data=None, json=None, headers=None, files=None,
-              metrics: RequestMetrics | None = None) -> Response:
-        """Tek bir isteği gönderir: transport verilmişse ona, yoksa ağa."""
-        if self.transport is None:
-            return self._raw_request(method, url, data=data, json=json,
-                                     headers=headers, files=files, metrics=metrics)
-        req = Request(method=method, url=url, data=data, json=json,
-                      headers={k: v for k, v in dict(headers or {}).items() if v is not None},
-                      files=files)
-        if "host" not in req.headers:
-            req.headers["Host"] = req.url.host
-        cookie_header = self.cookie_jar.header_for(
-            host=req.url.host, path=req.url.path, secure=(req.url.scheme == "https")
-        )
-        if cookie_header and "cookie" not in req.headers:
-            req.headers["Cookie"] = cookie_header
-        resp = self.transport.handle_request(req)
-        self._update_cookies(resp.headers, req.url)
-        if metrics and metrics.request_start:
-            resp.elapsed = time.monotonic() - metrics.request_start
-        return resp
+    def _tmo(self) -> Timeout:
+        """Etkin zaman aşımı: istek düzeyi ``timeout=`` varsa o, yoksa oturumunki."""
+        return _api.effective_timeout(self, self.timeout)
+
+    def use(self, plugin: Plugin) -> "Session":
+        """Plugin ekle (``AsyncSession.use`` ile aynı arayüz; kancalar düz fonksiyon).
+
+        Zincir çağrı destekli: ``s.use(p1).use(p2)``.
+        """
+        self._plugins.append(plugin)
+        return self
+
+    def _send(self, method, url, headers=None, body=b"",
+              metrics: RequestMetrics | None = None, stream: bool = False) -> Response:
+        """Tek bir isteği gönderir: plugin kancaları + transport verilmişse ona, yoksa ağa."""
+        try:
+            req_dict = {"method": method, "url": url, "headers": headers or {}, "body": body}
+            for plugin in self._plugins:
+                req_dict = call_sync(plugin, "on_request", req_dict)
+            method, url = req_dict["method"], req_dict["url"]
+            body = req_dict.get("body") or b""
+            hdrs = req_dict.get("headers") or {}
+            if self.transport is None:
+                resp = self._raw_request(method, url, data=body or None, headers=hdrs,
+                                         metrics=metrics, stream=stream)
+                if self._h3 is not None:
+                    u = URL(str(url))
+                    self._h3.state.observe(u.host, u.port, resp.headers)    # Alt-Svc keşfi
+            else:
+                req = Request(method=method, url=url, data=body or None,
+                              headers={k: v for k, v in dict(hdrs).items() if v is not None})
+                if "host" not in req.headers:
+                    req.headers["Host"] = req.url.host
+                cookie_header = self.cookie_jar.header_for(
+                    host=req.url.host, path=req.url.path, secure=(req.url.scheme == "https")
+                )
+                if cookie_header and "cookie" not in req.headers:
+                    req.headers["Cookie"] = cookie_header
+                req.timeout = self._tmo()
+                resp = self.transport.handle_request(req)
+                self._update_cookies(resp.headers, req.url)
+                if metrics and metrics.request_start:
+                    resp.elapsed = time.perf_counter() - metrics.request_start
+            for plugin in self._plugins:
+                resp = call_sync(plugin, "on_response", resp)
+            return resp
+        except Exception as e:
+            for plugin in self._plugins:
+                if call_sync(plugin, "on_error", e) is None:
+                    return Response(0, body=b"")
+            raise
 
     def _send_with_retries(self, method, url, **kwargs) -> Response:
         """``self.retries`` politikasına göre ``_send``'i tekrarlar."""
@@ -695,10 +1049,76 @@ class Session:
                     return resp
                 attempt += 1
                 delay = retry.get_delay(attempt, resp)
+                resp.close()      # akış yanıtıysa bağlantıyı bırak
                 logger.debug("HTTP %s, %d. yeniden deneme %.2fs sonra",
                              resp.status_code, attempt, delay)
             if delay:
                 time.sleep(delay)
+
+    # --- kimlik / hook / hop ------------------------------------------------
+
+    def _auth_for(self, auth, url_creds, host: str):
+        """(Auth | None, kaynak): istek > oturum > .netrc (trust_env) > URL'deki user:pass@."""
+        chosen = self.auth if auth is USE_CLIENT_DEFAULT else auth
+        if chosen is not None:
+            return resolve_auth(chosen), "explicit"
+        if self.trust_env:
+            creds = netrc_credentials(host)
+            if creds:
+                return BasicAuth(*creds), "netrc"
+        if url_creds:
+            return BasicAuth(*url_creds), "url"
+        return None, None
+
+    def _call_hooks(self, event: str, arg, req_hooks=None, **kw):
+        """Hook'ları çalıştırır. Yanıtta requests hook'u ``None`` dışı dönerse yanıt değişir."""
+        if event == "request":
+            for fn in _api.hook_list(self.event_hooks, "request"):
+                _no_await(fn(arg))
+            return arg
+        for fn in _api.hook_list(self.event_hooks, "response"):
+            _no_await(fn(arg))
+        for fn in _api.hook_list(self.hooks, "response") + _api.hook_list(req_hooks, "response"):
+            out = _no_await(fn(arg, **kw))
+            if out is not None:
+                arg = out
+        return arg
+
+    def _hop(self, auth, method, url, headers, body, metrics, req_hooks, hkw, stream=False):
+        """Tek yönlendirme adımı: auth akışı (401 yeniden denemesi dahil) + hook'lar.
+
+        Döner: (son yanıt, ara yanıtlar). Ara yanıtlar (ör. 401 challenge) ``history``'ye girer.
+        """
+        has_req_hooks = bool(_api.hook_list(self.event_hooks, "request"))
+        extras: list[Response] = []
+        if auth is None and not has_req_hooks:
+            resp = self._send_with_retries(method, url, headers=headers, body=body, metrics=metrics,
+                                           stream=stream)
+            return self._call_hooks("response", resp, req_hooks, **hkw), extras
+        removed = [k for k, v in headers.items() if v is None]
+        base = Request(method, url, data=body or None,
+                       headers={k: v for k, v in headers.items() if v is not None})
+        flow = auth.auth_flow(base) if auth is not None else None
+        req = next(flow) if flow is not None else base
+        while True:
+            self._call_hooks("request", req)
+            h = {k.decode("latin-1"): v.decode("latin-1") for k, v in req.headers.raw
+                 if k.lower() != b"content-length"}
+            lower = {x.lower() for x in h}
+            h.update({k: None for k in removed if k.lower() not in lower})
+            target = url if req.url is base.url else str(req.url)
+            resp = self._send_with_retries(req.method, target, headers=h,
+                                           body=req.body or b"", metrics=metrics, stream=stream)
+            resp = self._call_hooks("response", resp, req_hooks, **hkw)
+            if flow is None:
+                return resp, extras
+            try:
+                req = flow.send(resp)
+            except StopIteration:
+                return resp, extras
+            if stream:
+                _discard_stream(resp)     # 401 ara yanıtı: bağlantı havuza dönsün
+            extras.append(resp)
 
     def request(
         self,
@@ -709,58 +1129,110 @@ class Session:
         headers          = None,
         files            = None,
         allow_redirects: bool = True,
+        params           = None,
+        cookies          = None,
+        auth             = USE_CLIENT_DEFAULT,
+        timeout          = USE_CLIENT_DEFAULT,
+        hooks            = None,
+        stream:          bool = False,
     ) -> Response:
+        """HTTP isteği. requests/httpx uyumlu ek parametreler:
+
+        ``params`` (dict/liste/str; URL'deki sorguya eklenir), ``cookies`` (yalnızca bu
+        istek için; yönlendirmede başka origin'e gitmez), ``auth`` (oturumunkini ezer;
+        ``None`` oturum auth'unu kapatır), ``timeout`` (float, ``(connect, read)`` ya da
+        :class:`Timeout`; ``None`` sınırsız), ``hooks`` (``{"response": [fn]}``).
+
+        ``stream=True``: gövde OKUNMADAN döner; ``r.iter_content``/``iter_lines``/
+        ``iter_bytes``/``raw`` ile okunur, ``r.close()`` (ya da ``with``) ile bırakılır.
+        Gövde sonuna kadar okununca bağlantı havuza döner.
+        """
+        url, url_creds = _api.split_userinfo(url)
+        url = _api.apply_params(url, self.params, params)
         current_url    = url
         redirect_count = 0
         history: list[Response] = []
-        metrics = RequestMetrics(request_start=time.monotonic())
+        metrics = RequestMetrics(request_start=time.perf_counter())
         headers = self._merged_headers(headers)
+        body = _api.encode_body(data, json, files, headers)
+        req_hooks = _api.normalize_hooks(hooks)
+        req_cookies = _api.parse_cookie_arg(cookies)
+        tmo = _api.resolve_timeout(timeout, self.timeout)
+        token = _api.set_timeout_override(self, tmo)
+        hkw = _api.hook_kwargs(self, tmo or self.timeout)
+        first_origin = URL(current_url).origin
+        retry_plugins = [p for p in self._plugins if isinstance(p, RetryPlugin)]
+        try:
+            while True:
+                cur = URL(current_url)
+                same_origin = cur.origin == first_origin
+                hop_auth, _src = self._auth_for(
+                    auth if same_origin else None, url_creds if same_origin else None, cur.host)
+                if not same_origin and _src == "explicit":
+                    hop_auth = None
+                hop_headers = dict(headers)
+                if same_origin and req_cookies and not _api._has(hop_headers, "cookie"):
+                    jar = self.cookie_jar.header_for(
+                        host=cur.host, path=cur.path, secure=(cur.scheme == "https"))
+                    hop_headers["Cookie"] = _api.merge_cookie_header(jar, req_cookies)
+                attempt = 0
+                while True:
+                    resp, extras = self._hop(hop_auth, method, current_url, hop_headers,
+                                             body, metrics, req_hooks, hkw, stream=stream)
+                    delay = None
+                    for plugin in retry_plugins:
+                        if plugin.should_retry(resp, attempt):
+                            delay = plugin.delay_for(resp, attempt)
+                            break
+                    if delay is None:
+                        break
+                    resp.close()      # tekrar denenecek yanıt (akışsa bağlantıyı bırak)
+                    if delay:
+                        time.sleep(delay)
+                    attempt += 1
+                history.extend(extras)
+                if history:
+                    resp.history = list(history)
 
-        while True:
-            resp = self._send_with_retries(
-                method, current_url,
-                data=data, json=json, headers=headers, files=files,
-                metrics=metrics,
-            )
-            if history:
-                resp.history = list(history)
+                if not allow_redirects or resp.status_code not in (301, 302, 303, 307, 308):
+                    if not allow_redirects:
+                        resp.next = _api.next_request(resp, method, current_url, headers, body)
+                    return resp
 
-            if not allow_redirects or resp.status_code not in (301, 302, 303, 307, 308):
-                return resp
+                if redirect_count >= self.max_redirects:
+                    raise ConnectionError(f"Maksimum yönlendirme sayısına ulaşıldı ({self.max_redirects}).")
 
-            if redirect_count >= self.max_redirects:
-                raise ConnectionError(f"Maksimum yönlendirme sayısına ulaşıldı ({self.max_redirects}).")
+                location = resp.headers.get("location", "")
+                if not location:
+                    return resp
 
-            location = resp.headers.get("location", "")
-            if not location:
-                return resp
+                history.append(resp)
+                metrics.redirect_count += 1
 
-            history.append(resp)
-            metrics.redirect_count += 1
+                if stream:
+                    _discard_stream(resp)     # yönlendirme gövdesi: küçükse tüketip bağlantıyı koru
+                base = URL(current_url) if isinstance(current_url, str) else current_url
+                current_url = _resolve_location(base, location)
 
-            base = URL(current_url) if isinstance(current_url, str) else current_url
-            current_url = _resolve_location(base, location)
+                # Farklı bir origin'e gidiyorsak Authorization/Cookie TAŞINMAZ;
+                # aksi hâlde kimlik bilgisi üçüncü bir siteye sızar.
+                new_url = URL(current_url)
+                if (new_url.scheme, new_url.host, new_url.port) != base.origin and headers:
+                    headers = {
+                        k: v for k, v in dict(headers).items()
+                        if k.lower() not in ("authorization", "cookie", "proxy-authorization")
+                    }
 
-            # Farklı bir origin'e gidiyorsak kullanıcı Authorization/Cookie
-            # başlıklarını elle vermişse bunları TAŞIMAYIZ; aksi hâlde kimlik
-            # bilgisi üçüncü bir siteye sızar.
-            new_url = URL(current_url)
-            if (new_url.scheme, new_url.host, new_url.port) != base.origin and headers:
-                headers = {
-                    k: v for k, v in dict(headers).items()
-                    if k.lower() not in ("authorization", "cookie", "proxy-authorization")
-                }
+                if resp.status_code in (301, 302, 303):
+                    method = "GET"
+                    body   = b""
+                    headers = {k: v for k, v in headers.items()
+                               if k.lower() not in ("content-type", "content-length")}
 
-            if resp.status_code in (301, 302, 303):
-                method = "GET"
-                data   = None
-                json   = None
-                files  = None
-
-            redirect_count += 1
-            logger.debug("Yönlendirme (%s) -> %s", resp.status_code, current_url)
-
-                                                                                
+                redirect_count += 1
+                logger.debug("Yönlendirme (%s) -> %s", resp.status_code, current_url)
+        finally:
+            _api.reset_timeout_override(token)
 
     def _merged_headers(self, headers) -> dict:
         """Oturum başlıkları + istek başlıkları (istek kazanır; büyük/küçük harf
@@ -776,8 +1248,15 @@ class Session:
                 merged[k] = v
         return merged
 
-    def get(self, url, headers=None, allow_redirects=True) -> Response:
-        return self.request("GET", url, headers=headers, allow_redirects=allow_redirects)
+    def stream(self, method: str, url, **kwargs):
+        """httpx tarzı: ``with s.stream("GET", url) as r:`` — gövde akıtılır, çıkışta kapanır."""
+        return _StreamContext(self, method, url, kwargs)
+
+    def get(self, url, headers=None, allow_redirects=True, params=None, cookies=None,
+            auth=USE_CLIENT_DEFAULT, timeout=USE_CLIENT_DEFAULT, hooks=None, stream=False) -> Response:
+        return self.request("GET", url, headers=headers, allow_redirects=allow_redirects,
+                            params=params, cookies=cookies, auth=auth, timeout=timeout, hooks=hooks,
+                            stream=stream)
 
     def websocket(self, url: str):
         """
@@ -793,33 +1272,54 @@ class Session:
         from .protocol.http2_parser import WebSocketConnection
         return WebSocketConnection.handshake(self, url)
 
-    def post(self, url, data=None, json=None, headers=None, files=None, allow_redirects=True) -> Response:
-        return self.request("POST", url, data=data, json=json, headers=headers,
-                            files=files, allow_redirects=allow_redirects)
+    def post(self, url, data=None, json=None, headers=None, files=None, allow_redirects=True,
+             params=None, cookies=None, auth=USE_CLIENT_DEFAULT, timeout=USE_CLIENT_DEFAULT,
+             hooks=None, stream=False) -> Response:
+        return self.request("POST", url, data=data, json=json, headers=headers, files=files,
+                            allow_redirects=allow_redirects, params=params, cookies=cookies,
+                            auth=auth, timeout=timeout, hooks=hooks,
+                            stream=stream)
 
-    def put(self, url, data=None, json=None, headers=None, files=None, allow_redirects=True) -> Response:
-        return self.request("PUT", url, data=data, json=json, headers=headers,
-                            files=files, allow_redirects=allow_redirects)
+    def put(self, url, data=None, json=None, headers=None, files=None, allow_redirects=True,
+            params=None, cookies=None, auth=USE_CLIENT_DEFAULT, timeout=USE_CLIENT_DEFAULT,
+            hooks=None, stream=False) -> Response:
+        return self.request("PUT", url, data=data, json=json, headers=headers, files=files,
+                            allow_redirects=allow_redirects, params=params, cookies=cookies,
+                            auth=auth, timeout=timeout, hooks=hooks,
+                            stream=stream)
 
-    def patch(self, url, data=None, json=None, headers=None, allow_redirects=True) -> Response:
+    def patch(self, url, data=None, json=None, headers=None, allow_redirects=True,
+              params=None, cookies=None, auth=USE_CLIENT_DEFAULT, timeout=USE_CLIENT_DEFAULT,
+              hooks=None, stream=False) -> Response:
         return self.request("PATCH", url, data=data, json=json, headers=headers,
-                            allow_redirects=allow_redirects)
+                            allow_redirects=allow_redirects, params=params, cookies=cookies,
+                            auth=auth, timeout=timeout, hooks=hooks,
+                            stream=stream)
 
-    def delete(self, url, headers=None, allow_redirects=True) -> Response:
-        return self.request("DELETE", url, headers=headers, allow_redirects=allow_redirects)
+    def delete(self, url, headers=None, allow_redirects=True, params=None, cookies=None,
+               auth=USE_CLIENT_DEFAULT, timeout=USE_CLIENT_DEFAULT, hooks=None, stream=False) -> Response:
+        return self.request("DELETE", url, headers=headers, allow_redirects=allow_redirects,
+                            params=params, cookies=cookies, auth=auth, timeout=timeout, hooks=hooks,
+                            stream=stream)
 
-    def head(self, url, headers=None) -> Response:
-        return self.request("HEAD", url, headers=headers, allow_redirects=False)
+    def head(self, url, headers=None, allow_redirects=False, params=None, cookies=None,
+             auth=USE_CLIENT_DEFAULT, timeout=USE_CLIENT_DEFAULT, hooks=None) -> Response:
+        """HEAD; ``allow_redirects`` varsayılanı ``False`` (requests/httpx gibi)."""
+        return self.request("HEAD", url, headers=headers, allow_redirects=allow_redirects,
+                            params=params, cookies=cookies, auth=auth, timeout=timeout, hooks=hooks)
 
-    def options(self, url, headers=None, allow_redirects=True) -> Response:
-        return self.request("OPTIONS", url, headers=headers, allow_redirects=allow_redirects)
-
-                                                                                
+    def options(self, url, headers=None, allow_redirects=True, params=None, cookies=None,
+                auth=USE_CLIENT_DEFAULT, timeout=USE_CLIENT_DEFAULT, hooks=None, stream=False) -> Response:
+        return self.request("OPTIONS", url, headers=headers, allow_redirects=allow_redirects,
+                            params=params, cookies=cookies, auth=auth, timeout=timeout, hooks=hooks,
+                            stream=stream)
 
     def pre_warm(self, hosts: list[str], count: int = 2) -> dict[str, int]:
         return self.pool.prewarm(
             hosts, count=count,
-            tls_negotiate_fn=functools.partial(TLSAdapter.negotiate, ca_path=self._ca_path),
+            tls_negotiate_fn=functools.partial(TLSAdapter.negotiate, ca_path=self._ca_path,
+                                               **self._legacy_kw(),
+                                               client_cert=self.client_cert),
             impersonate=self.impersonate,
         )
 
@@ -857,7 +1357,11 @@ class Session:
                                                                                 
 
     def close(self) -> None:
+        if self._h3 is not None:
+            self._h3.close()
         self.pool.close_all()
+        if self.client_cert is not None and self._owns_cert:
+            self.client_cert.close()          # özel anahtar referansını bırak
         if self.transport is not None:
             self.transport.close()
 

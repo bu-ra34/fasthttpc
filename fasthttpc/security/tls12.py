@@ -51,6 +51,8 @@ from typing import Callable, Optional
 
 from ..crypto_math import FastAESGCM, FastChaCha20Poly1305
 from . import cert_validator as _cv
+from .._log import get_logger
+from ..transport.lingering import shutdown_and_drain
 from .alerts import describe_alert
 from .cert_validator import CertificateValidationError
 from .keyshare import (
@@ -59,6 +61,7 @@ from .keyshare import (
     generate_key_share,
     group_name,
 )
+from . import mtls as _mtls
 from .tls_adapter import TLSProtocolError
 from ..tls13.events import (
     ApplicationData,
@@ -71,6 +74,8 @@ from ..tls13.events import (
 # --------------------------------------------------------------------------
 # Sabitler
 # --------------------------------------------------------------------------
+_log = get_logger("tls12")
+
 VERSION_TLS12 = 0x0303
 
 CT_CHANGE_CIPHER_SPEC = 20
@@ -128,6 +133,7 @@ EXT_ALPN = 0x0010
 EXT_SCT = 0x0012
 EXT_EXTENDED_MASTER_SECRET = 0x0017
 EXT_RECORD_SIZE_LIMIT = 0x001C
+EXT_ENCRYPT_THEN_MAC = 0x0016      # RFC 7366; yalnızca legacy_tls
 EXT_SESSION_TICKET = 0x0023
 EXT_SUPPORTED_VERSIONS = 0x002B
 EXT_RENEGOTIATION_INFO = 0xFF01
@@ -192,6 +198,11 @@ class Suite:
     key_len: int
     fixed_iv_len: int    # GCM: 4 (salt), ChaCha: 12 (RFC 7905)
     hash_alg: Callable   # PRF / transcript hash'i
+    # --- yalnızca legacy_tls (tls12_legacy.py): varsayılanlar AEAD+ECDHE'dir, mevcut tablo değişmez ---
+    kx: str = "ECDHE"    # "ECDHE" | "RSA" (statik RSA; yalnızca legacy)
+    mode: str = "AEAD"   # "AEAD" | "CBC" (yalnızca legacy)
+    mac_hash: Optional[Callable] = None
+    mac_len: int = 0
 
 
 SUITES: dict[int, Suite] = {
@@ -452,6 +463,10 @@ class ServerHello12:
     ticket_ext: bool
     status_ext: bool
     record_size_limit: Optional[int]
+    # legacy_tls: sunucu bunları sunmayabilir (varsayılan modda sunmamak RED olduğundan hep True/False).
+    ems: bool = True
+    etm: bool = False
+    secure_renegotiation: bool = True
 
 
 def check_downgrade_sentinel(server_random: bytes) -> None:
@@ -466,8 +481,13 @@ def check_downgrade_sentinel(server_random: bytes) -> None:
         )
 
 
-def parse_server_hello_12(sh_msg: bytes, ch: ClientHelloInfo) -> ServerHello12:
-    """TLS 1.2 ServerHello'yu (4 bayt başlık dahil) ayrıştırır ve KATI biçimde doğrular."""
+def parse_server_hello_12(sh_msg: bytes, ch: ClientHelloInfo, legacy: bool = False) -> ServerHello12:
+    """TLS 1.2 ServerHello'yu (4 bayt başlık dahil) ayrıştırır ve KATI biçimde doğrular.
+
+    ``legacy=True`` (yalnızca ``legacy_tls``): CBC/statik-RSA suite'leri kabul edilir, EMS ve
+    renegotiation_info yokluğu RED yerine ``ems=False`` / ``secure_renegotiation=False`` olarak
+    raporlanır (+ log uyarısı). DOWNGRD kontrolü ve diğer tüm denetimler AYNEN sürer.
+    """
     if len(sh_msg) < 4 or sh_msg[0] != HS_SERVER_HELLO:
         raise _unexpected("ServerHello bekleniyordu.")
     if int.from_bytes(sh_msg[1:4], "big") != len(sh_msg) - 4:
@@ -494,8 +514,10 @@ def parse_server_hello_12(sh_msg: bytes, ch: ClientHelloInfo) -> ServerHello12:
 
     if version < VERSION_TLS12:
         raise _err(AL_PROTOCOL_VERSION, "protocol_version",
-                   f"Sunucu TLS 0x{version:04x} (TLS 1.1 veya altı / SSL) seçti; desteklenmiyor. "
-                   f"Yalnızca TLS 1.3 ve TLS 1.2 (güvenli alt küme) desteklenir.")
+                   f"Sunucu TLS 0x{version:04x} (TLS 1.1 veya altı / SSL) seçti; desteklenmiyor"
+                   + (" (legacy_tls=True TLS 1.0/1.1'i AÇMAZ: BEAST, MD5+SHA-1 PRF, RFC 8996)"
+                      if legacy else "")
+                   + ". Yalnızca TLS 1.3 ve TLS 1.2 (güvenli alt küme) desteklenir.")
     if version != VERSION_TLS12:
         raise _illegal(f"ServerHello.server_version 0x{version:04x} geçersiz.")
     if VERSION_TLS12 not in ch.versions:
@@ -525,48 +547,85 @@ def parse_server_hello_12(sh_msg: bytes, ch: ClientHelloInfo) -> ServerHello12:
             exts[et] = bytes(body[cur:cur + el])
             cur += el
 
-    suite = SUITES.get(cs)
+    if legacy:
+        from . import tls12_legacy as _lg
+        suite = SUITES.get(cs) or _lg.LEGACY_SUITES.get(cs)
+    else:
+        suite = SUITES.get(cs)
     if suite is None:
         raise reject_suite_message(cs)
     if cs not in ch.suites:
         raise _illegal(f"Sunucu ClientHello'da ilan etmediğimiz suite'i (0x{cs:04x}) seçti.")
 
+    allowed_exts = _SH_ALLOWED_EXTS
+    if legacy:
+        allowed_exts = _SH_ALLOWED_EXTS | {EXT_ENCRYPT_THEN_MAC}
     for et in exts:
-        if et not in _SH_ALLOWED_EXTS:
+        if et not in allowed_exts:
             raise _err(AL_UNSUPPORTED_EXTENSION, "unsupported_extension",
                        f"ServerHello TLS 1.2'de izin verilmeyen extension içeriyor: 0x{et:04x}.")
         if et not in ch.ext_types:
             raise _err(AL_UNSUPPORTED_EXTENSION, "unsupported_extension",
                        f"Sunucu istemediğimiz bir extension gönderdi: 0x{et:04x} (RFC 5246 §7.4.1.4).")
 
-    # --- Güvenli renegotiation (RFC 5746) — ZORUNLU --------------------------------
+    # --- Güvenli renegotiation (RFC 5746) — varsayılanda ZORUNLU, legacy'de TERCİH ---
+    secure_reneg = True
     if EXT_RENEGOTIATION_INFO not in ch.ext_types:
-        raise _err(AL_HANDSHAKE_FAILURE, "handshake_failure",
-                   "ClientHello'da renegotiation_info ilan edilmediği için TLS 1.2 güvenli biçimde "
-                   "kurulamaz (RFC 5746).")
-    ri = exts.get(EXT_RENEGOTIATION_INFO)
-    if ri is None:
-        raise _err(AL_HANDSHAKE_FAILURE, "handshake_failure",
-                   "Sunucu renegotiation_info (RFC 5746) göndermedi: güvenli renegotiation "
-                   "desteklenmiyor, olası renegotiation (Marsh Ray) saldırısına açık sunucu. "
-                   "Bağlantı reddedildi.")
-    if ri != b"\x00":
-        raise _err(AL_HANDSHAKE_FAILURE, "handshake_failure",
-                   "Sunucunun renegotiation_info değeri geçersiz (ilk el sıkışmada boş "
-                   "renegotiated_connection beklenir) — bağlantı reddedildi.")
+        if not legacy:
+            raise _err(AL_HANDSHAKE_FAILURE, "handshake_failure",
+                       "ClientHello'da renegotiation_info ilan edilmediği için TLS 1.2 güvenli biçimde "
+                       "kurulamaz (RFC 5746).")
+        secure_reneg = False
+    else:
+        ri = exts.get(EXT_RENEGOTIATION_INFO)
+        if ri is None:
+            if not legacy:
+                raise _err(AL_HANDSHAKE_FAILURE, "handshake_failure",
+                           "Sunucu renegotiation_info (RFC 5746) göndermedi: güvenli renegotiation "
+                           "desteklenmiyor, olası renegotiation (Marsh Ray) saldırısına açık sunucu. "
+                           "Bağlantı reddedildi.")
+            secure_reneg = False
+            _log.warning("legacy_tls: sunucu renegotiation_info (RFC 5746) sunmuyor — güvenli "
+                         "renegotiation YOK; renegotiation zaten desteklenmiyor (HelloRequest reddedilir).")
+        elif ri != b"\x00":
+            raise _err(AL_HANDSHAKE_FAILURE, "handshake_failure",
+                       "Sunucunun renegotiation_info değeri geçersiz (ilk el sıkışmada boş "
+                       "renegotiated_connection beklenir) — bağlantı reddedildi.")
 
-    # --- Extended Master Secret (RFC 7627) — ZORUNLU --------------------------------
+    # --- Extended Master Secret (RFC 7627) — varsayılanda ZORUNLU, legacy'de TERCİH ---
+    ems_on = True
     if EXT_EXTENDED_MASTER_SECRET not in ch.ext_types:
-        raise _err(AL_HANDSHAKE_FAILURE, "handshake_failure",
-                   "ClientHello'da Extended Master Secret (RFC 7627) ilan edilmediği için TLS 1.2 "
-                   "güvenli biçimde kurulamaz.")
-    ems = exts.get(EXT_EXTENDED_MASTER_SECRET)
-    if ems is None:
-        raise _err(AL_HANDSHAKE_FAILURE, "handshake_failure",
-                   "Sunucu Extended Master Secret (RFC 7627) kabul etmedi: master secret oturuma "
-                   "bağlı değil, triple-handshake saldırısına açık. Bağlantı reddedildi.")
-    if ems != b"":
-        raise _decode("extended_master_secret extension'ı boş olmalı.")
+        if not legacy:
+            raise _err(AL_HANDSHAKE_FAILURE, "handshake_failure",
+                       "ClientHello'da Extended Master Secret (RFC 7627) ilan edilmediği için TLS 1.2 "
+                       "güvenli biçimde kurulamaz.")
+        ems_on = False
+    else:
+        ems = exts.get(EXT_EXTENDED_MASTER_SECRET)
+        if ems is None:
+            if not legacy:
+                raise _err(AL_HANDSHAKE_FAILURE, "handshake_failure",
+                           "Sunucu Extended Master Secret (RFC 7627) kabul etmedi: master secret oturuma "
+                           "bağlı değil, triple-handshake saldırısına açık. Bağlantı reddedildi.")
+            ems_on = False
+            _log.warning("legacy_tls: sunucu Extended Master Secret (RFC 7627) sunmuyor — master secret "
+                         "oturum transcript'ine bağlı DEĞİL (triple-handshake saldırısına açık); "
+                         "yalnızca eski sunucu uyumluluğu için kabul edildi.")
+        elif ems != b"":
+            raise _decode("extended_master_secret extension'ı boş olmalı.")
+
+    # --- Encrypt-then-MAC (RFC 7366) — yalnızca legacy ---
+    etm_on = False
+    if legacy and EXT_ENCRYPT_THEN_MAC in exts:
+        if exts[EXT_ENCRYPT_THEN_MAC] != b"":
+            raise _decode("encrypt_then_mac extension'ı boş olmalı.")
+        if suite.mode != "CBC":
+            # RFC 7366 §3: AEAD/akış suite'inde sunucu EtM yanıtı GÖNDERMEMELİ.
+            raise _illegal("Sunucu AEAD suite'i ile encrypt_then_mac gönderdi (RFC 7366 §3 ihlali).")
+        etm_on = True
+    if legacy and suite.mode == "CBC" and not etm_on:
+        _log.warning("legacy_tls: sunucu Encrypt-then-MAC sunmuyor — CBC için MAC-then-encrypt "
+                     "(Lucky13 azaltımı best-effort).")
 
     # --- diğer extension'lar --------------------------------------------------------
     alpn = ""
@@ -597,7 +656,8 @@ def parse_server_hello_12(sh_msg: bytes, ch: ClientHelloInfo) -> ServerHello12:
             raise _illegal("record_size_limit 64'ten küçük.")
 
     return ServerHello12(random, session_id, suite, alpn,
-                         EXT_SESSION_TICKET in exts, EXT_STATUS_REQUEST in exts, rsl)
+                         EXT_SESSION_TICKET in exts, EXT_STATUS_REQUEST in exts, rsl,
+                         ems=ems_on, etm=etm_on, secure_renegotiation=secure_reneg)
 
 
 # --------------------------------------------------------------------------
@@ -690,8 +750,12 @@ def parse_server_key_exchange(msg: bytes) -> ServerKeyExchange:
 
 
 def verify_server_key_exchange(ske: ServerKeyExchange, client_random: bytes, server_random: bytes,
-                               leaf, suite: Suite, offered_sigalgs: list, offered_groups: list) -> int:
-    """SKE imzasını ve parametrelerini doğrular. Döner: kullanılan SignatureScheme."""
+                               leaf, suite: Suite, offered_sigalgs: list, offered_groups: list,
+                               legacy: bool = False) -> int:
+    """SKE imzasını ve parametrelerini doğrular. Döner: kullanılan SignatureScheme.
+
+    ``legacy=True`` yalnızca SHA-1 imzaları (rsa_pkcs1_sha1/ecdsa_sha1) ek olarak kabul eder.
+    """
     from cryptography.exceptions import InvalidSignature
     from cryptography.hazmat.primitives import hashes as _h
     from cryptography.hazmat.primitives.asymmetric import ec, padding, rsa
@@ -704,7 +768,11 @@ def verify_server_key_exchange(ske: ServerKeyExchange, client_random: bytes, ser
 
     alg = ske.sigalg
     hname = _HASH_NAMES.get(alg >> 8)
-    if alg not in SIG_ALGS:
+    sig_algs = SIG_ALGS
+    if legacy:
+        from .tls12_legacy import LEGACY_SIG_ALGS
+        sig_algs = {**SIG_ALGS, **LEGACY_SIG_ALGS}
+    if alg not in sig_algs:
         extra = f" ({hname} zayıf bir hash, reddedilir)" if hname else ""
         raise _err(AL_INSUFFICIENT_SECURITY, "insufficient_security",
                    f"ServerKeyExchange imza algoritması 0x{alg:04x} kabul edilmiyor{extra}. "
@@ -712,7 +780,7 @@ def verify_server_key_exchange(ske: ServerKeyExchange, client_random: bytes, ser
     if alg not in offered_sigalgs:
         raise _illegal(f"Sunucu ClientHello'da ilan etmediğimiz imza algoritmasını (0x{alg:04x}) kullandı.")
 
-    kind, hash_name = SIG_ALGS[alg]
+    kind, hash_name = sig_algs[alg]
     pub = leaf.public_key()
     is_ec = isinstance(pub, ec.EllipticCurvePublicKey)
     is_rsa = isinstance(pub, rsa.RSAPublicKey)
@@ -759,7 +827,8 @@ class HandshakeOrder12:
       WAIT_TAIL -> [NewSessionTicket] -> ChangeCipherSpec(kayıt katmanı) -> WAIT_FIN
       WAIT_FIN  -> Finished -> CONNECTED
 
-    CertificateRequest ayrı ve AÇIK bir hatayla reddedilir (istemci sertifikası yok).
+    mTLS (RFC 5246 §7.3): CertificateRequest YALNIZCA ServerKeyExchange'ten sonra, ServerHelloDone'dan
+    önce ve en fazla bir kez geçerlidir (durum WAIT_SHD'de kalır); başka konumda/tekrar -> unexpected_message.
     """
 
     _NAMES = {
@@ -769,11 +838,14 @@ class HandshakeOrder12:
         20: "Finished", 22: "CertificateStatus",
     }
 
-    def __init__(self, ticket_ok: bool = False, status_ok: bool = False):
+    def __init__(self, ticket_ok: bool = False, status_ok: bool = False, static_rsa: bool = False):
         self.state = "WAIT_SH"
         self.ticket_ok = ticket_ok
         self.status_ok = status_ok
+        # legacy_tls statik RSA: ServerKeyExchange YOKTUR (Certificate -> ServerHelloDone).
+        self.static_rsa = static_rsa
         self.ticket_seen = False
+        self.cert_request_seen = False
 
     @property
     def done(self) -> bool:
@@ -784,10 +856,14 @@ class HandshakeOrder12:
 
     def expect(self, hs_type: int) -> str:
         st = self.state
-        if hs_type == HS_CERTIFICATE_REQUEST and st in ("AFTER_CERT", "WAIT_SKE", "WAIT_SHD"):
-            raise _err(AL_UNSUPPORTED_CERTIFICATE, "unsupported_certificate",
-                       "Sunucu istemci sertifikası istedi (CertificateRequest) — istemci "
-                       "kimlik doğrulaması desteklenmiyor; bağlantı reddedildi.")
+        if hs_type == HS_CERTIFICATE_REQUEST and not self.cert_request_seen:
+            # RFC 5246 §7.3: ... ServerKeyExchange, CertificateRequest, ServerHelloDone.
+            # legacy_tls statik RSA'da SKE yoktur: CR, Certificate (ya da CertificateStatus)
+            # ardından gelir; sonrasında yalnızca ServerHelloDone kabul edilir.
+            if st == "WAIT_SHD" or (self.static_rsa and st in ("AFTER_CERT", "WAIT_SKE")):
+                self.cert_request_seen = True
+                self.state = "WAIT_SHD"
+                return self.state
         nxt = None
         if st == "WAIT_SH" and hs_type == HS_SERVER_HELLO:
             nxt = "WAIT_CERT"
@@ -796,10 +872,14 @@ class HandshakeOrder12:
         elif st == "AFTER_CERT":
             if hs_type == HS_CERTIFICATE_STATUS and self.status_ok:
                 nxt = "WAIT_SKE"
-            elif hs_type == HS_SERVER_KEY_EXCHANGE:
+            elif hs_type == HS_SERVER_KEY_EXCHANGE and not self.static_rsa:
                 nxt = "WAIT_SHD"
-        elif st == "WAIT_SKE" and hs_type == HS_SERVER_KEY_EXCHANGE:
+            elif hs_type == HS_SERVER_HELLO_DONE and self.static_rsa:
+                nxt = "WAIT_TAIL"
+        elif st == "WAIT_SKE" and hs_type == HS_SERVER_KEY_EXCHANGE and not self.static_rsa:
             nxt = "WAIT_SHD"
+        elif st == "WAIT_SKE" and hs_type == HS_SERVER_HELLO_DONE and self.static_rsa:
+            nxt = "WAIT_TAIL"
         elif st == "WAIT_SHD" and hs_type == HS_SERVER_HELLO_DONE:
             nxt = "WAIT_TAIL"
         elif st == "WAIT_TAIL" and hs_type == HS_NEW_SESSION_TICKET and self.ticket_ok \
@@ -820,8 +900,9 @@ class HandshakeOrder12:
 
     def check(self, hs_type: int) -> None:
         """``expect`` ile aynı denetim, ama durumu DEĞİŞTİRMEDEN."""
-        probe = HandshakeOrder12(self.ticket_ok, self.status_ok)
+        probe = HandshakeOrder12(self.ticket_ok, self.status_ok, self.static_rsa)
         probe.state, probe.ticket_seen = self.state, self.ticket_seen
+        probe.cert_request_seen = self.cert_request_seen
         probe.expect(hs_type)
 
     def on_ccs(self) -> None:
@@ -862,8 +943,18 @@ class TLS12ClientConnection:
     """
 
     def __init__(self, host: str, client_hello_msg: bytes, *, ca_path: Optional[str] = None,
-                 cert_validator: Optional[Callable] = None):
+                 cert_validator: Optional[Callable] = None, legacy_tls: bool = False,
+                 client_cert=None):
         self.host = host
+        # Eski sunucu uyumluluk modu (yalnızca açıkça istenirse; bkz. tls12_legacy.py).
+        self._legacy = bool(legacy_tls)
+        self.ems = True
+        self.etm = False
+        self.secure_renegotiation = True
+        self._client_cert = client_cert
+        self._cert_req: "Optional[_mtls.CertRequest12]" = None
+        self.client_cert_sent = False
+        self.client_signature_scheme: Optional[int] = None
         self.ca_path = ca_path
         self._cert_validator = cert_validator
         self._ch_msg = bytes(client_hello_msg)
@@ -924,7 +1015,12 @@ class TLS12ClientConnection:
             "key_len": self.key_len,
             "alpn": self.alpn,
             "peer_certificate": self.peer_certificate,
-            "extended_master_secret": True,
+            "extended_master_secret": self.ems,
+            "encrypt_then_mac": self.etm,
+            "secure_renegotiation": self.secure_renegotiation,
+            "forward_secret": self.suite is None or self.suite.kx == "ECDHE",
+            "legacy_tls": self._legacy,
+            "suite_name": self.suite.name if self.suite else "",
         }
 
     # ------------------------------------------------------------------- API
@@ -1121,6 +1217,12 @@ class TLS12ClientConnection:
         elif t == HS_SERVER_KEY_EXCHANGE:
             self._transcript += msg
             self._on_server_key_exchange(msg)
+        elif t == HS_CERTIFICATE_REQUEST:
+            self._transcript += msg
+            try:
+                self._cert_req = _mtls.parse_certificate_request_12(msg)
+            except _mtls.MtlsProtocolError as e:
+                raise TLS12Error(str(e), e.alert) from e
         elif t == HS_SERVER_HELLO_DONE:
             self._transcript += msg
             if len(msg) != 4:
@@ -1148,13 +1250,15 @@ class TLS12ClientConnection:
         self._queue_alert(1, AL_NO_RENEGOTIATION)
 
     def _on_server_hello(self, msg: bytes) -> None:
-        sh = parse_server_hello_12(msg, self._ch)
+        sh = parse_server_hello_12(msg, self._ch, self._legacy)
         self._sh = sh
         self.suite = sh.suite
+        self.ems, self.etm, self.secure_renegotiation = sh.ems, sh.etm, sh.secure_renegotiation
         self.alpn = sh.alpn
         if sh.record_size_limit is not None:
             self._max_send = min(MAX_PLAINTEXT, sh.record_size_limit)
-        self._order = HandshakeOrder12(ticket_ok=sh.ticket_ext, status_ok=sh.status_ext)
+        self._order = HandshakeOrder12(ticket_ok=sh.ticket_ext, status_ok=sh.status_ext,
+                                       static_rsa=sh.suite.kx == "RSA")
         self._order.expect(HS_SERVER_HELLO)
         self._transcript += msg
         self.state = ST_HANDSHAKE
@@ -1179,7 +1283,7 @@ class TLS12ClientConnection:
         ske = parse_server_key_exchange(msg)
         self.signature_scheme = verify_server_key_exchange(
             ske, self._ch.random, self._sh.random, self.peer_certificate, self.suite,
-            self._ch.sigalgs, self._ch.groups,
+            self._ch.sigalgs, self._ch.groups, self._legacy,
         )
         self._ske = ske
 
@@ -1194,28 +1298,69 @@ class TLS12ClientConnection:
 
     def _send_client_flight(self) -> None:
         suite, ske = self.suite, self._ske
-        if ske is None:  # pragma: no cover - sıra doğrulayıcı SKE'siz SHD'ye izin vermez
-            raise _unexpected("ServerKeyExchange olmadan ServerHelloDone.")
-        try:
-            priv, my_pub = generate_key_share(ske.group)
-            pms = compute_shared_secret(ske.group, priv, ske.public)
-        except ValueError as e:
-            raise _illegal(f"sunucunun ECDHE anahtarı geçersiz ({group_name(ske.group)}): {e}") from e
-
-        cke = _hs(HS_CLIENT_KEY_EXCHANGE, bytes([len(my_pub)]) + my_pub)
+        # mTLS (RFC 5246 §7.4.6): istemci Certificate, ClientKeyExchange'ten ÖNCE gider. Uygun
+        # sertifika/şema yoksa sıfır sertifikalı Certificate (sunucu karar verir).
+        cert_msg = cv_scheme = None
+        if self._cert_req is not None:
+            cv_scheme = _mtls.select_scheme_12(self._client_cert, self._cert_req)
+            cert_msg = _mtls.build_certificate_12(self._client_cert if cv_scheme is not None else None)
+            self._transcript += cert_msg
+        if suite.kx == "RSA":
+            # legacy_tls: statik RSA — PMS sunucu sertifikası anahtarına şifrelenir (ileri gizlilik YOK).
+            from . import tls12_legacy as _lg
+            body, pms = _lg.rsa_client_key_exchange(
+                self.peer_certificate, struct.unpack("!H", self._ch_msg[4:6])[0])
+            cke = _hs(HS_CLIENT_KEY_EXCHANGE, body)
+        else:
+            if ske is None:  # pragma: no cover - sıra doğrulayıcı SKE'siz SHD'ye izin vermez
+                raise _unexpected("ServerKeyExchange olmadan ServerHelloDone.")
+            try:
+                priv, my_pub = generate_key_share(ske.group)
+                pms = compute_shared_secret(ske.group, priv, ske.public)
+            except ValueError as e:
+                raise _illegal(f"sunucunun ECDHE anahtarı geçersiz ({group_name(ske.group)}): {e}") from e
+            cke = _hs(HS_CLIENT_KEY_EXCHANGE, bytes([len(my_pub)]) + my_pub)
         self._transcript += cke
-        session_hash = suite.hash_alg(bytes(self._transcript)).digest()
-        master = extended_master_secret(suite.hash_alg, pms, session_hash)
-        ckey, skey, civ, siv = derive_key_block(suite, master, self._sh.random, self._ch.random)
-        self._pending_read = RecordCipher(suite, skey, siv)
-        write = RecordCipher(suite, ckey, civ)
+        if self.ems:
+            # RFC 7627 §3: session_hash ClientKeyExchange'e KADAR (CertificateVerify HARİÇ) alınır.
+            session_hash = suite.hash_alg(bytes(self._transcript)).digest()
+            master = extended_master_secret(suite.hash_alg, pms, session_hash)
+        else:  # yalnızca legacy_tls: sunucu EMS sunmadı (parse_server_hello_12 varsayılanda reddeder)
+            from . import tls12_legacy as _lg
+            master = _lg.master_secret(suite.hash_alg, pms, self._ch.random, self._sh.random)
+        cv_msg = None
+        if cv_scheme is not None:
+            # RFC 5246 §7.4.8: imza, CKE dahil önceki tüm handshake mesajları üzerinedir; Finished
+            # transcript'i CertificateVerify'ı da kapsar.
+            try:
+                cv_msg = _mtls.build_certificate_verify_12(
+                    self._client_cert, cv_scheme, bytes(self._transcript))
+            except _mtls.ClientCertError as e:
+                raise TLS12Error(f"internal_error: istemci CertificateVerify imzalanamadı: {e}",
+                                 AL_INTERNAL_ERROR) from e
+            self._transcript += cv_msg
+            self.client_signature_scheme = cv_scheme
+            self.client_cert_sent = True
+        if suite.mode == "CBC":
+            from . import tls12_legacy as _lg
+            cmac, smac, ckey, skey = _lg.derive_cbc_keys(suite, master, self._sh.random, self._ch.random)
+            self._pending_read = _lg.CBCRecordCipher(suite, skey, smac, self.etm)
+            write = _lg.CBCRecordCipher(suite, ckey, cmac, self.etm)
+        else:
+            ckey, skey, civ, siv = derive_key_block(suite, master, self._sh.random, self._ch.random)
+            self._pending_read = RecordCipher(suite, skey, siv)
+            write = RecordCipher(suite, ckey, civ)
 
         verify = finished_verify_data(suite, master, b"client finished", bytes(self._transcript))
         fin = _hs(HS_FINISHED, verify)
         self._transcript += fin
         self._master = master
 
+        if cert_msg is not None:
+            self._out += _record(CT_HANDSHAKE, cert_msg)
         self._out += _record(CT_HANDSHAKE, cke)
+        if cv_msg is not None:
+            self._out += _record(CT_HANDSHAKE, cv_msg)
         self._out += _record(CT_CHANGE_CIPHER_SPEC, b"\x01")
         self._write = write                    # CCS'ten sonra: Finished şifreli gider
         self._write_active = True
@@ -1248,7 +1393,8 @@ class TLS12ClientConnection:
 # Senkron yol
 # --------------------------------------------------------------------------
 def negotiate_tls12(raw_socket, host: str, client_hello_record: bytes, server_hello_msg: bytes,
-                    trailing: bytes = b"", *, ca_path: Optional[str] = None):
+                    trailing: bytes = b"", *, ca_path: Optional[str] = None, legacy_tls: bool = False,
+                    client_cert=None):
     """TLS 1.2 el sıkışmasını tamamlar ve EncryptedSocket arayüzlü bir nesne döner.
 
     ``client_hello_record``: gönderdiğimiz ClientHello (5 bayt record başlığı DAHİL).
@@ -1257,7 +1403,8 @@ def negotiate_tls12(raw_socket, host: str, client_hello_record: bytes, server_he
     """
     from ..tls13.sync_socket import SyncTLSSocket
 
-    conn = TLS12ClientConnection(host, client_hello_record[5:], ca_path=ca_path)
+    conn = TLS12ClientConnection(host, client_hello_record[5:], ca_path=ca_path, legacy_tls=legacy_tls,
+                                 client_cert=client_cert)
     sock = SyncTLSSocket(raw_socket, conn)
 
     def flush() -> None:
@@ -1282,5 +1429,7 @@ def negotiate_tls12(raw_socket, host: str, client_hello_record: bytes, server_he
             flush()
     except TLS12Error:
         flush_quiet()          # fatal alert (varsa) best-effort gönder
+        # RST yerine FIN: okunmamış veriyle close() alert'i eş tarafta siler (bkz. lingering).
+        shutdown_and_drain(raw_socket)
         raise
     return sock

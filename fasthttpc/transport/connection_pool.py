@@ -17,6 +17,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Optional
 
 from ..models.urls import URL
+from .happy_eyeballs import connect_infos
 from .proxy import ProxyConfig, connect_via_proxy, resolve_proxy
 
 
@@ -98,32 +99,22 @@ class HTTPConnection:
         except socket.gaierror as e:
             raise ConnectionError(f"'{host}' adresi çözümlenemedi: {e}") from e
 
-        last_error: Exception | None = None
-        for family, socktype, proto, _canon, sockaddr in infos:
-            raw = socket.socket(family, socktype, proto)
-            try:
-                self._apply_socket_options(raw)
-                raw.settimeout(timeout)
-                raw.connect(sockaddr)
-            except PermissionError as e:
-                raw.close()
-                raise ConnectionError(
-                    f"'{host}:{port}' adresine bağlanılamadı (İzin reddedildi / Errno 13). "
-                    f"Bu genellikle şunlardan kaynaklanır: (1) ağın/güvenlik duvarının giden "
-                    f"bağlantıyı engellemesi, (2) sandbox/container ortamının ham soket açmaya "
-                    f"izin vermemesi, (3) zorunlu bir proxy üzerinden geçilmesi gerektiği halde "
-                    f"doğrudan bağlanılmaya çalışılması. Orijinal hata: {e}"
-                ) from e
-            except OSError as e:
-                raw.close()
-                last_error = e
-                continue
-
-            self.socket = raw
-            self.is_closed = False
-            return
-
-        raise ConnectionError(f"'{host}:{port}' adresine bağlanılamadı: {last_error}")
+        # Happy Eyeballs (RFC 8305): adresler (AAAA + A) sırayla değil yarıştırılır;
+        # ör. Windows'ta "localhost" -> ::1 reddi ~2 sn sürer, IPv4 250 ms'de kazanır.
+        try:
+            raw = connect_infos(infos, timeout, prepare=self._apply_socket_options)
+        except PermissionError as e:
+            raise ConnectionError(
+                f"'{host}:{port}' adresine bağlanılamadı (İzin reddedildi / Errno 13). "
+                f"Bu genellikle şunlardan kaynaklanır: (1) ağın/güvenlik duvarının giden "
+                f"bağlantıyı engellemesi, (2) sandbox/container ortamının ham soket açmaya "
+                f"izin vermemesi, (3) zorunlu bir proxy üzerinden geçilmesi gerektiği halde "
+                f"doğrudan bağlanılmaya çalışılması. Orijinal hata: {e}"
+            ) from e
+        except OSError as e:
+            raise ConnectionError(f"'{host}:{port}' adresine bağlanılamadı: {e}") from e
+        self.socket = raw
+        self.is_closed = False
 
     @staticmethod
     def _apply_socket_options(raw: socket.socket) -> None:
@@ -183,8 +174,11 @@ class ConnectionPool:
 
     def __init__(self, max_connections: int = 10, timeout: float = 30.0,
                  idle_timeout: float = DEFAULT_IDLE_TIMEOUT, resolver=None,
-                 proxy=None):
+                 proxy=None, tls_scope=None):
         self.max_connections = max_connections
+        # mTLS: istemci sertifikası kimliği; havuz anahtarına girer, böylece farklı
+        # sertifikalı oturumlar (başka havuz örnekleri dahil) bağlantı paylaşmaz.
+        self.tls_scope       = tls_scope
         # proxy: None | URL str | ProxyConfig | {"https": url, "all": url}
         self.proxy           = proxy
         self.timeout         = timeout
@@ -196,6 +190,12 @@ class ConnectionPool:
 
                                                                                
 
+    def _key(self, origin: tuple, proxy=None) -> tuple:
+        key = origin if proxy is None else origin + (proxy,)
+        if self.tls_scope:
+            key += (("mtls", self.tls_scope),)
+        return key
+
     def _get_semaphore(self, origin: tuple) -> threading.Semaphore:
         with self._lock:
             if origin not in self._semaphores:
@@ -205,7 +205,8 @@ class ConnectionPool:
                                                                               
 
     def acquire(self, url: URL, block: bool = True, timeout: Optional[float] = None,
-                proxy: Optional[str] = None) -> HTTPConnection:
+                proxy: Optional[str] = None,
+                connect_timeout: Optional[float] = None) -> HTTPConnection:
         """
         URL için en hızlı canlı bağlantıyı döner.
         Yoksa yeni bağlantı kurar. Concurrency limiti Semaphore ile korunur.
@@ -214,7 +215,7 @@ class ConnectionPool:
         geçersiz kılar; bağlantılar proxy başına ayrı havuzlanır).
         """
         origin = (url.scheme, url.host, url.port)
-        key = origin if proxy is None else origin + (proxy,)
+        key = self._key(origin, proxy)
         sem = self._get_semaphore(key)
 
                                                                 
@@ -243,7 +244,7 @@ class ConnectionPool:
         conn = HTTPConnection(origin)
         conn.pool_key = key
         try:
-            conn.connect(timeout=self.timeout, resolver=self.resolver,
+            conn.connect(timeout=connect_timeout or self.timeout, resolver=self.resolver,
                          proxy=resolve_proxy(self.proxy if proxy is None else proxy,
                                              url.scheme))
         except Exception:
@@ -310,8 +311,10 @@ class ConnectionPool:
                 with self._lock:
                     # Havuz sınırını prewarm de aşamamalı; aksi hâlde
                     # max_connections sessizce anlamsızlaşır.
-                    if len(self._pools[origin]) < self.max_connections:
-                        self._pools[origin].append(conn)
+                    pkey = self._key(origin)
+                    conn.pool_key = pkey
+                    if len(self._pools[pkey]) < self.max_connections:
+                        self._pools[pkey].append(conn)
                     else:
                         conn.close()
                         return host, False

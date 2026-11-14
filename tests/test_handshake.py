@@ -115,7 +115,7 @@ def test_dogru_sira_ve_compressed_cert():
 
 @pytest.mark.parametrize("seq", [
     (8,), (2, 11), (2, 8, 15), (2, 8, 11, 20), (2, 8, 8), (2, 8, 11, 11),
-    (2, 8, 11, 15, 15), (2, 4), (2, 8, 11, 15, 4), (2, 8, 13), (2, 2), (2, 8, 11, 15, 20, 20),
+    (2, 8, 11, 15, 15), (2, 4), (2, 8, 11, 15, 4), (2, 8, 11, 13), (2, 8, 13, 13), (2, 8, 13, 15), (2, 2), (2, 8, 11, 15, 20, 20),
 ])
 def test_sira_disi_veya_tekrar_mesaj_reddedilir(seq):
     v = HandshakeOrderValidator()
@@ -189,7 +189,7 @@ def test_negotiate_tekrar_extension(no_pki):
     ([("hs", 8), ("hs", 11), ("hs", 4), ("hs", 15), ("hs", 20)], "NewSessionTicket"),
     ([("hs", 8), ("hs", 11), ("hs", 15), ("hs", 4), ("hs", 20)], "NewSessionTicket"),
     ([("hs", 8), ("raw", 23, b"GET"), ("hs", 11), ("hs", 15), ("hs", 20)], "content_type=23"),
-    ([("hs", 8), ("hs", 13), ("hs", 11), ("hs", 15), ("hs", 20)], "CertificateRequest"),
+    ([("hs", 8), ("hs", 11), ("hs", 13), ("hs", 15), ("hs", 20)], "CertificateRequest"),
     ([("hs", 8), ("hs", 11), ("hs", 15), ("record", [("hs", 20), ("hs", 4)])], "Finished sonrasında"),
 ])
 def test_negotiate_sira_disi_mesajlar(no_pki, flight, needle):
