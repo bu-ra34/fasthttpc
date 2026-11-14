@@ -376,11 +376,11 @@ async def async_connect_via_proxy(proxy: ProxyConfig, host: str, port: int,
     ``timeout`` TCP bağlantısı + tünel kurulumu için toplam süredir. Dönen akış
     üzerinde ``AsyncTLSStream.negotiate`` veya ``writer.start_tls`` çalıştırılır.
     """
-    import asyncio
+    from .. import _backend as B
 
     async def _go():
         try:
-            reader, writer = await asyncio.open_connection(proxy.host, proxy.port)
+            reader, writer = await B.open_connection(proxy.host, proxy.port)
         except OSError as e:
             raise ProxyError(f"Proxy'ye bağlanılamadı ({proxy.host}:{proxy.port}): {e}") from e
         try:
@@ -390,4 +390,4 @@ async def async_connect_via_proxy(proxy: ProxyConfig, host: str, port: int,
             raise
         return reader, writer
 
-    return await asyncio.wait_for(_go(), timeout)
+    return await B.wait_for(_go(), timeout)
