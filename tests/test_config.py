@@ -138,9 +138,10 @@ def test_verify_negotiate_e_tasinir(tmp_path, monkeypatch):
 
     seen = {}
 
-    def fake_negotiate(sock, host, profile, *, ca_path=None):
+    def fake_negotiate(sock, host, profile, *, ca_path=None, port=None):
         seen["ca_path"] = ca_path
         seen["host"] = host
+        seen["port"] = port
         raise ConnectionError("test: el sıkışma kesildi")
 
     monkeypatch.setattr(s.pool, "acquire", lambda url, timeout=None: FakeConn())
@@ -148,7 +149,7 @@ def test_verify_negotiate_e_tasinir(tmp_path, monkeypatch):
     monkeypatch.setattr(session_mod.TLSAdapter, "negotiate", staticmethod(fake_negotiate))
     with pytest.raises(ConnectionError):
         s.get("https://intranet.example/")
-    assert seen == {"ca_path": str(pem.resolve()), "host": "intranet.example"}
+    assert seen == {"ca_path": str(pem.resolve()), "host": "intranet.example", "port": 443}
 
 
 def test_async_verify(tmp_path):

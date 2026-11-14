@@ -22,8 +22,10 @@ from .models.request  import Request
 from .models.response import Response, HTTPStatusError
 from .transport.connection_pool import ConnectionPool
 from .security.tls_adapter      import TLSAdapter
+from .security.alerts          import describe_alert
 from .protocol.http1_parser     import HTTP1Parser
-from .protocol.http2_parser     import Http2Connection, Http2StreamError, Http2ConnectionError
+from .protocol.http2_parser     import (Http2Connection, Http2StreamError, Http2ConnectionError,
+                                         Http2RefusedError)
 from .metrics    import RequestMetrics
 from .cache      import ResponseCache
 from .buffer     import AdaptiveReceiver, get_pool
@@ -32,6 +34,7 @@ from .config     import Limits, resolve_verify
 from .retry      import Retry
 from .multipart  import encode_multipart
 from .cookies    import CookieJar
+from .fingerprint import drop_h2_only_defaults, merge_default_headers, order_h1
 from ._log       import get_logger
 
 logger = get_logger("session")
@@ -71,6 +74,10 @@ def _proxy_spec(proxy, proxies):
     return spec
 
 
+
+class _H2Refused(ConnectionError):
+    """HTTP/2 isteği sunucu tarafından İŞLENMEDİ (GOAWAY); güvenle yeniden denenebilir."""
+
 class Session:
     """
     fasthttpc senkron HTTP istemcisi.
@@ -91,6 +98,10 @@ class Session:
                          verilirse istekler ağ yerine buna gönderilir.
         limits:          Opsiyonel :class:`~fasthttpc.config.Limits`; verilirse
                          ``max_connections`` parametresini geçersiz kılar.
+        headers:         Oturum düzeyi varsayılan başlıklar (``s.headers`` ile
+                         değiştirilebilir). Öncelik: profilin tarayıcı
+                         başlıkları < ``headers`` < istek başlıkları; değeri
+                         ``None`` olan başlık varsayılanı kaldırır.
 
     Örnek::
 
@@ -114,8 +125,14 @@ class Session:
         limits:          "Limits | None"              = None,
         proxies                                       = None,
         proxy                                         = None,
+        headers                                       = None,
     ):
         self.impersonate   = impersonate
+        # Oturum düzeyi varsayılan başlıklar (requests gibi mutable): profilin
+        # tarayıcı başlıklarını geçersiz kılar, istek başlıkları bunları.
+        self.headers       = Headers(headers)
+        self.resolver      = resolver      # opsiyonel DoHResolver (AsyncSession ile aynı ad)
+        self._rotator      = None
         self.timeout       = Timeout.from_value(timeout)
         self.max_redirects = max_redirects
         self.verify        = verify
@@ -167,14 +184,22 @@ class Session:
         if metrics:
             metrics.bytes_sent = len(req.body) + sum(len(k) + len(v) for k, v in h2_headers)
 
+        host = req.url.host
+        if ":" in host:
+            host = f"[{host}]"
+        default_port = 443 if req.url.scheme == "https" else 80
+        authority = host if req.url.port == default_port else f"{host}:{req.url.port}"
+
         try:
             status_code, resp_header_pairs, body_raw = conn.h2_conn.request(
                 method=req.method,
-                authority=req.url.host,
+                authority=authority,
                 path=req.url.raw_path.decode("latin-1"),
                 headers=h2_headers,
                 body=req.body,
             )
+        except Http2RefusedError as e:
+            raise _H2Refused(f"HTTP/2 isteği işlenmedi: {e}") from e
         except (Http2StreamError, Http2ConnectionError) as e:
             raise ConnectionError(f"HTTP/2 isteği başarısız: {e}") from e
 
@@ -185,13 +210,14 @@ class Session:
 
         resp_headers = Headers()
         for k, v in resp_header_pairs:
-            resp_headers[k] = v
+            resp_headers.add(k, v)
 
         ce = resp_headers.get("content-encoding", "").lower()
         body_raw = HTTP1Parser._decompress(body_raw, ce)
 
         resp         = Response(status_code=status_code, headers=resp_headers, body=body_raw)
         resp.request = req
+        resp.http_version = "HTTP/2"
         if metrics:
             metrics.total_end = time.monotonic()
             resp.metrics = metrics
@@ -206,17 +232,39 @@ class Session:
     def _read_app_data(self, conn) -> bytes:
         """Sadece Application Data döner; post-handshake handshake mesajları
         (NewSessionTicket vb.) TLS katmanında yutulur."""
+        dl = conn.conn_data.get("deadline")
         while True:
+            if dl is not None:
+                kalan = dl - time.monotonic()
+                if kalan <= 0:
+                    raise TimeoutError("İstek toplam süre sınırını (Timeout.total) aştı.")
+                conn.socket.raw_socket.settimeout(min(self.timeout.read_timeout, kalan))
             msg, m_type = conn.socket.recv_record(skip_post_handshake=True)
             if m_type == 23:
                 return msg
             elif m_type == 21:
                 if msg == b"\x01\x00":  # close_notify
                     return b""
-                raise ConnectionError(f"Şifreli Alert: {msg.hex()}")
+                raise ConnectionError(f"Sunucudan şifreli TLS alert: {describe_alert(bytes(msg))}")
             # m_type == 22 buraya artık gelmez (skip_post_handshake yuttu)
 
                                                                               
+
+    @staticmethod
+    def _body_framing(method: str, status_code: int, headers: Headers) -> str:
+        """Yanıt gövdesinin çerçevelenme biçimi (RFC 9112 §6.3).
+
+        ``"none"`` (HEAD, 1xx, 204, 304: gövde YOK, bağlantıdan veri beklenmez),
+        ``"chunked"``, ``"length"`` ya da ``"eof"`` (bağlantı kapanana kadar).
+        """
+        if method.upper() == "HEAD" or status_code in (204, 304) or 100 <= status_code < 200:
+            return "none"
+        if "chunked" in headers.get("transfer-encoding", "").lower():
+            return "chunked"
+        cl = headers.get("content-length", "").strip()
+        if cl.isdigit():
+            return "length"
+        return "eof"
 
     def _collect_body(
         self,
@@ -224,43 +272,43 @@ class Session:
         first_body_chunk: bytes,
         headers: Headers,
         metrics: RequestMetrics | None = None,
+        framing: str | None = None,
     ) -> bytes:
         """
         Headers parse edildikten sonra body'yi güvenilir biçimde toplar.
-        
+
         Chunked: proper chunk state-machine (TLS record boundary sorununu çözer)
-        Content-Length: tam miktar okunana kadar devam et
-        Bilinmiyor: bağlantı kapanana kadar oku (HTTP/1.0 compat)
+        Content-Length: tam miktar okunana kadar devam et; eksik gelirse
+        ``ConnectionResetError`` (sessizce kısaltılmış gövde DÖNMEZ).
+        Bilinmiyor: bağlantı kapanana kadar oku (HTTP/1.0 uyumu). Bu modda
+        close_notify'sız TCP kapanışı normal sayılır (çoğu HTTP/1.0 sunucusu
+        TLS'i düzgün kapatmaz; tarayıcılar/curl da böyle davranır).
         """
-        te = headers.get("transfer-encoding", "").lower()
-        is_chunked = "chunked" in te
-
-        cl_str = headers.get("content-length", "")
-        content_length: int | None = None
-        if cl_str:
-            try:
-                content_length = int(cl_str.strip())
-            except ValueError:
-                pass
-
-                                                                              
-        if is_chunked:
+        if framing is None:
+            framing = self._body_framing("GET", 200, headers)
+        if framing == "none":
+            return b""
+        if framing == "chunked":
             return self._collect_chunked(conn, first_body_chunk)
 
-                                                                               
-        if content_length is not None:
+        if framing == "length":
+            content_length = int(headers.get("content-length", "").strip())
             body = bytearray(first_body_chunk)
             while len(body) < content_length:
                 chunk = self._read_app_data(conn)
                 if not chunk:
-                    break
+                    raise ConnectionResetError(
+                        f"Yanıt gövdesi eksik: {len(body)}/{content_length} bayt alındı."
+                    )
                 body.extend(chunk)
             return bytes(body[:content_length])
 
-                                                                              
         body = bytearray(first_body_chunk)
         while True:
-            chunk = self._read_app_data(conn)
+            try:
+                chunk = self._read_app_data(conn)
+            except ConnectionResetError:
+                break  # close_notify'sız EOF: bağlantı-kapanışlı gövdenin sonu
             if not chunk:
                 break
             body.extend(chunk)
@@ -285,7 +333,7 @@ class Session:
                                      
                 more = self._read_app_data(conn)
                 if not more:
-                    return bytes(result)                    
+                    raise ConnectionResetError("Chunked gövde yarıda kesildi.")
                 buf.extend(more)
 
             size_line = bytes(buf[pos:nl]).split(b";")[0].strip()
@@ -294,19 +342,31 @@ class Session:
             try:
                 chunk_size = int(size_line, 16)
             except ValueError:
-                break
+                raise ConnectionError(f"Geçersiz chunk boyutu: {size_line[:20]!r}") from None
 
             if chunk_size == 0:
-                break                  
+                # Trailer satırlarını ve kapanış boş satırını TÜKET; aksi hâlde
+                # artan baytlar keep-alive bağlantıda bir sonraki yanıtı bozar.
+                while True:
+                    nl = buf.find(b"\r\n", pos)
+                    while nl == -1:
+                        more = self._read_app_data(conn)
+                        if not more:
+                            raise ConnectionResetError("Chunked gövde yarıda kesildi.")
+                        buf.extend(more)
+                        nl = buf.find(b"\r\n", pos)
+                    bos = nl == pos
+                    pos = nl + 2
+                    if bos:
+                        break
+                break
 
                                                                            
             end = pos + chunk_size
             while len(buf) < end + 2:                      
                 more = self._read_app_data(conn)
                 if not more:
-                                                    
-                    result.extend(buf[pos:])
-                    return bytes(result)
+                    raise ConnectionResetError("Chunked gövde yarıda kesildi.")
                 buf.extend(more)
 
             result.extend(buf[pos:end])
@@ -349,22 +409,17 @@ class Session:
             extra_headers["Content-Type"] = mp_ct
             files = None
 
+        # Profilin tarayıcı başlıkları (User-Agent, Accept-Encoding, sec-ch-ua...)
+        # + kullanıcı başlıkları; kullanıcınınki varsayılanı geçersiz kılar.
         req = Request(method=method, url=url, data=data, json=json,
-                      headers=headers, files=files)
+                      headers=merge_default_headers(self.impersonate, headers or {}),
+                      files=files)
         for k, v in extra_headers.items():
             req.headers[k] = v
 
                                
         if "host"       not in req.headers: req.headers["Host"]       = req.url.host
         if "connection" not in req.headers: req.headers["Connection"] = "keep-alive"
-        if "accept-encoding" not in req.headers:
-            req.headers["Accept-Encoding"] = "gzip, deflate"
-        if "user-agent" not in req.headers:
-            req.headers["User-Agent"] = (
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/131.0.0.0 Safari/537.36"
-            )
         # Çerezler yalnızca domain/path/Secure kurallarına uyanlar arasından
         # seçilir; redirect başka bir host'a giderse oraya gönderilmez.
         cookie_header = self.cookie_jar.header_for(
@@ -389,9 +444,13 @@ class Session:
                 metrics.connect_start = time.monotonic()
 
             conn = None
+            rot_proxy = None
             is_new_conn = False
+            got_bytes = False
             try:
-                conn = self.pool.acquire(req.url, timeout=self.timeout.pool)
+                rot_proxy = self._rotator.next() if self._rotator is not None else None
+                acq = {"proxy": rot_proxy} if rot_proxy is not None else {}
+                conn = self.pool.acquire(req.url, timeout=self.timeout.pool, **acq)
                 is_new_conn = not conn.tls_established
                 logger.debug("conn id=%s yeni=%s tls=%s h2=%s",
                              id(conn), is_new_conn, conn.tls_established,
@@ -408,7 +467,7 @@ class Session:
                                  self.impersonate, req.url.host)
                     conn.socket = TLSAdapter.negotiate(
                         conn.socket, req.url.host, self.impersonate,
-                        ca_path=self._ca_path,
+                        ca_path=self._ca_path, port=req.url.port,
                     )
                     conn.socket.raw_socket.settimeout(self.timeout.read_timeout)
                     conn.tls_established = True
@@ -416,13 +475,17 @@ class Session:
                     alpn = conn.socket.state.get("alpn", "")
                     if alpn == "h2":
                         logger.debug("TLS 1.3 kuruldu (ALPN: h2)")
-                        conn.h2_conn = Http2Connection(conn.socket)
+                        conn.h2_conn = Http2Connection(conn.socket, profile=self.impersonate)
                         conn.h2_conn.send_preface_and_settings()
                     else:
                         logger.debug("TLS 1.3 kuruldu (ALPN: http/1.1)")
 
                 if conn.h2_conn is not None:
                     resp = self._send_h2_request(conn, req, metrics, cache_entry, method, url)
+                    if conn.h2_conn.goaway is not None:
+                        # Sunucu GOAWAY ile kapatıyor: yanıt tamam ama bağlantı
+                        # yeniden kullanılmaz (RFC 9113 §6.8).
+                        conn.close()
                     self.pool.release(conn)
                     if metrics and metrics.request_start:
                         resp.elapsed = time.monotonic() - metrics.request_start
@@ -430,12 +493,18 @@ class Session:
 
                                  
                 req_lines = [f"{req.method} {req.url.raw_path.decode('ascii')} HTTP/1.1"]
-                for k, v in req.headers.raw:
-                    req_lines.append(f"{k.decode('ascii')}: {v.decode('ascii')}")
+                h1_pairs = [(k.decode("latin-1"), v.decode("latin-1")) for k, v in req.headers.raw]
+                h1_pairs = order_h1(self.impersonate,
+                                    drop_h2_only_defaults(self.impersonate, h1_pairs))
+                for k, v in h1_pairs:
+                    req_lines.append(f"{k}: {v}")
                 raw_bytes = "\r\n".join(req_lines).encode("ascii") + b"\r\n\r\n" + req.body
 
                 if metrics: metrics.bytes_sent = len(raw_bytes)
 
+                total = self.timeout.total
+                if total is not None:
+                    conn.conn_data["deadline"] = time.monotonic() + total
                 conn.socket.send_record(raw_bytes)
                 send_time = time.monotonic()
 
@@ -443,12 +512,14 @@ class Session:
                 # bytearray + kaldığı yerden arama: header'lar çok record'a bölünse
                 # bile birleştirme/arama doğrusal kalır.
                 header_acc  = bytearray()
+                got_bytes   = False   # yanıttan en az 1 bayt geldi mi (yeniden deneme güvenliği)
                 first_byte  = True
                 sep         = -1
                 while True:
                     chunk = self._read_app_data(conn)
                     if not chunk:
                         break
+                    got_bytes = True
                     if first_byte and metrics:
                         metrics.first_byte_time = time.monotonic()
                         first_byte = False
@@ -490,10 +561,10 @@ class Session:
 
                                                                            
                                                                     
-                if req.method.upper() == "HEAD":
-                    body_raw = b""
-                else:
-                    body_raw = self._collect_body(conn, first_body_chunk, resp_headers, metrics)
+                framing  = self._body_framing(req.method, status_code, resp_headers)
+                body_raw = self._collect_body(conn, first_body_chunk, resp_headers, metrics, framing)
+                if conn.conn_data.pop("deadline", None) is not None:
+                    conn.socket.raw_socket.settimeout(self.timeout.read_timeout)
 
                 if metrics:
                     metrics.transfer_end   = time.monotonic()
@@ -527,8 +598,16 @@ class Session:
                 if self._cache and method.upper() == "GET":
                     self._cache.store(str(url), method, resp)
 
-                if "close" in resp_headers.get("connection", "").lower():
+                conn_hdr = resp_headers.get("connection", "").lower()
+                http10   = lines[0].upper().startswith(b"HTTP/1.0")
+                if ("close" in conn_hdr or framing == "eof"
+                        or (http10 and "keep-alive" not in conn_hdr)):
+                    # Yeniden kullanılamaz: kapat VE havuza iade et. release()
+                    # kapalı bağlantıyı havuza koymaz ama semaphore slotunu
+                    # geri verir; atlanırsa max_connections kadar "close"
+                    # yanıtından sonra havuz kalıcı kilitlenir.
                     conn.close()
+                    self.pool.release(conn)
                 else:
                     self.pool.release(conn)
 
@@ -540,14 +619,23 @@ class Session:
                 # conn döngü başında None'a çekiliyor: acquire() patlarsa bir
                 # ÖNCEKİ turdan kalan bayat bağlantıyı ikinci kez release edip
                 # semaphore sayacını bozmuyoruz.
+                if (conn is None and rot_proxy is not None
+                        and not isinstance(e, TimeoutError)):
+                    self._rotator.mark_failed(rot_proxy)   # proxy'ye bağlanılamadı
                 if conn is not None:
                     conn.close()
                     self.pool.release(conn)  # close() semaphore'a dokunmaz
                     conn = None
-                    if not is_new_conn:
+                    if isinstance(e, _H2Refused) or (
+                            not is_new_conn and not got_bytes
+                            and not isinstance(e, TimeoutError)):
                         # Yeniden kullanılan bağlantı sunucu tarafında kapanmış
-                        # olabilir; bu idempotent olmayan istekler için de
-                        # güvenlidir çünkü sunucu isteği hiç görmemiştir.
+                        # olabilir; yanıttan HİÇ bayt gelmediyse ve hata zaman aşımı
+                        # değilse yeniden denemek güvenlidir. Zaman aşımı (sunucu
+                        # isteği işliyor olabilir) ya da yarım yanıt YENİDEN
+                        # DENENMEZ: POST çift gönderilir, bekleme süresi katlanır.
+                        # GOAWAY ile işlenmediği bildirilen h2 isteği (yeni
+                        # bağlantıda bile) güvenle yeniden denenir.
                         retry_count += 1
                         logger.debug("Bayat bağlantı, yeniden deneniyor (%s)", e)
                         continue
@@ -574,7 +662,8 @@ class Session:
             return self._raw_request(method, url, data=data, json=json,
                                      headers=headers, files=files, metrics=metrics)
         req = Request(method=method, url=url, data=data, json=json,
-                      headers=headers, files=files)
+                      headers={k: v for k, v in dict(headers or {}).items() if v is not None},
+                      files=files)
         if "host" not in req.headers:
             req.headers["Host"] = req.url.host
         cookie_header = self.cookie_jar.header_for(
@@ -625,6 +714,7 @@ class Session:
         redirect_count = 0
         history: list[Response] = []
         metrics = RequestMetrics(request_start=time.monotonic())
+        headers = self._merged_headers(headers)
 
         while True:
             resp = self._send_with_retries(
@@ -672,6 +762,20 @@ class Session:
 
                                                                                 
 
+    def _merged_headers(self, headers) -> dict:
+        """Oturum başlıkları + istek başlıkları (istek kazanır; büyük/küçük harf
+        duyarsız). ``None`` değerler, varsayılanı kaldırmak için korunur."""
+        merged: dict = {}
+        index: dict = {}
+        for src in (self.headers, headers or {}):
+            for k, v in (src.items() if hasattr(src, "items") else src):
+                lk = k.lower()
+                if lk in index:
+                    del merged[index[lk]]
+                index[lk] = k
+                merged[k] = v
+        return merged
+
     def get(self, url, headers=None, allow_redirects=True) -> Response:
         return self.request("GET", url, headers=headers, allow_redirects=allow_redirects)
 
@@ -707,6 +811,9 @@ class Session:
     def head(self, url, headers=None) -> Response:
         return self.request("HEAD", url, headers=headers, allow_redirects=False)
 
+    def options(self, url, headers=None, allow_redirects=True) -> Response:
+        return self.request("OPTIONS", url, headers=headers, allow_redirects=allow_redirects)
+
                                                                                 
 
     def pre_warm(self, hosts: list[str], count: int = 2) -> dict[str, int]:
@@ -718,6 +825,20 @@ class Session:
 
     def pool_stats(self) -> dict:
         return self.pool.stats()
+
+    def set_proxies(self, proxies: list[str], strategy: str = "round_robin") -> "Session":
+        """Proxy listesini ayarla ve rotasyonu etkinleştir (``AsyncSession`` ile aynı).
+
+        Rotasyon etkinken her istek için sıradaki proxy (``proxy=``/``proxies=``
+        yerine) kullanılır; bağlantılar proxy başına ayrı havuzlanır. Bağlantı
+        kurulamayan proxy devre dışı bırakılır.
+        """
+        from .async_session import ProxyRotator
+        from .transport.proxy import parse_proxy_url
+        for url in proxies:
+            parse_proxy_url(url)   # hatalı URL'i erken yakala
+        self._rotator = ProxyRotator(proxies, strategy=strategy)
+        return self
 
                                                                                 
 

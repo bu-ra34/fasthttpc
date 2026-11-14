@@ -15,6 +15,7 @@ Max-Age/Expires kurallarını uygular. Amaç tam bir tarayıcı uyumluluğu değ
 """
 from __future__ import annotations
 
+import threading
 import time
 from dataclasses import dataclass, field
 from email.utils import parsedate_to_datetime
@@ -132,6 +133,9 @@ class CookieJar:
 
     def __init__(self):
         self._cookies: dict[tuple[str, str, str], Cookie] = {}
+        # Session thread'ler arasında paylaşılabilir: sözlük, başka bir thread
+        # eklerken yinelenirse "dictionary changed size during iteration" olur.
+        self._lock = threading.RLock()
 
     def update_from_headers(self, set_cookie_values: Iterable[str],
                             request_host: str, request_path: str) -> None:
@@ -143,16 +147,19 @@ class CookieJar:
                 continue
             key = (cookie.domain, cookie.path, cookie.name)
             # Boş değer + geçmiş tarih = silme talebi
-            if cookie.is_expired():
-                self._cookies.pop(key, None)
-            else:
-                self._cookies[key] = cookie
+            with self._lock:
+                if cookie.is_expired():
+                    self._cookies.pop(key, None)
+                else:
+                    self._cookies[key] = cookie
 
     def header_for(self, host: str, path: str, secure: bool) -> str:
         """Verilen istek için gönderilecek ``Cookie`` başlığı değerini üretir."""
         now = time.time()
+        with self._lock:
+            snapshot = list(self._cookies.values())
         matched = [
-            c for c in self._cookies.values()
+            c for c in snapshot
             if not c.is_expired(now)
             and _domain_matches(host, c.domain, c.host_only)
             and _path_matches(path, c.path)
@@ -163,11 +170,14 @@ class CookieJar:
         return "; ".join(f"{c.name}={c.value}" for c in matched)
 
     def clear(self) -> None:
-        self._cookies.clear()
+        with self._lock:
+            self._cookies.clear()
 
     def as_dict(self) -> dict[str, str]:
         """Geriye dönük uyumluluk: isim -> değer sözlüğü."""
-        return {c.name: c.value for c in self._cookies.values() if not c.is_expired()}
+        with self._lock:
+            snapshot = list(self._cookies.values())
+        return {c.name: c.value for c in snapshot if not c.is_expired()}
 
     def __len__(self) -> int:
         return len(self._cookies)

@@ -13,6 +13,7 @@ from fasthttpc.fingerprint import (
     get_profile,
     ja3_for_profile,
     ja3_string_from_client_hello,
+    extension_ids_from_client_hello,
 )
 from fasthttpc.tls_crafter import TLSImpersonator
 
@@ -68,11 +69,15 @@ def test_client_random_zaman_damgasi_icermiyor():
         assert abs(prefix - now) > 86400, "client_random zaman damgası taşıyor gibi"
 
 
-def test_padding_512_katina_tamamliyor():
-    """Regresyon: cipher uzunluğu iki kez sayılıp hedef 2 byte kayıyordu."""
+def test_padding_boringssl_kurali():
+    """BoringSSL: handshake mesajı 256..511 bayt ise 512'ye tamamlanır, aksi halde
+    padding YOK. Safari profili padding ister (JA4'teki 21), Chrome ister değil."""
     for host in ("a.com", "cok-daha-uzun-bir-alan-adi.example.org", "x.io"):
+        ch = TLSImpersonator(host, profile="safari_18").build_client_hello()[0]
+        assert len(ch) - 5 == 512, f"{host}: handshake {len(ch) - 5} byte"
+        assert 0x15 in extension_ids_from_client_hello(ch)
         ch = TLSImpersonator(host, profile="chrome_131").build_client_hello()[0]
-        assert len(ch) % 512 == 0, f"{host}: {len(ch)} byte, 512'nin katı değil"
+        assert 0x15 not in extension_ids_from_client_hello(ch)
 
 
 def test_profiller_farkli_ja3_uretir():
@@ -82,9 +87,16 @@ def test_profiller_farkli_ja3_uretir():
 
 def test_ja3_grease_degerlerini_disarida_birakir():
     """JA3 tanımı gereği GREASE değerleri elenir; yoksa hash her seferinde değişir."""
-    a = ja3_string_from_client_hello(_client_hello())
-    b = ja3_string_from_client_hello(_client_hello())
-    assert a == b, "JA3 bağlantılar arasında kararlı olmalı"
+    # Chrome extension sırasını bağlantı başına karıştırır (gerçek davranış):
+    # JA3 METNİ değişir ama extension KÜMESİ/şifre/grup alanları sabittir.
+    a = ja3_string_from_client_hello(_client_hello()).split(",")
+    b = ja3_string_from_client_hello(_client_hello()).split(",")
+    assert a[1] == b[1] and a[3:] == b[3:]
+    assert sorted(a[2].split("-")) == sorted(b[2].split("-"))
+    # Karıştırmayan profillerde JA3 birebir kararlıdır.
+    for ad in ("firefox_133", "safari_18"):
+        assert ja3_string_from_client_hello(_client_hello(ad)) == \
+            ja3_string_from_client_hello(_client_hello(ad))
 
 
 def test_sni_hedef_hostu_tasiyor():
