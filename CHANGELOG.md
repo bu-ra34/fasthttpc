@@ -4,7 +4,7 @@
 
 requests/httpx'e göre kalan on eksik kapatıldı: akış, mTLS, auth, senkron
 hook'lar, trio, İngilizce dokümantasyon, PyPI paketlemesi, tip bilgisi, HTTP/3
-ve isteğe bağlı eski TLS modu. 953 → 1496 test; Python 3.10–3.13; CI artık
+ve isteğe bağlı eski TLS modu. 953 → 1498 test; Python 3.10–3.13; CI artık
 Linux, Windows ve macOS'ta.
 
 ### Yeni özellikler
