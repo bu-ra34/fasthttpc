@@ -43,6 +43,11 @@ from .http2_parser import (
     Http2Connection,
     Http2ConnectionError,
     Http2StreamError,
+    h2_for_profile,
+    h2_headers_priority_field,
+    h2_request_headers,
+    h2_setting,
+    HPACK_DEFAULT_TABLE_SIZE,
     _strip_data_frame_padding,
     _strip_headers_frame_fields,
 )
@@ -128,7 +133,7 @@ class _Recorder:
         self.chunks.append(bytes(data))
 
 
-def client_preface_bytes() -> bytes:
+def client_preface_bytes(profile=None) -> bytes:
     """Bağlantı ön eki + SETTINGS baytları: senkron taraf neyi gönderiyorsa o.
 
     ``Http2Connection.send_preface_and_settings`` sahte bir sokete karşı
@@ -136,7 +141,7 @@ def client_preface_bytes() -> bytes:
     sırası, değerleri) kendiliğinden tutarlı kalır.
     """
     rec = _Recorder()
-    Http2Connection(rec).send_preface_and_settings()
+    Http2Connection(rec, profile=profile).send_preface_and_settings()
     return b"".join(rec.chunks)
 
 
@@ -150,13 +155,17 @@ class AsyncHttp2Connection:
         read_timeout: Optional[float] = None,
         write_timeout: Optional[float] = None,
         on_close: Optional[Callable[[], None]] = None,
+        profile=None,
     ):
         self._s = stream
+        self._h2 = h2_for_profile(profile)
+        self._profile = profile
         self.read_timeout = read_timeout
         self.write_timeout = write_timeout
         self._on_close = on_close
-        self._decoder = HpackDecoder(max_table_size=65536,
-                                     max_header_list_size=HPACK_MAX_HEADER_LIST_SIZE)
+        self._decoder = HpackDecoder(
+            max_table_size=h2_setting(self._h2, 0x1, HPACK_DEFAULT_TABLE_SIZE),
+            max_header_list_size=HPACK_MAX_HEADER_LIST_SIZE)
         self._encoder = HpackEncoder()
         self._buf = bytearray()
         self._streams: dict[int, _Stream] = {}
@@ -196,7 +205,7 @@ class AsyncHttp2Connection:
     # ---------------------------------------------------------- el sıkışma
     async def start(self) -> None:
         """Ön ek + SETTINGS gönderir ve okuyucu görevi başlatır."""
-        self._s.write(client_preface_bytes())
+        self._s.write(client_preface_bytes(self._profile))
         await self._drain()
         self._task = self.loop.create_task(self._read_loop(), name="fasthttpc-h2-reader")
 
@@ -496,11 +505,13 @@ class AsyncHttp2Connection:
     def _send_headers(self, sid: int, headers: "list[tuple[str, str]]", end_stream: bool) -> None:
         block = self._encoder.encode(headers)
         max_frame = self._peer_max_frame
+        prio = h2_headers_priority_field(self._h2)
         out = bytearray()
         offset = 0
         first = True
         while first or offset < len(block):
-            chunk = block[offset: offset + max_frame]
+            room = max_frame - (len(prio) if first else 0)
+            chunk = block[offset: offset + room]
             offset += len(chunk)
             last = offset >= len(block)
             flags = 0
@@ -508,7 +519,10 @@ class AsyncHttp2Connection:
                 flags |= FrameFlags.END_STREAM
             if last:
                 flags |= FrameFlags.END_HEADERS
-            out += _frame(FrameType.HEADERS if first else FrameType.CONTINUATION, flags, sid, chunk)
+            if first and prio:
+                flags |= FrameFlags.PRIORITY
+            out += _frame(FrameType.HEADERS if first else FrameType.CONTINUATION, flags, sid,
+                          (prio + chunk) if first else chunk)
             first = False
         # Tek write: HEADERS+CONTINUATION arasına başka frame giremez.
         self._write(bytes(out))
@@ -552,13 +566,8 @@ class AsyncHttp2Connection:
                 break
             await self._wait_change(self.write_timeout)
 
-        # Pseudo-header sırası parmak izidir: senkron taraftakiyle aynı.
-        full = [
-            (":method", method.upper()),
-            (":authority", authority),
-            (":scheme", scheme),
-            (":path", path),
-        ] + [(k, v) for k, v in headers if not k.startswith(":")]
+        # Pseudo-header ve başlık sırası: senkron taraftakiyle AYNI fonksiyon.
+        full = h2_request_headers(self._h2, method, authority, scheme, path, headers)
 
         # await YOK: stream id tahsisi ile HEADERS yazımı sıralı kalmalı
         # (stream id'ler artan sırada gönderilmek zorunda; RFC 7540 §5.1.1).
