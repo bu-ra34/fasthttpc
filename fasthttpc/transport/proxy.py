@@ -390,7 +390,7 @@ async def async_connect_via_proxy(proxy: ProxyConfig, host: str, port: int,
         reader, writer = await B.wait_for(B.open_connection(proxy.host, proxy.port), timeout)
     except (OSError, asyncio.TimeoutError) as e:
         raise ProxyError(f"Proxy'ye bağlanılamadı ({proxy.host}:{proxy.port}): "
-                         f"{e or type(e).__name__}") from e
+                         f"{str(e) or type(e).__name__}") from e
     left = None if timeout is None else max(0.0, timeout - (time.perf_counter() - t0))
 
     async def _tunnel():
