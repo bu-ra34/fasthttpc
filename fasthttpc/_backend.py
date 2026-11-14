@@ -23,6 +23,8 @@ trio'da :class:`AnyioStream` bunu hem okuyucu hem yazıcı olarak sağlar.
 from __future__ import annotations
 
 import asyncio
+
+from .transport.happy_eyeballs import CONNECTION_ATTEMPT_DELAY
 import sys
 from typing import Any, Awaitable, Callable, Optional
 
@@ -368,11 +370,15 @@ async def open_connection(host: str, port: int, *, ssl: Any = None,
     """``(reader, writer)`` döner. asyncio: ``asyncio.open_connection``; trio:
     anyio TCP (+ ``ssl`` verilirse TLS) akışı, okuyucu = yazıcı = :class:`AnyioStream`."""
     if not _is_trio():
+        # Happy Eyeballs (RFC 8305): çok adresli host'larda (ör. localhost -> ::1, 127.0.0.1)
+        # adresler 250 ms aralıkla yarışır; çalışmayan IPv6 bağlantıyı geciktirmez.
         if ssl is None:
-            return await asyncio.open_connection(host, port)
-        return await asyncio.open_connection(host, port, ssl=ssl, server_hostname=server_hostname)
+            return await asyncio.open_connection(
+                host, port, happy_eyeballs_delay=CONNECTION_ATTEMPT_DELAY)
+        return await asyncio.open_connection(host, port, ssl=ssl, server_hostname=server_hostname,
+                                             happy_eyeballs_delay=CONNECTION_ATTEMPT_DELAY)
     anyio = _anyio()
-    sock = await anyio.connect_tcp(host, port)
+    sock = await anyio.connect_tcp(host, port, happy_eyeballs_delay=CONNECTION_ATTEMPT_DELAY)
     s = AnyioStream(sock)
     if ssl is not None:
         try:
