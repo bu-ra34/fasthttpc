@@ -11,6 +11,10 @@ Yollar (sorgu parametreleri ``?k=v``):
   /setcookie?i=X   Set-Cookie: cX=vX (çerez kavanozu yarış testi)
   /sleep?d=SN      SN saniye bekleyip yanıtla
   /drip?n=N&d=SN   N parça, her biri arası SN sn (toplam süre N*SN)
+  /gen?n=BAYT      n bayt, 64 KB bloklarla ÜRETİLİP akıtılır (bellekte tutulmaz; Content-Length)
+  /chunkgen?n=BAYT aynısı, Transfer-Encoding: chunked
+  /lines?n=N&d=SN  chunked; N satır ("satir-i\\n"), her biri SN sn arayla ayrı chunk'ta
+  /gzlines?n=N     gzip'li (Content-Encoding) N satır, Content-Length, parça parça gönderilir
   /cut             Content-Length 1000 vaat edip 10 bayt gönderip kapatır (close_notify'sız)
   /cutn            aynısı, ama temiz TLS kapanışıyla (close_notify)
   /trailer         chunked + trailer, kapanış satırı ayrı TLS kaydında
@@ -240,6 +244,39 @@ class YerelSunucu:
         elif yol == "/big":
             self._gonder(s, "200 OK", [("Content-Type", "application/octet-stream")],
                          govde_uret(int(q["n"])))
+        elif yol == "/gen":
+            n = int(q["n"])
+            blok = govde_uret(65536)
+            s.sendall(f"HTTP/1.1 200 OK\r\nContent-Length: {n}\r\n\r\n".encode())
+            kalan = n
+            while kalan > 0:
+                p = blok[:kalan]
+                s.sendall(p)
+                kalan -= len(p)
+        elif yol == "/chunkgen":
+            n = int(q["n"])
+            blok = govde_uret(65536)
+            s.sendall(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n")
+            kalan = n
+            while kalan > 0:
+                p = blok[:kalan]
+                s.sendall(b"%x\r\n" % len(p) + p + b"\r\n")
+                kalan -= len(p)
+            s.sendall(b"0\r\n\r\n")
+        elif yol == "/lines":
+            n, d = int(q.get("n", "3")), float(q.get("d", "0.3"))
+            s.sendall(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n")
+            for i in range(n):
+                p = f"satir-{i}\n".encode()
+                s.sendall(b"%x\r\n" % len(p) + p + b"\r\n")
+                time.sleep(d)
+            s.sendall(b"0\r\n\r\n")
+        elif yol == "/gzlines":
+            n = int(q.get("n", "50"))
+            z = gzip.compress("".join(f"satir-{i}\n" for i in range(n)).encode())
+            s.sendall(f"HTTP/1.1 200 OK\r\nContent-Encoding: gzip\r\nContent-Length: {len(z)}\r\n\r\n".encode())
+            for i in range(0, len(z), 7):
+                s.sendall(z[i:i + 7])
         elif yol == "/chunked":
             i = q.get("i", "x")
             parcalar = [b"parca1-", b"parca2-", i.encode()]
