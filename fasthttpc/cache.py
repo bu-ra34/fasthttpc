@@ -123,7 +123,7 @@ class ResponseCache:
             self._store[key] = entry
         return True
 
-    def build_conditional_headers(self, entry: CacheEntry) -> dict:
+    def build_conditional_headers(self, entry: CacheEntry) -> dict[str, str]:
         """
         Conditional GET için If-None-Match / If-Modified-Since header'larını üret.
         """

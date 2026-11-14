@@ -29,7 +29,7 @@ from __future__ import annotations
 
 import email.utils
 import time
-from typing import Iterable, Optional
+from typing import Any, Iterable, Optional
 
 DEFAULT_ALLOWED_METHODS = frozenset({"GET", "HEAD", "PUT", "DELETE", "OPTIONS", "TRACE"})
 RETRY_AFTER_STATUS_CODES = frozenset({413, 429, 503})
@@ -37,7 +37,7 @@ DEFAULT_BACKOFF_MAX = 120.0
 
 # Yeniden denenecek ağ hataları. CertificateValidationError Exception'dan
 # türer (OSError değil), dolayısıyla buraya hiç girmez.
-RETRYABLE_ERRORS: tuple = (ConnectionError, TimeoutError, OSError)
+RETRYABLE_ERRORS: tuple[type[BaseException], ...] = (ConnectionError, TimeoutError, OSError)
 
 
 class Retry:
@@ -119,7 +119,7 @@ class Retry:
         """``attempt``: kaçıncı yeniden deneme (1'den başlar)."""
         if self.backoff_factor <= 0 or attempt <= 0:
             return 0.0
-        return min(self.backoff_max, self.backoff_factor * (2 ** (attempt - 1)))
+        return float(min(self.backoff_max, self.backoff_factor * (2 ** (attempt - 1))))
 
     @staticmethod
     def parse_retry_after(value: str) -> Optional[float]:
@@ -137,14 +137,14 @@ class Retry:
             return None
         return max(0.0, dt.timestamp() - time.time())
 
-    def get_retry_after(self, response) -> Optional[float]:
+    def get_retry_after(self, response: Any) -> Optional[float]:
         if response is None or not self.respect_retry_after_header:
             return None
         if response.status_code not in RETRY_AFTER_STATUS_CODES:
             return None
         return self.parse_retry_after(response.headers.get("retry-after", ""))
 
-    def get_delay(self, attempt: int, response=None) -> float:
+    def get_delay(self, attempt: int, response: Any = None) -> float:
         """Bir sonraki denemeden önce beklenecek süre. Retry-After önceliklidir."""
         retry_after = self.get_retry_after(response)
         if retry_after is not None:

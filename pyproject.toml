@@ -1,15 +1,36 @@
 [build-system]
-requires = ["setuptools>=68", "wheel"]
+requires = ["setuptools>=77", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "fasthttpc"
 version = "0.5.0"
-description = "Pure-Python HTTP istemcisi — TLS 1.3 fingerprinting, async destek, connection pool"
+description = "Pure-Python HTTP client with browser TLS/HTTP2 fingerprint impersonation, async, HTTP/2 and TLS 1.3/1.2"
 readme = "README.md"
-license = { text = "MIT" }
+license = "MIT"
+license-files = ["LICENSE"]
 requires-python = ">=3.10"
 authors = [{ name = "Buğra" }]
+keywords = [
+    "http", "http-client", "http2", "tls", "tls13", "ja3", "ja4", "fingerprint",
+    "impersonate", "async", "asyncio", "requests", "httpx", "pure-python",
+]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Framework :: AsyncIO",
+    "Topic :: Internet :: WWW/HTTP",
+    "Topic :: Internet :: WWW/HTTP :: Dynamic Content",
+    "Topic :: Security :: Cryptography",
+    "Typing :: Typed",
+]
 dependencies = [
     "cryptography>=41.0",
     "certifi>=2023.7.22",
@@ -18,15 +39,28 @@ dependencies = [
 [project.optional-dependencies]
 brotli = ["brotli>=1.0"]
 zstd   = ["zstandard>=0.21"]
-dev    = ["pytest>=7.0", "h2>=4", "tlslite-ng>=0.8", "brotli>=1.0"]
+# Placeholders for upcoming features; they install nothing extra until the
+# corresponding backend lands.
+http3  = []
+trio   = ["trio>=0.22"]
+docs   = ["mkdocs>=1.6", "mkdocs-material>=9.5", "mkdocstrings[python]>=0.26"]
+dev    = ["pytest>=7.0", "h2>=4", "tlslite-ng>=0.8", "brotli>=1.0", "ruff", "mypy>=1.10", "build", "twine"]
 all    = ["brotli>=1.0", "zstandard>=0.21", "pytest>=7.0", "h2>=4", "tlslite-ng>=0.8"]
 
 [project.urls]
-Repository = "https://github.com/cevpy/fasthttpc"
+Homepage      = "https://github.com/cevpy/fasthttpc"
+Documentation = "https://cevpy.github.io/fasthttpc/"
+Repository    = "https://github.com/cevpy/fasthttpc"
+Issues        = "https://github.com/cevpy/fasthttpc/issues"
+Changelog     = "https://github.com/cevpy/fasthttpc/blob/main/CHANGELOG.md"
 
 [tool.setuptools.packages.find]
 where = ["."]
 include = ["fasthttpc*"]
+exclude = ["tests*", "interop*", "saha*", "examples*"]
+
+[tool.setuptools.package-data]
+fasthttpc = ["py.typed"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
@@ -46,3 +80,24 @@ extend-exclude = ["build", "dist"]
 # sözdizimi hataları, geçersiz karşılaştırmalar, yanlış yerde return/yield,
 # tanımsız isimler. Temizlik sonrası genişletilebilir.
 select = ["E9", "F63", "F7", "F82"]
+
+[tool.mypy]
+python_version = "3.10"
+strict = true
+# Only modules that are already strict-clean are checked; extend the list as
+# other modules are annotated. Imports are followed silently so errors in
+# not-yet-clean modules do not fail the run.
+follow_imports = "silent"
+files = [
+    "fasthttpc/models/headers.py",
+    "fasthttpc/models/urls.py",
+    "fasthttpc/config.py",
+    "fasthttpc/retry.py",
+    "fasthttpc/cookies.py",
+    "fasthttpc/cache.py",
+    "fasthttpc/metrics.py",
+    "fasthttpc/timeout.py",
+    "fasthttpc/_log.py",
+    "fasthttpc/transport/mock.py",
+    "fasthttpc/multipart.py",
+]
