@@ -146,7 +146,7 @@ class _H1BodyStream:
         conn = self._conn
         m = self._metrics
         if m:
-            m.transfer_end = m.total_end = time.monotonic()
+            m.transfer_end = m.total_end = time.perf_counter()
             m.bytes_received = self._received
         if not reuse:
             conn.close()
@@ -196,7 +196,7 @@ class _H2BodyStream:
         conn, st = self._conn, self._st
         m = self._metrics
         if m:
-            m.transfer_end = m.total_end = time.monotonic()
+            m.transfer_end = m.total_end = time.perf_counter()
             m.bytes_received = self._received
         if st.broken or conn.h2_conn.goaway is not None:
             conn.close()
@@ -429,8 +429,8 @@ class Session:
             raise ConnectionError(f"HTTP/2 isteği başarısız: {e}") from e
 
         if metrics:
-            metrics.first_byte_time = time.monotonic()
-            metrics.transfer_end    = time.monotonic()
+            metrics.first_byte_time = time.perf_counter()
+            metrics.transfer_end    = time.perf_counter()
             metrics.bytes_received  = len(body_raw)
 
         resp_headers = Headers()
@@ -455,7 +455,7 @@ class Session:
         resp.http_version = "HTTP/2"
         resp.tls_info = self._tls_info(conn)
         if metrics:
-            metrics.total_end = time.monotonic()
+            metrics.total_end = time.perf_counter()
             resp.metrics = metrics
 
         self._update_cookies(resp_headers, req.url)
@@ -488,11 +488,11 @@ class Session:
         resp.request = req
         resp.http_version = "HTTP/3"
         if metrics:
-            metrics.first_byte_time = metrics.transfer_end = metrics.total_end = time.monotonic()
+            metrics.first_byte_time = metrics.transfer_end = metrics.total_end = time.perf_counter()
             metrics.bytes_received = len(body)
             resp.metrics = metrics
             if metrics.request_start:
-                resp.elapsed = time.monotonic() - metrics.request_start
+                resp.elapsed = time.perf_counter() - metrics.request_start
         self._update_cookies(resp_headers, req.url)
         if status_code == 304 and cache_entry:
             cached = cache_entry.response
@@ -510,7 +510,7 @@ class Session:
         dl = conn.conn_data.get("deadline")
         while True:
             if dl is not None:
-                kalan = dl - time.monotonic()
+                kalan = dl - time.perf_counter()
                 if kalan <= 0:
                     raise TimeoutError("İstek toplam süre sınırını (Timeout.total) aştı.")
                 conn.socket.raw_socket.settimeout(min(self._tmo().read_timeout, kalan))
@@ -726,7 +726,7 @@ class Session:
         retry_count = 0
         while retry_count < 2:
             if metrics:
-                metrics.connect_start = time.monotonic()
+                metrics.connect_start = time.perf_counter()
 
             conn = None
             rot_proxy = None
@@ -745,11 +745,11 @@ class Session:
 
                 if metrics:
                     metrics.connection_reused = not is_new_conn
-                    metrics.connect_end       = time.monotonic()
+                    metrics.connect_end       = time.perf_counter()
 
                      
                 if is_new_conn:
-                    if metrics: metrics.tls_start = time.monotonic()
+                    if metrics: metrics.tls_start = time.perf_counter()
                     logger.debug("%s profili ile TLS el sıkışması başlıyor (%s)",
                                  self.impersonate, req.url.host)
                     conn.socket = TLSAdapter.negotiate(
@@ -760,7 +760,7 @@ class Session:
                     )
                     conn.socket.raw_socket.settimeout(self._tmo().read_timeout)
                     conn.tls_established = True
-                    if metrics: metrics.tls_end = time.monotonic()
+                    if metrics: metrics.tls_end = time.perf_counter()
                     alpn = conn.socket.state.get("alpn", "")
                     if alpn == "h2":
                         logger.debug("TLS 1.3 kuruldu (ALPN: h2)")
@@ -775,7 +775,7 @@ class Session:
                     if resp._stream is not None:
                         # Bağlantıyı akış yönetir (bitince/close'ta havuza döner).
                         if metrics and metrics.request_start:
-                            resp.elapsed = time.monotonic() - metrics.request_start
+                            resp.elapsed = time.perf_counter() - metrics.request_start
                         return resp
                     if conn.h2_conn.goaway is not None:
                         # Sunucu GOAWAY ile kapatıyor: yanıt tamam ama bağlantı
@@ -783,7 +783,7 @@ class Session:
                         conn.close()
                     self.pool.release(conn)
                     if metrics and metrics.request_start:
-                        resp.elapsed = time.monotonic() - metrics.request_start
+                        resp.elapsed = time.perf_counter() - metrics.request_start
                     return resp
 
                                  
@@ -799,9 +799,9 @@ class Session:
 
                 total = self._tmo().total
                 if total is not None:
-                    conn.conn_data["deadline"] = time.monotonic() + total
+                    conn.conn_data["deadline"] = time.perf_counter() + total
                 conn.socket.send_record(raw_bytes)
-                send_time = time.monotonic()
+                send_time = time.perf_counter()
 
                                                                             
                 # bytearray + kaldığı yerden arama: header'lar çok record'a bölünse
@@ -816,7 +816,7 @@ class Session:
                         break
                     got_bytes = True
                     if first_byte and metrics:
-                        metrics.first_byte_time = time.monotonic()
+                        metrics.first_byte_time = time.perf_counter()
                         first_byte = False
                     search_from = max(0, len(header_acc) - 3)
                     header_acc += chunk
@@ -874,20 +874,20 @@ class Session:
                                                          len(headers_raw) + 4))
                     resp.request = req
                     if metrics:
-                        metrics.transfer_end = time.monotonic()
+                        metrics.transfer_end = time.perf_counter()
                         resp.metrics = metrics
                         if metrics.first_byte_time:
                             conn.update_ttfb((metrics.first_byte_time - send_time) * 1000)
                     self._update_cookies(resp_headers, req.url)
                     if metrics and metrics.request_start:
-                        resp.elapsed = time.monotonic() - metrics.request_start
+                        resp.elapsed = time.perf_counter() - metrics.request_start
                     return resp
                 body_raw = self._collect_body(conn, first_body_chunk, resp_headers, metrics, framing)
                 if conn.conn_data.pop("deadline", None) is not None:
                     conn.socket.raw_socket.settimeout(self._tmo().read_timeout)
 
                 if metrics:
-                    metrics.transfer_end   = time.monotonic()
+                    metrics.transfer_end   = time.perf_counter()
                     metrics.bytes_received = len(headers_raw) + 4 + len(body_raw)
                     if metrics.first_byte_time:
                         ttfb_ms = (metrics.first_byte_time - send_time) * 1000
@@ -902,7 +902,7 @@ class Session:
                 resp.tls_info = self._tls_info(conn)
 
                 if metrics:
-                    metrics.total_end = time.monotonic()
+                    metrics.total_end = time.perf_counter()
                     resp.metrics = metrics                              
 
                 self._update_cookies(resp_headers, req.url)
@@ -931,7 +931,7 @@ class Session:
                     self.pool.release(conn)
 
                 if metrics and metrics.request_start:
-                    resp.elapsed = time.monotonic() - metrics.request_start
+                    resp.elapsed = time.perf_counter() - metrics.request_start
                 return resp
 
             except (ConnectionResetError, ConnectionError, TimeoutError, OSError) as e:
@@ -1016,7 +1016,7 @@ class Session:
                 resp = self.transport.handle_request(req)
                 self._update_cookies(resp.headers, req.url)
                 if metrics and metrics.request_start:
-                    resp.elapsed = time.monotonic() - metrics.request_start
+                    resp.elapsed = time.perf_counter() - metrics.request_start
             for plugin in self._plugins:
                 resp = call_sync(plugin, "on_response", resp)
             return resp
@@ -1147,7 +1147,7 @@ class Session:
         current_url    = url
         redirect_count = 0
         history: list[Response] = []
-        metrics = RequestMetrics(request_start=time.monotonic())
+        metrics = RequestMetrics(request_start=time.perf_counter())
         headers = self._merged_headers(headers)
         body = _api.encode_body(data, json, files, headers)
         req_hooks = _api.normalize_hooks(hooks)

@@ -270,7 +270,7 @@ class AsyncHttp2Connection:
         self._hblock = bytearray()
         self._hblock_sid = 0
         self._hblock_end_stream = False
-        self.last_used = time.monotonic()
+        self.last_used = time.perf_counter()
         self.loop = B.current_token()   # asyncio: olay döngüsü; trio: TrioToken
 
     # ------------------------------------------------------------- durum
@@ -427,7 +427,7 @@ class AsyncHttp2Connection:
 
     def _finish(self, st: _Stream) -> None:
         self._streams.pop(st.id, None)
-        self.last_used = time.monotonic()
+        self.last_used = time.perf_counter()
         if not st.fut.done():
             st.fut.set_result(H2Response(st.status, st.headers, bytes(st.body), st.first_byte_time))
         if st.hdr_fut is not None and not st.hdr_fut.done():
@@ -521,7 +521,7 @@ class AsyncHttp2Connection:
             st.headers_done = True
             st.status = status
             st.headers.extend(hdrs)
-            st.first_byte_time = time.monotonic()
+            st.first_byte_time = time.perf_counter()
             if st.hdr_fut is not None and not st.hdr_fut.done():
                 st.hdr_fut.set_result(None)
         if end_stream:
@@ -677,7 +677,7 @@ class AsyncHttp2Connection:
         # await YOK: stream id tahsisi ile HEADERS yazımı sıralı kalmalı
         # (stream id'ler artan sırada gönderilmek zorunda; RFC 7540 §5.1.1).
         st = self._alloc_stream()
-        self.last_used = time.monotonic()
+        self.last_used = time.perf_counter()
         try:
             self._send_headers(st.id, full, end_stream=not body)
         except BaseException:
@@ -732,7 +732,7 @@ class AsyncHttp2Connection:
         st = self._alloc_stream()
         st.streaming = True
         st.hdr_fut = B.new_future()
-        self.last_used = time.monotonic()
+        self.last_used = time.perf_counter()
         handle = H2StreamHandle(self, st)
         try:
             self._send_headers(st.id, full, end_stream=not body)
