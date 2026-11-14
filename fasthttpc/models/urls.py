@@ -1,4 +1,5 @@
                           
+from typing import Any
 from urllib.parse import urlparse, urlencode, parse_qs
 
 class QueryParams:
@@ -52,7 +53,7 @@ class URL:
         self.raw_query = parsed.query
         self.params = QueryParams(parsed.query)
 
-    def copy_with(self, **kwargs) -> 'URL':
+    def copy_with(self, **kwargs: Any) -> 'URL':
         """İstenen parametreleri değiştirerek yeni bir URL nesnesi döner."""
                                         
         new_url = URL.__new__(URL)
