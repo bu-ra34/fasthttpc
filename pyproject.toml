@@ -22,7 +22,7 @@ dev    = ["pytest>=7.0", "h2>=4"]
 all    = ["brotli>=1.0", "zstandard>=0.21", "pytest>=7.0", "h2>=4"]
 
 [project.urls]
-Repository = "https://github.com/kullanici/fasthttpc"
+Repository = "https://github.com/cevpy/fasthttpc"
 
 [tool.setuptools.packages.find]
 where = ["."]
