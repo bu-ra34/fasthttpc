@@ -18,7 +18,7 @@ Geriye dönük uyumluluk: ``Session(timeout=30)`` (float/int) hâlâ geçerlidir
 from __future__ import annotations
 
 import os
-from typing import Optional, Union
+from typing import Any, Optional, Union
 
 _DEFAULT_TIMEOUT = 30.0
 _UNSET = object()
@@ -58,6 +58,9 @@ class Timeout:
             if timeout is not None:
                 raise TypeError("timeout ve default aynı anda verilemez.")
             timeout = default  # type: ignore[assignment]
+        vals: dict[str, Optional[float]]
+        total_val: Optional[float]
+        self.default: Optional[float]
         if isinstance(timeout, Timeout):
             base = timeout
             self.default = base.default
@@ -72,8 +75,9 @@ class Timeout:
                             ("write", write), ("pool", pool)):
             if given is not _UNSET:
                 vals[name] = None if given is None else float(given)  # type: ignore[arg-type]
-            if vals[name] is not None and vals[name] < 0:
-                raise ValueError(f"Timeout.{name} negatif olamaz: {vals[name]}")
+            v = vals[name]
+            if v is not None and v < 0:
+                raise ValueError(f"Timeout.{name} negatif olamaz: {v}")
         if total is not _UNSET:
             total_val = None if total is None else float(total)  # type: ignore[arg-type]
         if total_val is not None and total_val <= 0:
@@ -114,7 +118,7 @@ class Timeout:
     def pool_timeout(self) -> float:
         return self.pool if self.pool is not None else _DEFAULT_TIMEOUT
 
-    def as_dict(self) -> dict:
+    def as_dict(self) -> dict[str, Optional[float]]:
         return {"connect": self.connect, "read": self.read,
                 "write": self.write, "pool": self.pool}
 
@@ -159,7 +163,7 @@ class Limits:
         self.max_keepalive_connections = max_keepalive_connections
         self.keepalive_expiry = keepalive_expiry
 
-    def apply_to_pool(self, pool) -> None:
+    def apply_to_pool(self, pool: Any) -> None:
         """Sınırları bir :class:`ConnectionPool` örneğine uygular."""
         pool.max_connections = self.max_connections
         pool.max_keepalive_connections = self.max_keepalive_connections
@@ -185,7 +189,7 @@ VERIFY_FALSE_MESSAGE = (
 )
 
 
-def resolve_verify(verify: "bool | str | os.PathLike") -> Optional[str]:
+def resolve_verify(verify: "bool | str | os.PathLike[str]") -> Optional[str]:
     """``verify`` parametresini cert_validator'ın ``ca_path`` değerine çevirir.
 
     ``True`` → ``None`` (varsayılan güven deposu), yol → mutlak yol.
