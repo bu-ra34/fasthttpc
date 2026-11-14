@@ -10,6 +10,7 @@ from fasthttpc import AsyncSession, Limits, Timeout
 from fasthttpc.transport import proxy as P
 from fasthttpc.transport.proxy import ProxyConfig, ProxyError
 
+from netutil import start_dual
 from async_fakes import AsyncFakeProxy, start_stdlib_tls, start_tls13
 from tls13_fakeserver import PKI, http_responder
 
@@ -249,7 +250,7 @@ def test_limits_max_connections_ve_pool_timeout_h1(pki_local, ca_local):
             finally:
                 state["open"] -= 1
                 w.close()
-        srv = await asyncio.start_server(slow_handler_conn, "127.0.0.1", 0)
+        srv = await start_dual(slow_handler_conn)
         port = srv.sockets[0].getsockname()[1]
         async with srv:
             s = AsyncSession(impersonate="chrome_131", verify=ca_local, timeout=5,

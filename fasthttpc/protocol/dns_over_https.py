@@ -13,6 +13,8 @@ import threading
 import time
 from typing import Optional
 
+from ..transport.happy_eyeballs import create_connection
+
 
 class DoHCache:
     """TTL'li DNS cache — tekrar sorgulama önler."""
@@ -87,7 +89,7 @@ class DoHResolver:
         ctx.check_hostname = True
         ctx.verify_mode    = ssl.CERT_REQUIRED
 
-        raw = socket.create_connection((self._host, 443), timeout=self._timeout)
+        raw = create_connection((self._host, 443), timeout=self._timeout)
         sock = ctx.wrap_socket(raw, server_hostname=self._host)
 
         try:

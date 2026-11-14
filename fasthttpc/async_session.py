@@ -9,7 +9,11 @@ import asyncio
 import ssl
 import warnings
 
+from . import _backend as B
 from ._log import get_logger
+from . import _api
+from ._api import USE_CLIENT_DEFAULT
+from .auth import resolve_auth, netrc_credentials, BasicAuth
 
 logger = get_logger("async")
 import time
@@ -31,7 +35,8 @@ from .retry           import Retry
 from .tls13 import AsyncTLSStream
 from .protocol.async_h2 import AsyncHttp2Connection, H2StreamRefused
 from .protocol.http2_parser import Http2ConnectionError, Http2StreamError
-from .transport.proxy import ProxyConfig, async_connect_via_proxy, parse_proxy_url, resolve_proxy
+from .transport.proxy import ProxyConfig, ProxyError, async_connect_via_proxy, parse_proxy_url, resolve_proxy
+from .transport.happy_eyeballs import CONNECTION_ATTEMPT_DELAY
 
 
                                                                                
@@ -44,97 +49,14 @@ def _resolve_location(base: URL, location: str) -> str:
     return _impl(base, location)
 
 
-class Plugin:
-    """
-    Base plugin sınıfı. Kalıtım alarak özelleştirin.
-    Metodlar opsiyonel — sadece gerekli hook'ları override edin.
-    """
-    async def on_request(self, request: dict) -> dict:
-        """İstek gönderilmeden önce çağrılır. request dict'i döndürün."""
-        return request
-
-    async def on_response(self, response: Response) -> Response:
-        """Yanıt alındıktan sonra çağrılır. response döndürün."""
-        return response
-
-    async def on_error(self, error: Exception) -> Optional[Exception]:
-        """Hata oluştuğunda çağrılır. None → hatayı yut; Exception → yeniden fırlat."""
-        return error
+from .plugins import Plugin, RetryPlugin, LoggingPlugin, RateLimitPlugin, call_async  # noqa: E402,F401
 
 
-class RetryPlugin(Plugin):
-    """Belirli durum kodlarında isteği otomatik tekrar dener.
+async def _maybe(out):
+    """Hook düz değer ya da coroutine döndürebilir."""
+    import inspect
+    return await out if inspect.isawaitable(out) else out
 
-    Yeniden deneme, istek döngüsünün SAHİBİ olan ``AsyncSession.request``
-    tarafından uygulanır; bir ``on_response`` hook'u yanıtı dönüştürebilir ama
-    yeni bir istek başlatamaz. Bu yüzden plugin yalnızca politikayı bildirir,
-    kararı session verir.
-
-    Args:
-        max_retries: Azami yeniden deneme sayısı (ilk istek hariç).
-        retry_on:    Yeniden denenecek HTTP durum kodları.
-        backoff:     Üstel bekleme taban süresi (saniye). 0 ise beklenmez.
-    """
-
-    def __init__(self, max_retries: int = 3,
-                 retry_on: tuple = (429, 500, 502, 503, 504),
-                 backoff: float = 0.5):
-        self.max_retries = max_retries
-        self.retry_on = set(retry_on)
-        self.backoff = backoff
-
-    def should_retry(self, response: Response, attempt: int) -> bool:
-        return attempt < self.max_retries and response.status_code in self.retry_on
-
-    def delay_for(self, response: Response, attempt: int) -> float:
-        """Retry-After başlığına saygı duyar, yoksa üstel bekleme uygular."""
-        retry_after = response.headers.get("retry-after", "")
-        if retry_after:
-            try:
-                return max(0.0, float(retry_after.strip()))
-            except ValueError:
-                pass
-        return self.backoff * (2 ** attempt) if self.backoff else 0.0
-
-
-class LoggingPlugin(Plugin):
-    """İstekleri ve yanıtları loglar."""
-    def __init__(self, verbose: bool = False):
-        self._verbose = verbose
-
-    async def on_request(self, request: dict) -> dict:
-        print(f"[LOG] → {request['method']} {request['url']}")
-        return request
-
-    async def on_response(self, response: Response) -> Response:
-        status = response.status_code
-        size   = len(response.body)
-        print(f"[LOG] ← {status} ({size}B)")
-        if self._verbose and hasattr(response, "metrics"):
-            print(f"       ttfb={response.metrics.ttfb:.1f}ms total={response.metrics.total_time:.1f}ms")
-        return response
-
-
-class RateLimitPlugin(Plugin):
-    """Saniyedeki istek sayısını sınırlar."""
-    def __init__(self, rps: float = 10.0):
-        self._interval = 1.0 / rps
-        self._last_req = 0.0
-        self._lock     = asyncio.Lock()
-
-    async def on_request(self, request: dict) -> dict:
-        async with self._lock:
-            now   = time.monotonic()
-            wait  = self._interval - (now - self._last_req)
-            if wait > 0:
-                await asyncio.sleep(wait)
-            self._last_req = time.monotonic()
-        return request
-
-
-                                                                               
-                                   
-                                                                               
 
 class ProxyRotator:
     """
@@ -231,6 +153,131 @@ class _StaleConn(Exception):
         self.cause = cause
 
 
+class _BodyState:
+    """``_h1_iter_body`` sonucu: gövde sonrası artakalan bayt sayısı."""
+    extra = 0
+
+
+class _AsyncH1Stream:
+    """HTTP/1.1 akış gövdesi (async): bağlantının sahibi. Gövde bitince bağlantı
+    (yeniden kullanılabilirse) havuza döner; erken ``aclose()``/hata -> kapatılır."""
+
+    def __init__(self, session: "AsyncSession", opened: "_Opened", agen, state: _BodyState,
+                 reusable: bool):
+        self._s, self._o, self._gen, self._state = session, opened, agen, state
+        self._reusable = reusable
+        self._done = False
+
+    async def read_chunk(self) -> bytes:
+        if self._done:
+            return b""
+        try:
+            return await self._gen.__anext__()
+        except StopAsyncIteration:
+            self._done = True
+            await self._s._h1_finish(self._o, self._reusable and self._state.extra == 0)
+            return b""
+        except BaseException:
+            self.close_nowait()
+            raise
+
+    def close_nowait(self) -> None:
+        """Bağlantıyı eşzamanlı kapatır ve slotu iade eder (iptal güvenli)."""
+        if self._done:
+            return
+        self._done = True
+        _AsyncH1Stream._kill(self._o)
+
+    @staticmethod
+    def _kill(o: "_Opened") -> None:
+        try:
+            o.writer.close()
+        except (OSError, RuntimeError):
+            pass
+        o.release()
+
+    async def aclose(self) -> None:
+        if self._done:
+            return
+        self._done = True
+        try:
+            await self._gen.aclose()
+        except Exception:  # noqa: BLE001
+            pass
+        o = self._o
+        try:
+            o.writer.close()
+            await o.writer.wait_closed()
+        except (OSError, RuntimeError, asyncio.CancelledError):
+            pass
+        finally:
+            o.release()
+
+    def __del__(self):
+        try:
+            self.close_nowait()
+        except Exception:  # noqa: BLE001
+            pass
+
+
+class _AsyncH2Stream:
+    """HTTP/2 akış gövdesi (async): erken kapanış stream'i CANCEL ile iptal eder."""
+
+    def __init__(self, handle):
+        self._h = handle
+
+    async def read_chunk(self) -> bytes:
+        try:
+            return await self._h.read_chunk()
+        except (Http2StreamError, Http2ConnectionError) as e:
+            raise ConnectionError(f"HTTP/2 isteği başarısız: {e}") from e
+        except BaseException:
+            self._h.close_nowait()
+            raise
+
+    def close_nowait(self) -> None:
+        self._h.close_nowait()
+
+    async def aclose(self) -> None:
+        await self._h.aclose()
+
+    def __del__(self):
+        try:
+            self._h.close_nowait()
+        except Exception:  # noqa: BLE001
+            pass
+
+
+class _AsyncStreamContext:
+    """``AsyncSession.stream(...)``: ``async with s.stream("GET", url) as r:``."""
+
+    def __init__(self, session, method, url, kwargs):
+        self._args = (session, method, url, kwargs)
+        self._resp = None
+
+    async def __aenter__(self) -> Response:
+        session, method, url, kwargs = self._args
+        self._resp = await session.request(method, url, stream=True, **kwargs)
+        return self._resp
+
+    async def __aexit__(self, *exc) -> None:
+        if self._resp is not None:
+            await self._resp.aclose()
+
+
+async def _discard_stream(resp: Response) -> None:
+    """Yönlendirme gövdesini (küçükse) tüketip bağlantıyı korur; sonra kapatır."""
+    try:
+        n = 0
+        async for c in resp.aiter_raw():
+            n += len(c)
+            if n > 65536:
+                break
+    except Exception as e:  # noqa: BLE001
+        logger.debug("yönlendirme gövdesi okunamadı: %s", e)
+    await resp.aclose()
+
+
 class AsyncSession:
     """
     asyncio tabanlı async HTTP istemcisi.
@@ -274,13 +321,39 @@ class AsyncSession:
         proxy                         = None,
         resolver                      = None,
         headers                       = None,
+        http3:           "bool | str | object" = False,
+        legacy_tls:      bool         = False,
+        auth                          = None,
+        hooks:           "dict | None" = None,
+        event_hooks:     "dict | None" = None,
+        trust_env:       bool          = True,
+        params                        = None,
+        *,
+        cert                          = None,
     ):
+        # Eski sunucu uyumluluk modu (bkz. Session ve security/tls12_legacy.py); varsayılan False.
+        from .security.tls12_legacy import normalize_legacy
+        self.legacy_tls    = normalize_legacy(legacy_tls)
+        self._tls_infos: dict = {}      # (host, port, proxy) -> son el sıkışmanın tls_info'su
         # impersonate verilirse TLS, fasthttpc.tls13 çekirdeğiyle (tarayıcı
         # ClientHello'su) kurulur ve profilin ALPN'i (h2, http/1.1) kullanılır;
         # sunucu h2 seçerse HTTP/2 (multiplexing) konuşulur.
         # impersonate=None -> stdlib ssl, yalnızca HTTP/1.1.
         from .session import _proxy_spec
         self.impersonate   = impersonate
+        # requests/httpx uyumu (Session ile aynı): kimlik, hook'lar, varsayılan params.
+        self.auth          = auth
+        self.hooks         = _api.normalize_hooks(hooks)
+        self.event_hooks   = _api.normalize_event_hooks(event_hooks)
+        self.trust_env     = trust_env
+        self.params        = params
+        # mTLS (oturum düzeyi): yol | (cert, key) | (cert, key, parola) | ClientCert
+        from .security.client_cert import ClientCert
+        self.client_cert   = ClientCert.coerce(cert)
+        self._owns_cert    = self.client_cert is not None and not isinstance(cert, ClientCert)
+        if self.client_cert is not None and impersonate is None:
+            # impersonate=None yolu stdlib ssl kullanır; sertifikayı SESSİZCE yok saymak yerine reddet.
+            raise ValueError("cert= (mTLS) için impersonate verilmelidir (impersonate=None desteklemez).")
         # Oturum düzeyi varsayılan başlıklar (mutable; Session ile aynı öncelik:
         # profil başlıkları < headers < istek başlıkları; None değer kaldırır).
         self.headers       = Headers(headers)
@@ -296,15 +369,29 @@ class AsyncSession:
         self.cookie_jar    = CookieJar()
         self._plugins: list[Plugin]   = []
         self._rotator: Optional[ProxyRotator] = None
-        self._sem     = asyncio.Semaphore(self.limits.max_connections)
+        self._sem_obj: Any = None          # bkz. ``_sem`` (arka uca göre geç oluşturulur)
+        self._sem_kind: Optional[str] = None
         # HTTP/2: (host, port, proxy) -> canlı bağlantı; kaynak protokol önbelleği
         self._h2:           dict[tuple, AsyncHttp2Connection] = {}
         self._origin_proto: dict[tuple, str] = {}
-        self._origin_locks: dict[tuple, asyncio.Lock] = {}
-        self._bg_tasks:     set[asyncio.Task] = set()
+        self._origin_locks: dict[tuple, Any] = {}
+        self._bg_tasks:     set = set()
         # HTTP/1.1 keep-alive havuzu: (host, port, proxy, impersonate-mi) -> boşta bağlantılar.
         # Boştaki bağlantı semaphore slotu TUTMAZ (slot yalnızca kullanımdayken).
         self._idle: dict[tuple, list[_Opened]] = {}
+        # HTTP/3 (opsiyonel, aioquic): True -> Alt-Svc keşfi + h2'ye düşüş, "force" -> doğrudan h3.
+        self._h3 = None
+        from .http3.options import Http3Options
+        _h3opts = Http3Options.from_value(http3)
+        if _h3opts is not None and self.client_cert is not None:
+            # HTTP/3 yolu istemci sertifikası (mTLS) göndermez: cert= varken h3 KULLANILMAZ
+            # (aksi halde istek sertifikasız bir QUIC bağlantısıyla gidebilirdi).
+            if _h3opts.mode == "force":
+                raise ValueError("http3='force' ile cert= (mTLS) birlikte kullanılamaz.")
+            _h3opts = None
+        if _h3opts is not None:
+            from .http3.manager import AsyncHttp3
+            self._h3 = AsyncHttp3(_h3opts, self._ca_path, impersonate)
 
         if isinstance(cache, ResponseCache):
             self._cache: Optional[ResponseCache] = cache
@@ -314,6 +401,22 @@ class AsyncSession:
             self._cache = None
 
                                                                                
+
+    def _origin_key(self, u: URL, proxy) -> tuple:
+        """h2/protokol önbelleği anahtarı; mTLS'de sertifika kimliği anahtara girer."""
+        k = (u.host, u.port, proxy)
+        return k + (self.client_cert.identity,) if self.client_cert is not None else k
+
+    @property
+    def _sem(self):
+        """Bağlantı semaforu. Çalışan arka uca (asyncio | trio) göre oluşturulur;
+        döngü dışında kurulan oturum için geçici asyncio semaforu, trio altında
+        ilk kullanımda değiştirilir."""
+        kind = B.current_backend(None)
+        if self._sem_obj is None or (kind is not None and kind != self._sem_kind):
+            self._sem_obj = B.Semaphore(self.limits.max_connections)
+            self._sem_kind = kind or "asyncio"
+        return self._sem_obj
 
     @property
     def cookies(self) -> dict[str, str]:
@@ -341,22 +444,27 @@ class AsyncSession:
                 stats.setdefault(f"https://{host}:{port}", {"idle": 0, "h2": 0})["h2"] += 1
         return stats
 
+    def _tmo(self) -> Timeout:
+        """Etkin zaman aşımı: istek düzeyi ``timeout=`` varsa o, yoksa oturumunki."""
+        return _api.effective_timeout(self, self.timeout)
+
     def use(self, plugin: Plugin) -> "AsyncSession":
-        """Plugin ekle. Zincir çağrı destekli: session.use(p1).use(p2)"""
+        """Plugin ekle (``Session.use`` ile aynı arayüz; kancalar düz fonksiyon ya da coroutine).
+
+        Zincir çağrı destekli: ``session.use(p1).use(p2)``.
+        """
         self._plugins.append(plugin)
         return self
 
     async def _run_request_hooks(self, req: dict) -> dict:
         for plugin in self._plugins:
-            req = await plugin.on_request(req)
+            req = await call_async(plugin, "on_request", req)
         return req
 
     async def _run_response_hooks(self, resp: Response) -> Response:
         for plugin in self._plugins:
-            resp = await plugin.on_response(resp)
+            resp = await call_async(plugin, "on_response", resp)
         return resp
-
-                                                                               
 
     def set_proxies(self, proxies: list[str], strategy: str = "round_robin") -> "AsyncSession":
         """Proxy listesini ayarla ve rotasyonu etkinleştir.
@@ -392,9 +500,9 @@ class AsyncSession:
                 logger.debug("Ön ısıtma başarısız %s: %s", host, e)
                 return host, False
             o = _Opened(reader, writer, alpn, lambda: None, key=self._h1_key(u, proxy_cfg),
-                        loop=asyncio.get_running_loop())
+                        loop=B.current_token())
             try:
-                key = (u.host, u.port, proxy_cfg)
+                key = self._origin_key(u, proxy_cfg)
                 if alpn == "h2":
                     if self._h2_get(key) is None:
                         await self._start_h2(key, o)
@@ -410,9 +518,13 @@ class AsyncSession:
                 return host, False
 
         tasks = [_warm_one(h) for h in hosts for _ in range(count)]
-        for coro in asyncio.as_completed(tasks):
-            host, ok = await coro
-            results[host] = results.get(host, 0) + (1 if ok else 0)
+        if B.current_backend() == "asyncio":
+            for coro in asyncio.as_completed(tasks):
+                host, ok = await coro
+                results[host] = results.get(host, 0) + (1 if ok else 0)
+        else:
+            for host, ok in await B.gather(*tasks):
+                results[host] = results.get(host, 0) + (1 if ok else 0)
 
         return results
 
@@ -438,42 +550,48 @@ class AsyncSession:
         kurulur. impersonate=None: stdlib ssl, yalnızca http/1.1.
         ``tls=False``: düz TCP (``ws://``), yine proxy tüneli üzerinden olabilir.
         """
-        connect_to = self.timeout.connect
+        connect_to = self._tmo().connect
         sni = host
         if proxy is None and self.resolver is not None:
-            host = await asyncio.wait_for(self._resolve(host), connect_to)   # DoH: TCP IP'ye, TLS/SNI özgün ada
+            host = await B.wait_for(self._resolve(host), connect_to)   # DoH: TCP IP'ye, TLS/SNI özgün ada
+
+        progress: dict = {}
 
         async def _go():
             if not tls:
                 if proxy is None:
-                    reader, writer = await asyncio.open_connection(host, port)
+                    reader, writer = await B.open_connection(host, port)
                 else:
                     reader, writer = await async_connect_via_proxy(
-                        proxy, host, port, timeout=connect_to)
+                        proxy, host, port, timeout=connect_to, progress=progress)
                 return reader, writer, ""
             if self.impersonate is not None:
                 kw = {"alpn": list(alpn)} if alpn is not None else {}
+                if self.legacy_tls:
+                    kw["legacy_tls"] = True
                 if proxy is None:
                     stream = await AsyncTLSStream.connect(
                         host, port, self.impersonate, server_hostname=sni,
-                        ca_path=self._ca_path, **kw)
+                        ca_path=self._ca_path, client_cert=self.client_cert, **kw)
                 else:
-                    reader, writer = await async_connect_via_proxy(proxy, host, port, timeout=connect_to)
+                    reader, writer = await async_connect_via_proxy(proxy, host, port, timeout=connect_to, progress=progress)
                     try:
                         stream = await AsyncTLSStream.negotiate(
                             reader, writer, sni, self.impersonate, ca_path=self._ca_path,
-                            port=port, **kw)   # bilet anahtarı: proxy'nin değil hedefin portu
+                            port=port, client_cert=self.client_cert, **kw)   # bilet anahtarı: proxy'nin değil hedefin portu
                     except BaseException:
                         writer.close()
                         raise
+                from .security.tls12_legacy import tls_info as _tls_info
+                self._tls_infos[(sni, port, proxy)] = _tls_info(stream.conn.crypto_state())
                 return stream, stream, stream.conn.alpn
             ctx = ssl.create_default_context(cafile=self._ca_path)
             ctx.set_alpn_protocols(["http/1.1"])
             if proxy is None:
-                reader, writer = await asyncio.open_connection(
+                reader, writer = await B.open_connection(
                     host, port, ssl=ctx, server_hostname=sni)
             else:
-                reader, writer = await async_connect_via_proxy(proxy, host, port, timeout=connect_to)
+                reader, writer = await async_connect_via_proxy(proxy, host, port, timeout=connect_to, progress=progress)
                 try:
                     if hasattr(writer, "start_tls"):   # Python 3.11+
                         await writer.start_tls(ctx, server_hostname=sni)
@@ -484,13 +602,20 @@ class AsyncSession:
                     raise
             return reader, writer, "http/1.1"
 
-        return await asyncio.wait_for(_go(), connect_to)
+        try:
+            return await B.wait_for(_go(), connect_to)
+        except asyncio.TimeoutError as e:
+            if proxy is not None and not progress.get("proxy_tcp"):
+                # Süre proxy'ye TCP bağlanırken doldu (iç zamanlayıcıyla yarışı dıştaki kazandı):
+                # senkron yol ve async_connect_via_proxy ile aynı anlam -> ProxyError.
+                raise ProxyError(f"Proxy'ye bağlanılamadı ({proxy.host}:{proxy.port}): "
+                                 f"zaman aşımı") from e
+            raise
 
     async def _resolve(self, host: str) -> str:
         """DoH çözücüyle (senkron, thread'de) IP'ye çevirir; hata olursa özgün ad."""
         try:
-            ip = await asyncio.get_running_loop().run_in_executor(
-                None, self.resolver.resolve_one, host)
+            ip = await B.run_in_thread(self.resolver.resolve_one, host)
         except Exception as e:
             logger.debug("DoH çözümlemesi başarısız (%s), OS çözücüsüne dönülüyor: %s", host, e)
             return host
@@ -510,7 +635,8 @@ class AsyncSession:
         return release
 
     def _h1_key(self, u: URL, proxy: Optional[ProxyConfig]) -> tuple:
-        return (u.host, u.port, proxy, self.impersonate is not None)
+        k = (u.host, u.port, proxy, self.impersonate is not None)
+        return k + (self.client_cert.identity,) if self.client_cert is not None else k
 
     @staticmethod
     def _conn_dead(o: "_Opened") -> bool:
@@ -537,7 +663,7 @@ class AsyncSession:
 
     def _idle_purge(self) -> None:
         """Süresi dolan boşta bağlantıları kapatır."""
-        now = time.monotonic()
+        now = time.perf_counter()
         for key in list(self._idle):
             keep = []
             for o in self._idle[key]:
@@ -556,9 +682,8 @@ class AsyncSession:
     def _idle_pop(self, key: tuple) -> "Optional[_Opened]":
         self._idle_purge()
         lst = self._idle.get(key)
-        try:
-            loop = asyncio.get_running_loop()
-        except RuntimeError:
+        loop = B.current_token()
+        if loop is None:
             return None
         while lst:
             o = lst.pop()               # en son kullanılan (LIFO) en taze olandır
@@ -574,10 +699,10 @@ class AsyncSession:
         """Havuz slotu alır; boşta uygun HTTP/1.1 bağlantısı varsa onu, yoksa yenisini
         açar. Slot ``release()`` ile geri verilir."""
         try:
-            await asyncio.wait_for(self._sem.acquire(), self.timeout.pool)
+            await B.wait_for(self._sem.acquire(), self._tmo().pool)
         except asyncio.TimeoutError:
             raise asyncio.TimeoutError(
-                f"Bağlantı havuzu {self.timeout.pool} sn içinde boşalmadı "
+                f"Bağlantı havuzu {self._tmo().pool} sn içinde boşalmadı "
                 f"(max_connections={self.limits.max_connections}).") from None
         release = self._slot_releaser()
         key = self._h1_key(u, proxy)
@@ -589,26 +714,26 @@ class AsyncSession:
                     o.release, o.reused = release, True
                     if metrics:
                         metrics.connection_reused = True
-                        metrics.connect_start = metrics.connect_end = time.monotonic()
+                        metrics.connect_start = metrics.connect_end = time.perf_counter()
                     return o
             if metrics:
-                metrics.connect_start = time.monotonic()
+                metrics.connect_start = time.perf_counter()
             reader, writer, alpn = await self._connect(u.host, u.port, proxy)
         except BaseException:
             release()
             raise
         if metrics:
-            metrics.connect_end = time.monotonic()
-            metrics.tls_end     = time.monotonic()
+            metrics.connect_end = time.perf_counter()
+            metrics.tls_end     = time.perf_counter()
         return _Opened(reader, writer, alpn, release, key=key,
-                       loop=asyncio.get_running_loop())
+                       loop=B.current_token())
 
     async def _h1_finish(self, o: "_Opened", reusable: bool) -> None:
         """İstek bitti: bağlantıyı havuza koyar ya da kapatır; slot HER durumda geri verilir."""
         try:
             if reusable:
                 self._idle_purge()
-                o.last_used = time.monotonic()
+                o.last_used = time.perf_counter()
                 cap = self.limits.max_keepalive_connections
                 if cap is None:
                     cap = self.limits.max_connections
@@ -630,20 +755,17 @@ class AsyncSession:
         if conn is None:
             return None
         drop = False
-        try:
-            loop_ok = conn.loop is asyncio.get_running_loop()
-        except RuntimeError:
-            loop_ok = False
+        loop_ok = conn.loop is not None and conn.loop is B.current_token()
         expiry = self.limits.keepalive_expiry
         if not loop_ok or not conn.usable:
             drop = True
         elif expiry is not None and conn.active_streams == 0 \
-                and time.monotonic() - conn.last_used > expiry:
+                and time.perf_counter() - conn.last_used > expiry:
             drop = True
         if drop:
             del self._h2[key]
             if loop_ok and not conn.closed:
-                task = asyncio.ensure_future(conn.close())
+                task = B.spawn(conn.close())
                 self._bg_tasks.add(task)
                 task.add_done_callback(self._bg_tasks.discard)
             return None
@@ -652,11 +774,11 @@ class AsyncSession:
     async def _start_h2(self, key: tuple, opened: "_Opened") -> AsyncHttp2Connection:
         stream = opened.writer          # AsyncTLSStream: read/write/drain/close/wait_closed
         conn = AsyncHttp2Connection(
-            stream, read_timeout=self.timeout.read, write_timeout=self.timeout.write,
+            stream, read_timeout=self._tmo().read, write_timeout=self._tmo().write,
             on_close=opened.release, profile=self.impersonate,
         )
         try:
-            await asyncio.wait_for(conn.start(), self.timeout.connect)
+            await B.wait_for(conn.start(), self._tmo().connect)
         except BaseException:
             await conn.close()
             opened.release()
@@ -665,23 +787,39 @@ class AsyncSession:
         return conn
 
     async def _exchange(self, method: str, u: URL, proxy: Optional[ProxyConfig],
-                        req_headers: dict, raw_body: bytes, metrics):
+                        req_headers: dict, raw_body: bytes, metrics, stream: bool = False):
         """Bağlantıyı bulur/kurar ve isteği h2 veya HTTP/1.1 ile yapar.
 
         ``(status, Headers, body_raw, send_time, http_version)`` döner.
         """
-        key = (u.host, u.port, proxy)
+        if self._h3 is not None:
+            if proxy is not None or self._rotator is not None:
+                if self._h3.state.force:
+                    raise ConnectionError("http3='force' bir HTTP proxy ile kullanılamaz (UDP).")
+            else:
+                t = self.timeout
+                r3 = await self._h3.exchange(
+                    u.host, u.port, method, u.raw_path.decode("latin-1"),
+                    [(k.lower(), str(v)) for k, v in req_headers.items()
+                     if k.lower() not in self._H2_SKIP],
+                    raw_body, t.total if t.total is not None else t.read_timeout)
+                if r3 is not None:
+                    if metrics:
+                        metrics.bytes_sent = len(raw_body)
+                        metrics.first_byte_time = time.perf_counter()
+                    return r3[0], r3[1], r3[2], time.perf_counter(), "HTTP/3"
+        key = self._origin_key(u, proxy)
         for attempt in (0, 1):
             conn = self._h2_get(key)
             opened = None
             if conn is not None:
                 if metrics:
                     metrics.connection_reused = True
-                    metrics.connect_start = metrics.connect_end = time.monotonic()
+                    metrics.connect_start = metrics.connect_end = time.perf_counter()
             elif self.impersonate is not None and self._origin_proto.get(key) != "h1":
                 # Protokol henüz bilinmiyor: aynı kaynağa eşzamanlı gelen isteklerin
                 # tek bir h2 bağlantısını paylaşabilmesi için ilk el sıkışma serileşir.
-                async with self._origin_locks.setdefault(key, asyncio.Lock()):
+                async with self._origin_locks.setdefault(key, B.Lock()):
                     conn = self._h2_get(key)
                     if conn is None:
                         opened = await self._open(u, proxy, metrics)
@@ -695,14 +833,16 @@ class AsyncSession:
 
             if conn is not None:
                 try:
-                    return await self._h2_exchange(conn, method, u, req_headers, raw_body, metrics)
+                    return await self._h2_exchange(conn, method, u, req_headers, raw_body, metrics,
+                                                   stream=stream)
                 except H2StreamRefused as e:
                     if attempt == 0:
                         logger.debug("h2 stream işlenmedi, yeni bağlantıda yeniden: %s", e)
                         continue
                     raise ConnectionError(f"HTTP/2 isteği başarısız: {e}") from e
             try:
-                return await self._h1_exchange(opened, method, u, req_headers, raw_body, metrics)
+                return await self._h1_exchange(opened, method, u, req_headers, raw_body, metrics,
+                                               stream=stream)
             except _StaleConn as st:
                 # Havuzdaki bağlantı sunucu tarafında kapanmıştı ve yanıttan HİÇ bayt
                 # gelmedi: bir kez, taze bağlantıyla yeniden dene (zaman aşımı hariç).
@@ -712,7 +852,8 @@ class AsyncSession:
                     opened.release()
                     opened.writer.close()
                     raise ConnectionError("Beklenmeyen ALPN h2 (kaynak h1 olarak biliniyordu).") from st
-                return await self._h1_exchange(opened, method, u, req_headers, raw_body, metrics)
+                return await self._h1_exchange(opened, method, u, req_headers, raw_body, metrics,
+                                               stream=stream)
         raise ConnectionError("Tüm bağlantı denemeleri başarısız oldu.")  # pragma: no cover
 
     # RFC 7540 §8.1.2.2: bağlantıya özgü başlıklar h2'de yasaktır; Host -> :authority.
@@ -720,15 +861,24 @@ class AsyncSession:
                           "transfer-encoding", "upgrade"})
 
     async def _h2_exchange(self, conn: AsyncHttp2Connection, method: str, u: URL,
-                           req_headers: dict, raw_body: bytes, metrics):
+                           req_headers: dict, raw_body: bytes, metrics, stream: bool = False):
         h2_headers = [(k.lower(), str(v)) for k, v in req_headers.items()
                       if k.lower() not in self._H2_SKIP]
         host = f"[{u.host}]" if ":" in u.host else u.host
         authority = host if u.port == 443 else f"{host}:{u.port}"
         if metrics:
             metrics.bytes_sent = len(raw_body) + sum(len(k) + len(v) for k, v in h2_headers)
-        send_time = time.monotonic()
+        send_time = time.perf_counter()
         try:
+            if stream:
+                h = await conn.request_stream(method, authority, u.raw_path.decode("latin-1"),
+                                              h2_headers, raw_body)
+                if metrics:
+                    metrics.first_byte_time = h.first_byte_time or time.perf_counter()
+                headers = Headers()
+                for k, v in h.headers:
+                    headers.add(k, v)
+                return h.status, headers, _AsyncH2Stream(h), send_time, "HTTP/2"
             r = await conn.request(method, authority, u.raw_path.decode("latin-1"),
                                    h2_headers, raw_body)
         except H2StreamRefused:
@@ -736,7 +886,7 @@ class AsyncSession:
         except (Http2StreamError, Http2ConnectionError) as e:
             raise ConnectionError(f"HTTP/2 isteği başarısız: {e}") from e
         if metrics:
-            metrics.first_byte_time = r.first_byte_time or time.monotonic()
+            metrics.first_byte_time = r.first_byte_time or time.perf_counter()
         headers = Headers()
         for k, v in r.headers:
             headers.add(k, v)
@@ -761,82 +911,115 @@ class AsyncSession:
         Eksik gövde ConnectionResetError'dır. ``artakalan_bayt`` > 0 ise bağlantıda
         yanıta ait olmayan veri var demektir (bağlantı yeniden kullanılmamalı).
         """
+        state = _BodyState()
+        parts = [c async for c in AsyncSession._h1_iter_body(
+            reader, method, status, headers, first, read_to, state)]
+        return b"".join(parts), state.extra
+
+    @staticmethod
+    async def _h1_iter_body(reader, method: str, status: int, headers: Headers,
+                            first: bytes, read_to: Optional[float], state: "_BodyState",
+                            stream: bool = False):
+        """HTTP/1.1 gövdesini PARÇA PARÇA üretir (boş parça yok); sonunda
+        ``state.extra`` artakalan bayt sayısıdır. ``stream=False`` iken
+        bağlantı-kapanışlı (eof) gövdede 2 sn sessizlik gövdenin sonu sayılır
+        (eski HTTP/1.0 davranışı); akışta okuma zaman aşımı hata olur."""
         async def more() -> bytes:
-            return await asyncio.wait_for(reader.read(4096), timeout=read_to)
+            return await B.wait_for(reader.read(65536), timeout=read_to)
 
         framing = AsyncSession._h1_framing(method, status, headers)
         if framing == "none":
-            return b"", len(first)      # gövde YOK: bağlantıdan veri beklenmez
+            state.extra = len(first)    # gövde YOK: bağlantıdan veri beklenmez
+            return
 
         buf = bytearray(first)
         if framing == "chunked":
-            out = bytearray()
-            pos = 0
-            while True:
-                nl = buf.find(b"\r\n", pos)
+            async def need_line() -> int:
+                nl = buf.find(b"\r\n")
                 while nl == -1:
                     c = await more()
                     if not c:
                         raise ConnectionResetError("Chunked gövde yarıda kesildi.")
                     buf.extend(c)
-                    nl = buf.find(b"\r\n", pos)
+                    nl = buf.find(b"\r\n")
+                return nl
+
+            while True:
+                nl = await need_line()
                 try:
-                    sz = int(bytes(buf[pos:nl]).split(b";")[0].strip(), 16)
+                    sz = int(bytes(buf[:nl]).split(b";")[0].strip(), 16)
                 except ValueError:
                     raise ConnectionError("Geçersiz chunk boyutu.") from None
-                pos = nl + 2
+                del buf[:nl + 2]
                 if sz == 0:
                     # trailer'lar (varsa) boş satıra kadar tüketilir: bağlantı temiz kalsın
                     while True:
-                        nl = buf.find(b"\r\n", pos)
-                        while nl == -1:
-                            c = await more()
-                            if not c:
-                                raise ConnectionResetError("Chunked gövde yarıda kesildi.")
-                            buf.extend(c)
-                            nl = buf.find(b"\r\n", pos)
-                        empty = nl == pos
-                        pos = nl + 2
+                        nl = await need_line()
+                        empty = nl == 0
+                        del buf[:nl + 2]
                         if empty:
-                            return bytes(out), len(buf) - pos
-                while len(buf) < pos + sz + 2:
+                            state.extra = len(buf)
+                            return
+                remaining = sz
+                while remaining > 0:
+                    if not buf:
+                        c = await more()
+                        if not c:
+                            raise ConnectionResetError("Chunked gövde yarıda kesildi.")
+                        buf.extend(c)
+                    take = min(remaining, len(buf))
+                    yield bytes(buf[:take])
+                    del buf[:take]
+                    remaining -= take
+                while len(buf) < 2:         # chunk sonu CRLF
                     c = await more()
                     if not c:
                         raise ConnectionResetError("Chunked gövde yarıda kesildi.")
                     buf.extend(c)
-                out.extend(buf[pos:pos + sz])
-                pos += sz + 2
-                if pos > 65536:             # işlenmiş kısmı at
-                    del buf[:pos]
-                    pos = 0
+                del buf[:2]
 
         if framing == "length":
             n = int(headers.get("content-length", "").strip())
-            while len(buf) < n:
+            got = 0
+            while True:
+                if buf:
+                    piece = bytes(buf[:n - got])
+                    got += len(piece)
+                    if len(buf) > len(piece):
+                        state.extra = len(buf) - len(piece)
+                    buf.clear()
+                    if piece:
+                        yield piece
+                if got >= n:
+                    return
                 c = await more()
                 if not c:
-                    raise ConnectionResetError(
-                        f"Yanıt gövdesi eksik: {len(buf)}/{n} bayt alındı.")
+                    raise ConnectionResetError(f"Yanıt gövdesi eksik: {got}/{n} bayt alındı.")
                 buf.extend(c)
-            return bytes(buf[:n]), len(buf) - n
 
+        if buf:
+            yield bytes(buf)
         while True:                          # bağlantı kapanana kadar (HTTP/1.0)
             try:
-                c = await asyncio.wait_for(reader.read(4096), timeout=2.0)
-            except (ConnectionResetError, asyncio.TimeoutError):
-                break
+                c = await B.wait_for(reader.read(65536),
+                                           timeout=read_to if stream else 2.0)
+            except ConnectionResetError:
+                return
+            except asyncio.TimeoutError:
+                if stream:
+                    raise
+                return
             if not c:
-                break
-            buf.extend(c)
-        return bytes(buf), 0
+                return
+            yield c
 
     async def _h1_exchange(self, opened: "_Opened", method: str, u: URL,
-                           req_headers: dict, raw_body: bytes, metrics):
+                           req_headers: dict, raw_body: bytes, metrics, stream: bool = False):
         """Bağlantıda tek HTTP/1.1 isteği. Bağlantı yeniden kullanılabilirse havuza
         döner; aksi halde (Connection: close, HTTP/1.0, eof çerçeveli gövde, hata,
         iptal) kapatılır. Slot her durumda serbest bırakılır."""
         reader, writer = opened.reader, opened.writer
-        read_to = self.timeout.read
+        read_to = self._tmo().read
         reusable = False
         finished = False
         got_bytes = False        # yanıttan en az 1 bayt geldi mi (yeniden deneme güvenliği)
@@ -851,17 +1034,17 @@ class AsyncSession:
                 metrics.bytes_sent = len(raw_request)
 
             writer.write(raw_request)
-            await asyncio.wait_for(writer.drain(), self.timeout.write)
-            send_time = time.monotonic()
+            await B.wait_for(writer.drain(), self._tmo().write)
+            send_time = time.perf_counter()
 
             hdr_acc = bytearray()
             sep     = -1
             while True:
-                chunk = await asyncio.wait_for(reader.read(4096), timeout=read_to)
+                chunk = await B.wait_for(reader.read(4096), timeout=read_to)
                 if not chunk: break
                 got_bytes = True
                 if len(hdr_acc) == 0 and metrics:
-                    metrics.first_byte_time = time.monotonic()
+                    metrics.first_byte_time = time.perf_counter()
                 search_from = max(0, len(hdr_acc) - 3)
                 hdr_acc += chunk
                 sep = hdr_acc.find(b"\r\n\r\n", search_from)
@@ -886,6 +1069,25 @@ class AsyncSession:
                 if b":" not in line: continue
                 k, _, v = line.partition(b":")
                 resp_headers._list.append((k.strip(), k.strip().lower(), v.strip()))
+
+            framing = self._h1_framing(method, status_code, resp_headers)
+            streamable = stream and framing != "none" and not (
+                framing == "length" and int(resp_headers.get("content-length", "0").strip()) == 0)
+            if streamable:
+                conn_tokens = {t.strip() for t in resp_headers.get("connection", "").lower().split(",")}
+                http10 = lines[0].upper().startswith(b"HTTP/1.0")
+                req_close = any(k.lower() == "connection" and "close" in str(v).lower()
+                                for k, v in req_headers.items())
+                reusable = (
+                    status_code != 101 and not req_close and "close" not in conn_tokens
+                    and (not http10 or "keep-alive" in conn_tokens) and framing != "eof")
+                state = _BodyState()
+                agen = self._h1_iter_body(reader, method, status_code, resp_headers,
+                                          first_body_chunk, read_to, state, stream=True)
+                finished = True          # bağlantıyı akış yönetir
+                return (status_code, resp_headers,
+                        _AsyncH1Stream(self, opened, agen, state, reusable),
+                        send_time, "HTTP/1.1")
 
             body_raw, extra = await self._h1_read_body(
                 reader, method, status_code, resp_headers, first_body_chunk, read_to)
@@ -921,8 +1123,10 @@ class AsyncSession:
         headers: Optional[dict]  = None,
         body:    bytes           = b"",
         metrics: Optional[RequestMetrics] = None,
+        stream:  bool            = False,
     ) -> Response:
-        """Tek async HTTP isteği (ALPN'e göre HTTP/2 veya HTTP/1.1)."""
+        """Tek async HTTP isteği (ALPN'e göre HTTP/2 veya HTTP/1.1).
+        ``stream=True``: gövde okunmadan döner (``aiter_*``/``aread``/``aclose``)."""
         u = URL(url) if isinstance(url, str) else url
 
         proxy_cfg, proxy = self._select_proxy(u)
@@ -954,27 +1158,35 @@ class AsyncSession:
             req_headers["Content-Length"] = str(len(raw_body))
 
         if metrics:
-            metrics.request_start = time.monotonic()
+            metrics.request_start = time.perf_counter()
 
         try:
             status_code, resp_headers, body_raw, send_time, http_version = await self._exchange(
-                method, u, proxy_cfg, req_headers, raw_body, metrics)
+                method, u, proxy_cfg, req_headers, raw_body, metrics, stream=stream)
 
+            is_stream = not isinstance(body_raw, (bytes, bytearray))
             if metrics:
-                metrics.transfer_end   = time.monotonic()
-                metrics.bytes_received = len(body_raw)
-                metrics.total_end      = time.monotonic()
+                metrics.transfer_end   = time.perf_counter()
+                metrics.bytes_received = 0 if is_stream else len(body_raw)
+                metrics.total_end      = time.perf_counter()
 
-            ce  = resp_headers.get("content-encoding", "").lower()
-            body_final = HTTP1Parser._decompress(bytes(body_raw), ce)
+            if is_stream:
+                body_final = b""
+            else:
+                ce  = resp_headers.get("content-encoding", "").lower()
+                body_final = HTTP1Parser._decompress(bytes(body_raw), ce)
 
             self._update_cookies(resp_headers, u)
 
-            resp = Response(status_code=status_code, headers=resp_headers, body=body_final)
+            if is_stream:
+                resp = Response(status_code=status_code, headers=resp_headers, astream=body_raw)
+            else:
+                resp = Response(status_code=status_code, headers=resp_headers, body=body_final)
             resp.http_version = http_version
+            resp.tls_info = self._tls_infos.get((u.host, u.port, proxy_cfg))
             resp.url = str(url)
             if metrics and metrics.request_start:
-                resp.elapsed = time.monotonic() - metrics.request_start
+                resp.elapsed = time.perf_counter() - metrics.request_start
 
             if metrics:
                 resp.metrics = metrics
@@ -982,7 +1194,7 @@ class AsyncSession:
             if status_code == 304 and cache_entry:
                 resp = cache_entry.response
 
-            if self._cache and method.upper() == "GET":
+            if self._cache and method.upper() == "GET" and not is_stream:
                 self._cache.store(url, method, resp)
 
             if proxy and self._rotator and metrics and metrics.first_byte_time:
@@ -996,7 +1208,7 @@ class AsyncSession:
             if proxy and self._rotator:
                 self._rotator.mark_failed(proxy)
             for plugin in self._plugins:
-                e2 = await plugin.on_error(e)
+                e2 = await call_async(plugin, "on_error", e)
                 if e2 is None:
                     return Response(0, body=b"")
             raise
@@ -1004,25 +1216,37 @@ class AsyncSession:
                                                                                 
     # --- Faz 5 kancaları: transport + retry -------------------------------
 
-    async def _send(self, method, url, headers=None, body=b"", metrics=None) -> Response:
+    async def _send(self, method, url, headers=None, body=b"", metrics=None,
+                    stream: bool = False) -> Response:
         """Tek isteği transport'a (verilmişse) ya da ağa gönderir."""
         if self.transport is None:
-            return await self._raw_request(method, url, headers=headers, body=body,
-                                           metrics=metrics)
-        req_dict = await self._run_request_hooks(
-            {"method": method, "url": url, "headers": headers or {}, "body": body}
-        )
-        h = {k: v for k, v in dict(req_dict.get("headers") or {}).items() if v is not None}
-        cookie_header = self._cookie_header(URL(req_dict["url"]))
-        if cookie_header and not any(k.lower() == "cookie" for k in h):
-            h["Cookie"] = cookie_header
-        req = Request(method=req_dict["method"], url=req_dict["url"], headers=h,
-                      data=req_dict.get("body") or None)
-        if "host" not in req.headers:
-            req.headers["Host"] = req.url.host
-        resp = await self.transport.handle_async_request(req)
-        self._update_cookies(resp.headers, req.url)
-        return await self._run_response_hooks(resp)
+            resp = await self._raw_request(method, url, headers=headers, body=body,
+                                           metrics=metrics, stream=stream)
+            if self._h3 is not None:
+                u = URL(str(url))
+                self._h3.state.observe(u.host, u.port, resp.headers)    # Alt-Svc keşfi
+            return resp
+        try:
+            req_dict = await self._run_request_hooks(
+                {"method": method, "url": url, "headers": headers or {}, "body": body}
+            )
+            h = {k: v for k, v in dict(req_dict.get("headers") or {}).items() if v is not None}
+            cookie_header = self._cookie_header(URL(req_dict["url"]))
+            if cookie_header and not any(k.lower() == "cookie" for k in h):
+                h["Cookie"] = cookie_header
+            req = Request(method=req_dict["method"], url=req_dict["url"], headers=h,
+                          data=req_dict.get("body") or None)
+            if "host" not in req.headers:
+                req.headers["Host"] = req.url.host
+            req.timeout = self._tmo()
+            resp = await self.transport.handle_async_request(req)
+            self._update_cookies(resp.headers, req.url)
+            return await self._run_response_hooks(resp)
+        except Exception as e:
+            for plugin in self._plugins:
+                if await call_async(plugin, "on_error", e) is None:
+                    return Response(0, body=b"")
+            raise
 
     async def _send_with_retries(self, method, url, **kwargs) -> Response:
         """``self.retries`` politikasına göre ``_send``'i tekrarlar."""
@@ -1041,104 +1265,187 @@ class AsyncSession:
                     return resp
                 attempt += 1
                 delay = retry.get_delay(attempt, resp)
+                await resp.aclose()      # akış yanıtıysa bağlantıyı bırak
             logger.debug("%d. yeniden deneme %.2fs sonra", attempt, delay)
             if delay:
-                await asyncio.sleep(delay)
+                await B.sleep(delay)
+
+    # --- kimlik / hook / hop ------------------------------------------------
+
+    def _auth_for(self, auth, url_creds, host: str):
+        """(Auth | None, kaynak): istek > oturum > .netrc (trust_env) > URL'deki user:pass@."""
+        chosen = self.auth if auth is USE_CLIENT_DEFAULT else auth
+        if chosen is not None:
+            return resolve_auth(chosen), "explicit"
+        if self.trust_env:
+            creds = netrc_credentials(host)
+            if creds:
+                return BasicAuth(*creds), "netrc"
+        if url_creds:
+            return BasicAuth(*url_creds), "url"
+        return None, None
+
+    async def _call_hooks(self, event: str, arg, req_hooks=None, **kw):
+        """Hook'ları çalıştırır. Yanıtta requests hook'u ``None`` dışı dönerse yanıt değişir."""
+        if event == "request":
+            for fn in _api.hook_list(self.event_hooks, "request"):
+                await _maybe(fn(arg))
+            return arg
+        for fn in _api.hook_list(self.event_hooks, "response"):
+            await _maybe(fn(arg))
+        for fn in _api.hook_list(self.hooks, "response") + _api.hook_list(req_hooks, "response"):
+            out = await _maybe(fn(arg, **kw))
+            if out is not None:
+                arg = out
+        return arg
+
+    async def _hop(self, auth, method, url, headers, body, metrics, req_hooks, hkw, stream=False):
+        """Tek yönlendirme adımı: auth akışı (401 yeniden denemesi dahil) + hook'lar.
+
+        Döner: (son yanıt, ara yanıtlar). Ara yanıtlar (ör. 401 challenge) ``history``'ye girer.
+        """
+        has_req_hooks = bool(_api.hook_list(self.event_hooks, "request"))
+        extras: list[Response] = []
+        if auth is None and not has_req_hooks:
+            resp = await self._send_with_retries(method, url, headers=headers, body=body, metrics=metrics,
+                                                 stream=stream)
+            return await self._call_hooks("response", resp, req_hooks, **hkw), extras
+        removed = [k for k, v in headers.items() if v is None]
+        base = Request(method, url, data=body or None,
+                       headers={k: v for k, v in headers.items() if v is not None})
+        flow = auth.auth_flow(base) if auth is not None else None
+        req = next(flow) if flow is not None else base
+        while True:
+            await self._call_hooks("request", req)
+            h = {k.decode("latin-1"): v.decode("latin-1") for k, v in req.headers.raw
+                 if k.lower() != b"content-length"}
+            lower = {x.lower() for x in h}
+            h.update({k: None for k in removed if k.lower() not in lower})
+            target = url if req.url is base.url else str(req.url)
+            resp = await self._send_with_retries(req.method, target, headers=h,
+                                           body=req.body or b"", metrics=metrics, stream=stream)
+            resp = await self._call_hooks("response", resp, req_hooks, **hkw)
+            if flow is None:
+                return resp, extras
+            try:
+                req = flow.send(resp)
+            except StopIteration:
+                return resp, extras
+            if stream:
+                await _discard_stream(resp)     # 401 ara yanıtı: bağlantı havuza dönsün
+            extras.append(resp)
 
     async def request(
         self,
         method:          str,
         url:             "str | URL",
-        data:            Any  = None,
-        json:            Any  = None,
-        headers:         Optional[dict] = None,
-        files:           Optional[dict] = None,
+        data             = None,
+        json             = None,
+        headers          = None,
+        files            = None,
         allow_redirects: bool = True,
+        params           = None,
+        cookies          = None,
+        auth             = USE_CLIENT_DEFAULT,
+        timeout          = USE_CLIENT_DEFAULT,
+        hooks            = None,
+        stream:          bool = False,
     ) -> Response:
-        import json as jsonlib
+        """HTTP isteği. ``stream=True``: gövde OKUNMADAN döner; ``async for c in
+        r.aiter_bytes()``, ``await r.aread()`` ile okunur, ``await r.aclose()`` (ya da
+        ``async with``) ile bırakılır. requests/httpx uyumlu ek parametreler:
 
-        url = str(url)
-        body    = b""
-        h       = self._merged_headers(headers)
-
-        if files is not None:
-            body, ct = encode_multipart(
-                fields=data if isinstance(data, dict) else None, files=files)
-            h.setdefault("Content-Type", ct)
-        elif json is not None:
-            body = jsonlib.dumps(json).encode("utf-8")
-            h.setdefault("Content-Type", "application/json")
-        elif isinstance(data, dict):
-            from urllib.parse import urlencode
-            body = urlencode(data).encode("ascii")
-            h.setdefault("Content-Type", "application/x-www-form-urlencoded")
-        elif isinstance(data, str):
-            body = data.encode("utf-8")
-        elif isinstance(data, (bytes, bytearray)):
-            body = bytes(data)
-
-        metrics       = RequestMetrics(request_start=time.monotonic())
-        current_url   = url
-        redirect_cnt  = 0
-        history       = []
-
+        ``params`` (dict/liste/str; URL'deki sorguya eklenir), ``cookies`` (yalnızca bu
+        istek için; yönlendirmede başka origin'e gitmez), ``auth`` (oturumunkini ezer;
+        ``None`` oturum auth'unu kapatır), ``timeout`` (float, ``(connect, read)`` ya da
+        :class:`Timeout`; ``None`` sınırsız), ``hooks`` (``{"response": [fn]}``).
+        """
+        url, url_creds = _api.split_userinfo(url)
+        url = _api.apply_params(url, self.params, params)
+        current_url    = url
+        redirect_count = 0
+        history: list[Response] = []
+        metrics = RequestMetrics(request_start=time.perf_counter())
+        headers = self._merged_headers(headers)
+        body = _api.encode_body(data, json, files, headers)
+        req_hooks = _api.normalize_hooks(hooks)
+        req_cookies = _api.parse_cookie_arg(cookies)
+        tmo = _api.resolve_timeout(timeout, self.timeout)
+        token = _api.set_timeout_override(self, tmo)
+        hkw = _api.hook_kwargs(self, tmo or self.timeout)
+        first_origin = URL(current_url).origin
         retry_plugins = [p for p in self._plugins if isinstance(p, RetryPlugin)]
-
-        while True:
-            attempt = 0
+        try:
             while True:
-                resp = await self._send_with_retries(
-                    method, current_url, headers=h, body=body, metrics=metrics
-                )
-                retrying = False
-                for plugin in retry_plugins:
-                    if plugin.should_retry(resp, attempt):
-                        delay = plugin.delay_for(resp, attempt)
-                        logger.debug("HTTP %s alındı, %.2fs sonra tekrar denenecek",
-                                     resp.status_code, delay)
-                        if delay:
-                            await asyncio.sleep(delay)
-                        retrying = True
+                cur = URL(current_url)
+                same_origin = cur.origin == first_origin
+                hop_auth, _src = self._auth_for(
+                    auth if same_origin else None, url_creds if same_origin else None, cur.host)
+                if not same_origin and _src == "explicit":
+                    hop_auth = None
+                hop_headers = dict(headers)
+                if same_origin and req_cookies and not _api._has(hop_headers, "cookie"):
+                    jar = self.cookie_jar.header_for(
+                        host=cur.host, path=cur.path, secure=(cur.scheme == "https"))
+                    hop_headers["Cookie"] = _api.merge_cookie_header(jar, req_cookies)
+                attempt = 0
+                while True:
+                    resp, extras = await self._hop(hop_auth, method, current_url, hop_headers,
+                                             body, metrics, req_hooks, hkw, stream=stream)
+                    delay = None
+                    for plugin in retry_plugins:
+                        if plugin.should_retry(resp, attempt):
+                            delay = plugin.delay_for(resp, attempt)
+                            break
+                    if delay is None:
                         break
-                if not retrying:
-                    break
-                attempt += 1
+                    await resp.aclose()      # tekrar denenecek yanıt (akışsa bağlantıyı bırak)
+                    if delay:
+                        await B.sleep(delay)
+                    attempt += 1
+                history.extend(extras)
+                if history:
+                    resp.history = list(history)
 
-            if history:
-                resp.history = list(history)
+                if not allow_redirects or resp.status_code not in (301, 302, 303, 307, 308):
+                    if not allow_redirects:
+                        resp.next = _api.next_request(resp, method, current_url, headers, body)
+                    return resp
 
-            if not allow_redirects or resp.status_code not in (301, 302, 303, 307, 308):
-                return resp
+                if redirect_count >= self.max_redirects:
+                    raise ConnectionError(f"Maksimum yönlendirme sayısına ulaşıldı ({self.max_redirects}).")
 
-            if redirect_cnt >= self.max_redirects:
-                raise ConnectionError("Max redirect aşıldı")
+                location = resp.headers.get("location", "")
+                if not location:
+                    return resp
 
-            location = resp.headers.get("location", "")
-            if not location:
-                return resp
+                history.append(resp)
+                metrics.redirect_count += 1
 
-            history.append(resp)
-            metrics.redirect_count += 1
+                if stream:
+                    await _discard_stream(resp)
+                base = URL(current_url) if isinstance(current_url, str) else current_url
+                current_url = _resolve_location(base, location)
 
-            base = URL(current_url)
-            location = _resolve_location(base, location)
+                # Farklı bir origin'e gidiyorsak Authorization/Cookie TAŞINMAZ;
+                # aksi hâlde kimlik bilgisi üçüncü bir siteye sızar.
+                new_url = URL(current_url)
+                if (new_url.scheme, new_url.host, new_url.port) != base.origin and headers:
+                    headers = {
+                        k: v for k, v in dict(headers).items()
+                        if k.lower() not in ("authorization", "cookie", "proxy-authorization")
+                    }
 
-            new = URL(location)
-            if (new.scheme, new.host, new.port) != base.origin:
-                # Farklı origin'e giderken kimlik bilgisi taşınmaz
-                h = {k: v for k, v in h.items()
-                     if k.lower() not in ("authorization", "cookie", "proxy-authorization")}
+                if resp.status_code in (301, 302, 303):
+                    method = "GET"
+                    body   = b""
+                    headers = {k: v for k, v in headers.items()
+                               if k.lower() not in ("content-type", "content-length")}
 
-            current_url = location
-            if resp.status_code in (301, 302, 303):
-                method = "GET"
-                body = b""
-                h = {k: v for k, v in h.items()
-                     if k.lower() not in ("content-type", "content-length")}
-
-            redirect_cnt += 1
-
-                                                                                
+                redirect_count += 1
+                logger.debug("Yönlendirme (%s) -> %s", resp.status_code, current_url)
+        finally:
+            _api.reset_timeout_override(token)
 
     def _merged_headers(self, headers) -> dict:
         """Oturum başlıkları + istek başlıkları (istek kazanır; büyük/küçük harf
@@ -1154,36 +1461,59 @@ class AsyncSession:
                 merged[k] = v
         return merged
 
-    async def get(self, url, headers: Optional[dict] = None, allow_redirects: bool = True) -> Response:
-        return await self.request("GET", url, headers=headers, allow_redirects=allow_redirects)
+    def stream(self, method: str, url, **kwargs):
+        """httpx tarzı: ``async with s.stream("GET", url) as r:`` — çıkışta kapanır."""
+        return _AsyncStreamContext(self, method, url, kwargs)
 
-    async def post(self, url, data=None, json=None, headers: Optional[dict] = None,
-                   files=None, allow_redirects: bool = True) -> Response:
-        return await self.request("POST", url, data=data, json=json, headers=headers,
-                                  files=files, allow_redirects=allow_redirects)
+    async def get(self, url, headers=None, allow_redirects=True, params=None, cookies=None,
+                  auth=USE_CLIENT_DEFAULT, timeout=USE_CLIENT_DEFAULT, hooks=None, stream=False) -> Response:
+        return await self.request("GET", url, headers=headers, allow_redirects=allow_redirects,
+                                  params=params, cookies=cookies, auth=auth, timeout=timeout,
+                                  hooks=hooks, stream=stream)
 
-    async def put(self, url, data=None, json=None, headers: Optional[dict] = None,
-                  files=None, allow_redirects: bool = True) -> Response:
-        return await self.request("PUT", url, data=data, json=json, headers=headers,
-                                  files=files, allow_redirects=allow_redirects)
+    async def post(self, url, data=None, json=None, headers=None, files=None, allow_redirects=True,
+                   params=None, cookies=None, auth=USE_CLIENT_DEFAULT, timeout=USE_CLIENT_DEFAULT,
+                   hooks=None, stream=False) -> Response:
+        return await self.request("POST", url, data=data, json=json, headers=headers, files=files,
+                                  allow_redirects=allow_redirects, params=params, cookies=cookies,
+                                  auth=auth, timeout=timeout, hooks=hooks,
+                                  stream=stream)
 
-    async def patch(self, url, data=None, json=None, headers: Optional[dict] = None,
-                    allow_redirects: bool = True) -> Response:
+    async def put(self, url, data=None, json=None, headers=None, files=None, allow_redirects=True,
+                  params=None, cookies=None, auth=USE_CLIENT_DEFAULT, timeout=USE_CLIENT_DEFAULT,
+                  hooks=None, stream=False) -> Response:
+        return await self.request("PUT", url, data=data, json=json, headers=headers, files=files,
+                                  allow_redirects=allow_redirects, params=params, cookies=cookies,
+                                  auth=auth, timeout=timeout, hooks=hooks,
+                                  stream=stream)
+
+    async def patch(self, url, data=None, json=None, headers=None, allow_redirects=True,
+                    params=None, cookies=None, auth=USE_CLIENT_DEFAULT, timeout=USE_CLIENT_DEFAULT,
+                    hooks=None, stream=False) -> Response:
         return await self.request("PATCH", url, data=data, json=json, headers=headers,
-                                  allow_redirects=allow_redirects)
+                                  allow_redirects=allow_redirects, params=params, cookies=cookies,
+                                  auth=auth, timeout=timeout, hooks=hooks,
+                                  stream=stream)
 
-    async def delete(self, url, headers: Optional[dict] = None,
-                     allow_redirects: bool = True) -> Response:
-        return await self.request("DELETE", url, headers=headers, allow_redirects=allow_redirects)
+    async def delete(self, url, headers=None, allow_redirects=True, params=None, cookies=None,
+                     auth=USE_CLIENT_DEFAULT, timeout=USE_CLIENT_DEFAULT, hooks=None, stream=False) -> Response:
+        return await self.request("DELETE", url, headers=headers, allow_redirects=allow_redirects,
+                                  params=params, cookies=cookies, auth=auth, timeout=timeout,
+                                  hooks=hooks, stream=stream)
 
-    async def head(self, url, headers: Optional[dict] = None) -> Response:
-        return await self.request("HEAD", url, headers=headers, allow_redirects=False)
+    async def head(self, url, headers=None, allow_redirects=False, params=None, cookies=None,
+                   auth=USE_CLIENT_DEFAULT, timeout=USE_CLIENT_DEFAULT, hooks=None) -> Response:
+        """HEAD; ``allow_redirects`` varsayılanı ``False`` (requests/httpx gibi)."""
+        return await self.request("HEAD", url, headers=headers, allow_redirects=allow_redirects,
+                                  params=params, cookies=cookies, auth=auth, timeout=timeout,
+                                  hooks=hooks)
 
-    async def options(self, url, headers: Optional[dict] = None,
-                      allow_redirects: bool = True) -> Response:
-        return await self.request("OPTIONS", url, headers=headers, allow_redirects=allow_redirects)
-
-                                                                               
+    async def options(self, url, headers=None, allow_redirects=True, params=None, cookies=None,
+                      auth=USE_CLIENT_DEFAULT, timeout=USE_CLIENT_DEFAULT, hooks=None, stream=False) -> Response:
+        return await self.request("OPTIONS", url, headers=headers,
+                                  allow_redirects=allow_redirects, params=params, cookies=cookies,
+                                  auth=auth, timeout=timeout, hooks=hooks,
+                                  stream=stream)
 
     async def gather(self, *requests: tuple) -> list[Response]:
         """
@@ -1197,7 +1527,7 @@ class AsyncSession:
             else:
                 method, url, kw = req
             tasks.append(self.request(method, url, **kw))
-        return await asyncio.gather(*tasks)
+        return await B.gather(*tasks)
 
                                                                                 
 
@@ -1213,35 +1543,26 @@ class AsyncSession:
 
     async def close(self) -> None:
         conns, self._h2 = list(self._h2.values()), {}
-        try:
-            running = asyncio.get_running_loop()
-        except RuntimeError:
-            running = None
+        running = B.current_token()
         idle = [o for lst in self._idle.values() for o in lst]
         self._idle = {}
         waits = []
         for o in idle:
             self._drop_conn(o)
-            if o.loop is running:
-                waits.append((o, asyncio.ensure_future(o.writer.wait_closed())))
-        if waits:
-            # Karşı taraf TLS close_notify'a yanıt vermezse (ssl kapanış zaman aşımı
-            # 30 sn) close() takılmasın: kısa süre bekle, kalanı arka planda kapanır.
-            _, pending = await asyncio.wait([t for _, t in waits], timeout=1.0)
-            for o, t in waits:
-                if t in pending:
-                    t.cancel()
-                    inner = getattr(o.writer, "writer", o.writer)
-                    transport = getattr(inner, "transport", None)
-                    if transport is not None:
-                        transport.abort()       # TCP'yi şimdi bırak
-                elif not t.cancelled() and t.exception() is not None:
-                    logger.debug("wait_closed hatası yok sayıldı: %s", t.exception())
+            if running is not None and o.loop is running:
+                waits.append(o.writer)
+        # Karşı taraf TLS close_notify'a yanıt vermezse (ssl kapanış zaman aşımı
+        # 30 sn) close() takılmasın: kısa süre bekle, kalanı arka planda kapanır.
+        await B.close_streams(waits, 1.0)
         for c in conns:
-            if c.loop is running:
+            if running is not None and c.loop is running:
                 await c.close()
+        if self._h3 is not None:
+            await self._h3.close()
         if self.transport is not None:
-            self.transport.close()                                         
+            self.transport.close()
+        if self.client_cert is not None and self._owns_cert:
+            self.client_cert.close()          # özel anahtar referansını bırak
 
     async def __aenter__(self):
         return self
@@ -1304,11 +1625,11 @@ class AsyncWebSocket:
                 f"Sec-WebSocket-Version: 13\r\n\r\n"
             )
             writer.write(req.encode("latin-1"))
-            await asyncio.wait_for(writer.drain(), session.timeout.write)
+            await B.wait_for(writer.drain(), session.timeout.write)
 
             resp = bytearray()
             while b"\r\n\r\n" not in resp:
-                chunk = await asyncio.wait_for(reader.read(4096), session.timeout.read)
+                chunk = await B.wait_for(reader.read(4096), session.timeout.read)
                 if not chunk:
                     raise ConnectionError(
                         f"WebSocket Upgrade yanıtı tamamlanmadan bağlantı kapandı: {bytes(resp[:200])!r}")
@@ -1370,7 +1691,7 @@ class AsyncWebSocket:
             try:
                 self._writer.write(WebSocketFrame(
                     WebSocketFrame.OP_CLOSE, (1000).to_bytes(2, "big")).serialize())
-                await asyncio.wait_for(self._writer.drain(), 2.0)
+                await B.wait_for(self._writer.drain(), 2.0)
             except (OSError, asyncio.TimeoutError, RuntimeError) as e:
                 logger.debug("WebSocket CLOSE frame'i gönderilemedi: %s", e)
         self._writer.close()
