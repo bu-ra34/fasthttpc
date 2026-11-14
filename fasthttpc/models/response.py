@@ -16,6 +16,10 @@ from .headers import Headers
 _CHARSET_RE = re.compile(r"""charset\s*=\s*["']?([^\s;"']+)""", re.IGNORECASE)
 
 
+_LINK_RE = re.compile(r'<([^>]*)>((?:\s*;\s*[^;,"\s=]+(?:\s*=\s*(?:"[^"]*"|[^;,\s]*))?)*)')
+_LINK_PARAM_RE = re.compile(r'[;\s]*([^;,"\s=]+)(?:\s*=\s*(?:"([^"]*)"|([^;,\s]*)))?')
+
+
 class _Text(str):
     """``Response.text`` değeri: hem ``str`` (requests/httpx uyumu: ``r.text``)
     hem çağrılabilir (eski API: ``r.text()``, ``r.text(encoding="latin-1")``)."""
@@ -82,6 +86,7 @@ class Response:
         self.body: bytes                   = body
         self.request                       = request
         self.history: List["Response"]     = []
+        self.next                          = None   # allow_redirects=False: izlenecek istek (requests ``r.next``)
         self.elapsed                       = elapsed
         self._reason: str                  = ""
         self._url: Optional[str]           = None
@@ -183,29 +188,16 @@ class Response:
             # {"next": {"url": "https://...", "rel": "next"}}
         """
         link_header = self.headers.get("link", "")
-        if not link_header:
-            return {}
-
         result: dict[str, dict[str, str]] = {}
-        for part in link_header.split(","):
-            part = part.strip()
-            if not part:
-                continue
-            segments = [s.strip() for s in part.split(";")]
-            if not segments:
-                continue
-            url_part = segments[0]
-            if url_part.startswith("<") and url_part.endswith(">"):
-                url = url_part[1:-1]
-            else:
-                continue
-            params: dict[str, str] = {"url": url}
-            for seg in segments[1:]:
-                if "=" in seg:
-                    k, _, v = seg.partition("=")
-                    params[k.strip()] = v.strip().strip('"')
-            rel = params.get("rel", url)
-            result[rel] = params
+        # RFC 8288: <uri>; param=değer; ... ; URI içindeki virgül ve tırnaklı
+        # değerler (``title="a, b"``) bölmeyi bozmaz.
+        for m in _LINK_RE.finditer(link_header):
+            params: dict[str, str] = {"url": m.group(1)}
+            for pm in _LINK_PARAM_RE.finditer(m.group(2) or ""):
+                key = pm.group(1).lower()
+                if key not in params or key == "url":
+                    params[key] = pm.group(2) if pm.group(2) is not None else (pm.group(3) or "")
+            result[params.get("rel", params["url"])] = params
         return result
 
                                                                                
@@ -217,8 +209,13 @@ class Response:
 
     @property
     def is_redirect(self) -> bool:
-        """Redirect yanıtı mı? (301, 302, 303, 307, 308)"""
-        return self.status_code in (301, 302, 303, 307, 308)
+        """Redirect yanıtı mı? (301/302/303/307/308 VE ``Location`` başlığı var; requests/httpx gibi)"""
+        return self.status_code in (301, 302, 303, 307, 308) and "location" in self.headers
+
+    @property
+    def is_permanent_redirect(self) -> bool:
+        """301/308 + ``Location`` (requests uyumu)."""
+        return self.status_code in (301, 308) and "location" in self.headers
 
     @property
     def is_client_error(self) -> bool:
