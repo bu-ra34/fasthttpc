@@ -476,13 +476,28 @@ def test_fake_hello_request_no_renegotiation_uyarisi(pki, files):
 
 
 def test_fake_hello_request_seli_kapatir(pki, files):
-    srv, es, t = _run_fake(pki, files, tamper={"hello_request_flood"})
-    with pytest.raises(ConnectionError, match="no_renegotiation|renegotiation"):
-        # Uygulama verisi GÖNDERİLMEZ: sunucunun yanıtı (echo) istemci kapandıktan sonra
-        # gelirse RST oluşur ve sunucu alert'leri okuyamadan kaybedebilir.
-        for _ in range(tls12.MAX_HELLO_REQUESTS + 2):
-            es.recv_record(skip_post_handshake=True)
-    es.close()
+    """Renegotiation seli bağlantıyı no_renegotiation ile kapatmalı.
+
+    Sel, sunucunun Finished'ı ile AYNI TCP okumasında gelebilir (macOS'ta CI'da
+    görüldü): istemci o zaman reddi daha negotiate() içinde verir. İki zamanlama da
+    doğru davranıştır; test ikisini de kabul eder ama sonucu (red + alert'ler) aynı
+    sıkılıkla doğrular.
+    """
+    srv = Fake12Server(pki, tamper={"hello_request_flood"})
+    port, t, ls = serve_fake_in_thread(srv)
+    es = None
+    try:
+        with pytest.raises(ConnectionError, match="no_renegotiation|renegotiation"):
+            es = _connect(port, files[0], "chrome_131")
+            # Uygulama verisi GÖNDERİLMEZ: sunucunun yanıtı (echo) istemci kapandıktan
+            # sonra gelirse RST oluşur ve sunucu alert'leri okuyamadan kaybedebilir.
+            for _ in range(tls12.MAX_HELLO_REQUESTS + 2):
+                es.recv_record(skip_post_handshake=True)
+    finally:
+        if es is not None:
+            es.close()
+        else:
+            ls.close()
     t.join(5)
     assert srv.alerts.count(b"\x01\x64") == 3 and srv.alerts[-1] == bytes([2, tls12.AL_NO_RENEGOTIATION])
 
