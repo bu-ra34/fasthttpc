@@ -377,13 +377,23 @@ async def async_connect_via_proxy(proxy: ProxyConfig, host: str, port: int,
     ``timeout`` TCP bağlantısı + tünel kurulumu için toplam süredir. Dönen akış
     üzerinde ``AsyncTLSStream.negotiate`` veya ``writer.start_tls`` çalıştırılır.
     """
+    import asyncio
+    import time
+
     from .. import _backend as B
 
-    async def _go():
-        try:
-            reader, writer = await B.open_connection(proxy.host, proxy.port)
-        except OSError as e:
-            raise ProxyError(f"Proxy'ye bağlanılamadı ({proxy.host}:{proxy.port}): {e}") from e
+    # Senkron ``connect_via_proxy`` ile aynı anlam: proxy'ye TCP bağlantısı kurulamaması —
+    # reddedilme de, connect süresinin dolması da (Windows'ta kapalı porta bağlanma reddi ~2 sn
+    # sonra bildirilir) — ProxyError'dır. Tünel aşamasının zaman aşımı ham TimeoutError kalır.
+    t0 = time.perf_counter()
+    try:
+        reader, writer = await B.wait_for(B.open_connection(proxy.host, proxy.port), timeout)
+    except (OSError, asyncio.TimeoutError) as e:
+        raise ProxyError(f"Proxy'ye bağlanılamadı ({proxy.host}:{proxy.port}): "
+                         f"{e or type(e).__name__}") from e
+    left = None if timeout is None else max(0.0, timeout - (time.perf_counter() - t0))
+
+    async def _tunnel():
         try:
             await async_open_tunnel(reader, writer, proxy, host, port)
         except BaseException:
@@ -391,4 +401,4 @@ async def async_connect_via_proxy(proxy: ProxyConfig, host: str, port: int,
             raise
         return reader, writer
 
-    return await B.wait_for(_go(), timeout)
+    return await B.wait_for(_tunnel(), left)
