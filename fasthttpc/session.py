@@ -126,6 +126,7 @@ class Session:
         proxies                                       = None,
         proxy                                         = None,
         headers                                       = None,
+        http3:           "bool | str | object"        = False,
     ):
         self.impersonate   = impersonate
         # Oturum düzeyi varsayılan başlıklar (requests gibi mutable): profilin
@@ -158,6 +159,14 @@ class Session:
 
         self._receiver = AdaptiveReceiver()
         self._pool     = get_pool()
+        # HTTP/3 (opsiyonel, aioquic): True -> Alt-Svc keşfi + h2'ye düşüş, "force" -> doğrudan h3.
+        self._h3 = None
+        self._has_proxy = bool(_proxy_spec(proxy, proxies))
+        from .http3.options import Http3Options
+        _h3opts = Http3Options.from_value(http3)
+        if _h3opts is not None:
+            from .http3.manager import SyncHttp3
+            self._h3 = SyncHttp3(_h3opts, self._ca_path, impersonate)
 
                                                                                
 
@@ -227,6 +236,45 @@ class Session:
         if self._cache and method.upper() == "GET":
             self._cache.store(str(url), method, resp)
 
+        return resp
+
+    def _h3_attempt(self, req, metrics, cache_entry, method, url) -> "Response | None":
+        """HTTP/3 denemesi: Response ya da None (h2/h1'e düş). Ayrıntı: fasthttpc.http3."""
+        if self._has_proxy or self._rotator is not None:
+            # UDP bir HTTP proxy'sinden geçemez.
+            if self._h3.state.force:
+                raise ConnectionError("http3='force' bir HTTP proxy ile kullanılamaz (UDP).")
+            return None
+        t = self.timeout
+        timeout = t.total if t.total is not None else t.read_timeout
+        h3_headers = [(k.decode("latin-1").lower(), v.decode("latin-1")) for k, v in req.headers.raw]
+        h3_headers = [(k, v) for k, v in h3_headers
+                      if k != "host" and k not in self._H2_FORBIDDEN_HEADERS]
+        if metrics:
+            metrics.bytes_sent = len(req.body) + sum(len(k) + len(v) for k, v in h3_headers)
+        r = self._h3.exchange(req.url.host, req.url.port, method,
+                              req.url.raw_path.decode("latin-1"), h3_headers, req.body, timeout)
+        if r is None:
+            return None
+        status_code, resp_headers, body = r
+        resp = Response(status_code=status_code, headers=resp_headers, body=body)
+        resp.request = req
+        resp.http_version = "HTTP/3"
+        if metrics:
+            metrics.first_byte_time = metrics.transfer_end = metrics.total_end = time.monotonic()
+            metrics.bytes_received = len(body)
+            resp.metrics = metrics
+            if metrics.request_start:
+                resp.elapsed = time.monotonic() - metrics.request_start
+        self._update_cookies(resp_headers, req.url)
+        if status_code == 304 and cache_entry:
+            cached = cache_entry.response
+            cached.request = req
+            if metrics:
+                cached.metrics = metrics
+            return cached
+        if self._cache and method.upper() == "GET":
+            self._cache.store(str(url), method, resp)
         return resp
 
     def _read_app_data(self, conn) -> bytes:
@@ -437,6 +485,11 @@ class Session:
                 cond = self._cache.build_conditional_headers(cache_entry)
                 for k, v in cond.items():
                     req.headers[k] = v
+
+        if self._h3 is not None:
+            h3_resp = self._h3_attempt(req, metrics, cache_entry, method, url)
+            if h3_resp is not None:
+                return h3_resp
 
         retry_count = 0
         while retry_count < 2:
@@ -659,8 +712,12 @@ class Session:
               metrics: RequestMetrics | None = None) -> Response:
         """Tek bir isteği gönderir: transport verilmişse ona, yoksa ağa."""
         if self.transport is None:
-            return self._raw_request(method, url, data=data, json=json,
+            resp = self._raw_request(method, url, data=data, json=json,
                                      headers=headers, files=files, metrics=metrics)
+            if self._h3 is not None:
+                u = URL(str(url))
+                self._h3.state.observe(u.host, u.port, resp.headers)    # Alt-Svc keşfi
+            return resp
         req = Request(method=method, url=url, data=data, json=json,
                       headers={k: v for k, v in dict(headers or {}).items() if v is not None},
                       files=files)
@@ -857,6 +914,8 @@ class Session:
                                                                                 
 
     def close(self) -> None:
+        if self._h3 is not None:
+            self._h3.close()
         self.pool.close_all()
         if self.transport is not None:
             self.transport.close()
