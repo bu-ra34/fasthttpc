@@ -83,6 +83,23 @@ async def main():
 asyncio.run(main())
 ```
 
+### requests / httpx'ten geçiş
+
+`Response` requests/httpx alanlarını sunar: `r.status_code`, `r.headers`,
+`r.url`, `r.ok`, `r.reason`, `r.encoding`, `r.content` (bytes), `r.json()`,
+`r.raise_for_status()`, `r.history`, `r.elapsed` (saniye; `r.elapsed.total_seconds()`
+de çalışır).
+
+- `r.text` bir **property**'dir (`str`), requests'teki gibi; kodlama
+  Content-Type `charset`'inden gelir (yoksa `utf-8`, hatalı byte'lar `replace`),
+  `r.encoding = "latin-1"` ile değiştirilebilir. Geriye uyumluluk: dönen değer
+  çağrılabilir olduğundan eski `r.text()` ve `r.text(encoding="latin-1")` aynen
+  çalışır.
+- `r.json` requests'te olduğu gibi **metottur** (`r.json()`).
+- `requests.get(...)` yerine `Session`/`AsyncSession` kullanın; `verify=False`
+  desteklenmez (bkz. Güvenlik modeli), `proxies={...}` sözlüğü ve `timeout=`
+  (sayı veya `Timeout`) requests ile aynı biçimdedir.
+
 ### Timeout ve Limits
 
 httpx'e benzer `Timeout` ve `Limits` (`fasthttpc.config`):
