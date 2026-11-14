@@ -302,6 +302,8 @@ class FakeTLS13Server:
             p = self.alpn.encode()
             lst = bytes([len(p)]) + p
             ee_ext += ext(16, struct.pack("!H", len(lst)) + lst)
+        if "alps" in self.tamper:
+            ee_ext += ext(17513, b"\x00\x00")          # ALPS kabul (sunucu ayarları boş)
         msgs.append(hs(8, struct.pack("!H", len(ee_ext)) + ee_ext))
         if "cert_request" in self.tamper:
             msgs.append(hs(13, b"\x00\x00\x00"))
@@ -354,7 +356,15 @@ class FakeTLS13Server:
         return out
 
     def _on_encrypted(self, content: bytes, ctype: int) -> bytes:
+        if self.state == "WAIT_FINISHED" and "alps" in self.tamper and content[:1] == b"\x08":
+            # ALPS: istemci EncryptedExtensions'ı Finished'tan ÖNCE gelir ve transcript'e girer.
+            assert ctype == 22
+            self.client_ee = content
+            self.transcript += content
+            return b""
         if self.state == "WAIT_FINISHED":
+            if "alps" in self.tamper:
+                assert getattr(self, "client_ee", None), "ALPS kabul edildi ama istemci EE yollamadı"
             assert ctype == 22 and content[0] == 20, "client Finished bekleniyordu"
             hl = self.h.digest_size
             fkey = expand_label(self.h, self.c_hts, "finished", b"", hl)
