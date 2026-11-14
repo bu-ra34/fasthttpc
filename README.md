@@ -270,17 +270,22 @@ verir veya belgelenmiştir:
   async tarafta uygulanmaz.
 - Async HTTP/2'de sunucu PUSH_PROMISE'i protokol hatasıdır (ENABLE_PUSH=0 ilan
   edilir); öncelik (PRIORITY) gönderilmez, yok sayılır.
-- **TLS 1.2 bilinçli olarak kapsam dışıdır.** fasthttpc yalnızca TLS 1.3
-  konuşur. Profiller gerçek tarayıcılar gibi `supported_versions` içinde
-  0x0303'ü ve TLS 1.2 cipher suite'lerini *ilan eder* (parmak izi doğruluğu
-  için), ama sunucu TLS 1.3 dışında bir sürüm seçerse bağlantı açık bir hatayla
-  reddedilir ("Sunucu TLS 1.2 ile yanıt verdi ..."). ServerHello.random'da
-  `DOWNGRD` işareti varsa olası downgrade saldırısı ayrıca belirtilir. Bu bir
-  downgrade yolu açmaz: TLS 1.2 handshake'i hiç implemente edilmemiştir.
-  Gerekçe: TLS 1.2 (RSA/ECDHE key exchange, CBC/GCM, renegotiation, ayrı PRF,
-  extended master secret) ikinci bir tam handshake yığını demektir ve saldırı
-  yüzeyini ikiye katlar; günümüzde TLS 1.3 desteklemeyen sunucu oranı düşüktür.
-  TLS 1.2-only sunucular için stdlib `ssl` tabanlı `AsyncSession` kullanılabilir.
+- **TLS 1.2: yalnızca güvenli bir alt küme desteklenir** (`fasthttpc/security/tls12.py`,
+  hem senkron hem async yolda). TLS 1.3 tercih edilir; sunucu TLS 1.2 seçerse:
+  - *Desteklenen:* ECDHE (x25519, secp256r1, secp384r1) + ECDSA/RSA sertifika;
+    AES-128-GCM, AES-256-GCM, ChaCha20-Poly1305 (0xC02B, 0xC02F, 0xC02C, 0xC030,
+    0xCCA9, 0xCCA8); ServerKeyExchange imza algoritmaları ecdsa, rsa_pss_rsae ve
+    rsa_pkcs1 (SHA-256/384/512; ClientHello'da ilan edilenlerden biri olmalı).
+  - *Zorunlu:* Extended Master Secret (RFC 7627) ve renegotiation_info (RFC 5746);
+    sunucu birini göndermezse bağlantı reddedilir. Sertifika zinciri + hostname,
+    SKE imzası, Finished (sabit zamanlı), handshake mesaj sırası ve
+    ServerHello.random `DOWNGRD` işareti (downgrade saldırısı) denetlenir.
+  - *Reddedilen (açık hatayla):* CBC suite'leri, statik RSA, DHE, PSK, anonim/export,
+    SHA-1/MD5/SHA-224 imzalar, istemci sertifikası isteği (CertificateRequest),
+    null dışı sıkıştırma, TLS 1.1 ve altı. Renegotiation desteklenmez (HelloRequest'e
+    `no_renegotiation` uyarısı verilir, tekrarlanırsa bağlantı kapanır).
+  - *Kullanılmayan:* NewSessionTicket yalnızca ayrıştırılır; oturum devamı yoktur.
+  - `impersonate=None` ("default") profili TLS 1.2'yi ilan etmez; 1.2 seçen sunucu reddedilir.
 - **HelloRetryRequest:** destekleniyor (RFC 8446 §4.1.4, cookie dahil); ikinci
   HRR handshake'i sonlandırır.
 - **Session resumption (PSK/0-RTT) yok.** Her bağlantı tam handshake yapar.

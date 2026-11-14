@@ -8,7 +8,7 @@ ALERT_NAMES = {
     46: "certificate_unknown", 47: "illegal_parameter", 48: "unknown_ca",
     49: "access_denied", 50: "decode_error", 51: "decrypt_error",
     70: "protocol_version", 71: "insufficient_security", 80: "internal_error",
-    86: "inappropriate_fallback", 90: "user_canceled", 109: "missing_extension",
+    86: "inappropriate_fallback", 90: "user_canceled", 100: "no_renegotiation", 109: "missing_extension",
     110: "unsupported_extension", 112: "unrecognized_name",
     113: "bad_certificate_status_response", 115: "unknown_psk_identity",
     116: "certificate_required", 120: "no_application_protocol",
@@ -16,8 +16,8 @@ ALERT_NAMES = {
 
 _HINTS = {
     70: ("Sunucu ortak bir TLS sürümü bulamadı. En olası neden: sunucu TLS 1.3 "
-         "desteklemiyor (yalnızca TLS 1.2 veya altı). fasthttpc bilinçli olarak "
-         "yalnızca TLS 1.3 konuşur; TLS 1.2 kapsam dışıdır (README)."),
+         "veya güvenli TLS 1.2 alt kümesini (ECDHE + AEAD + Extended Master Secret) "
+         "desteklemiyor; TLS 1.1 ve altı reddedilir (README)."),
     40: ("Sunucu teklif edilen parametrelerden (cipher suite / grup / imza "
          "algoritması) hiçbirini kabul etmedi."),
     47: "Sunucu ClientHello'daki bir alanı geçersiz buldu.",
