@@ -274,6 +274,7 @@ class AsyncSession:
         proxy                         = None,
         resolver                      = None,
         headers                       = None,
+        http3:           "bool | str | object" = False,
     ):
         # impersonate verilirse TLS, fasthttpc.tls13 çekirdeğiyle (tarayıcı
         # ClientHello'su) kurulur ve profilin ALPN'i (h2, http/1.1) kullanılır;
@@ -305,6 +306,13 @@ class AsyncSession:
         # HTTP/1.1 keep-alive havuzu: (host, port, proxy, impersonate-mi) -> boşta bağlantılar.
         # Boştaki bağlantı semaphore slotu TUTMAZ (slot yalnızca kullanımdayken).
         self._idle: dict[tuple, list[_Opened]] = {}
+        # HTTP/3 (opsiyonel, aioquic): True -> Alt-Svc keşfi + h2'ye düşüş, "force" -> doğrudan h3.
+        self._h3 = None
+        from .http3.options import Http3Options
+        _h3opts = Http3Options.from_value(http3)
+        if _h3opts is not None:
+            from .http3.manager import AsyncHttp3
+            self._h3 = AsyncHttp3(_h3opts, self._ca_path, impersonate)
 
         if isinstance(cache, ResponseCache):
             self._cache: Optional[ResponseCache] = cache
@@ -670,6 +678,22 @@ class AsyncSession:
 
         ``(status, Headers, body_raw, send_time, http_version)`` döner.
         """
+        if self._h3 is not None:
+            if proxy is not None or self._rotator is not None:
+                if self._h3.state.force:
+                    raise ConnectionError("http3='force' bir HTTP proxy ile kullanılamaz (UDP).")
+            else:
+                t = self.timeout
+                r3 = await self._h3.exchange(
+                    u.host, u.port, method, u.raw_path.decode("latin-1"),
+                    [(k.lower(), str(v)) for k, v in req_headers.items()
+                     if k.lower() not in self._H2_SKIP],
+                    raw_body, t.total if t.total is not None else t.read_timeout)
+                if r3 is not None:
+                    if metrics:
+                        metrics.bytes_sent = len(raw_body)
+                        metrics.first_byte_time = time.monotonic()
+                    return r3[0], r3[1], r3[2], time.monotonic(), "HTTP/3"
         key = (u.host, u.port, proxy)
         for attempt in (0, 1):
             conn = self._h2_get(key)
@@ -1007,8 +1031,12 @@ class AsyncSession:
     async def _send(self, method, url, headers=None, body=b"", metrics=None) -> Response:
         """Tek isteği transport'a (verilmişse) ya da ağa gönderir."""
         if self.transport is None:
-            return await self._raw_request(method, url, headers=headers, body=body,
+            resp = await self._raw_request(method, url, headers=headers, body=body,
                                            metrics=metrics)
+            if self._h3 is not None:
+                u = URL(str(url))
+                self._h3.state.observe(u.host, u.port, resp.headers)    # Alt-Svc keşfi
+            return resp
         req_dict = await self._run_request_hooks(
             {"method": method, "url": url, "headers": headers or {}, "body": body}
         )
@@ -1240,6 +1268,8 @@ class AsyncSession:
         for c in conns:
             if c.loop is running:
                 await c.close()
+        if self._h3 is not None:
+            await self._h3.close()
         if self.transport is not None:
             self.transport.close()                                         
 
