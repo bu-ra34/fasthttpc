@@ -76,13 +76,35 @@ def test_ilk_adres_kara_delik_ikinci_acik_hizli_baglanir():
         ls.close()
 
 
+class _HemenReddeden(_KaraDelik):
+    def connect_ex(self, addr): return errno.ECONNREFUSED
+
+
 def test_reddedilen_adreste_beklemeden_sonrakine_gecer():
+    """Hata anında (gecikme beklenmeden) sıradaki adres denenir. Reddi anında bildiren bir soketle
+    platformdan bağımsız sınanır: Windows'ta gerçek reddedilen bağlantı ~2 sn SYN yeniden denemesiyle
+    bildirilir, bu yüzden gerçek kapalı port burada zamanlama ölçüsü olamaz."""
+    ls = _listener()
+    infos = [_info(socket.AF_INET6, ("::1", 9, 0, 0)), _info(socket.AF_INET, ls.getsockname())]
+
+    def fabrika(family, socktype, proto):
+        return _HemenReddeden() if family == socket.AF_INET6 else socket.socket(family, socktype, proto)
+    t = time.perf_counter()
+    s = he.connect_infos(infos, 10, delay=5.0, _socket=fabrika)     # gecikme 5 sn: hata -> hemen sonraki
+    assert time.perf_counter() - t < 2
+    s.close()
+    ls.close()
+
+
+def test_yavas_bildirilen_ret_gecikme_zamanlayicisini_engellemez():
+    """Gerçek kapalı port (Windows'ta ret ~2 sn'de bildirilir, selectors exceptfds'i de WRITE sayar):
+    ikinci deneme yine delay sonunda başlar ve kazanır."""
     ls = _listener()
     infos = [_info(socket.AF_INET, ("127.0.0.1", _closed_port())),
              _info(socket.AF_INET, ls.getsockname())]
     t = time.perf_counter()
-    s = he.connect_infos(infos, 10, delay=5.0)     # gecikme 5 sn: hata -> hemen sonraki
-    assert time.perf_counter() - t < 2
+    s = he.connect_infos(infos, 10, delay=0.25)
+    assert time.perf_counter() - t < 1.5
     s.close()
     ls.close()
 
