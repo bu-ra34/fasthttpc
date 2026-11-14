@@ -775,17 +775,21 @@ def _handle_hrr(raw_socket: socket.socket, impersonator: TLSImpersonator,
 class TLSAdapter:
     @staticmethod
     def negotiate(raw_socket: socket.socket, host: str, profile_name: str, *,
-                  ca_path: str | None = None) -> EncryptedSocket:
+                  ca_path: str | None = None, port: int | None = None) -> EncryptedSocket:
         """ca_path: None -> certifi + sistem CA'ları; aksi halde YALNIZCA o PEM dosyası."""
         impersonator = TLSImpersonator(host, profile=profile_name)
 
         # PSK resumption (faz4) — VARSAYILAN KAPALI; bkz. session_tickets.enable_resumption.
         ticket_key = None
         if session_tickets.resumption_enabled():
-            try:
-                peer_port = raw_socket.getpeername()[1]
-            except (OSError, IndexError, TypeError):
-                peer_port = None
+            # Hedef port: proxy tünelinde getpeername() PROXY'nin portunu verir; bu
+            # yüzden çağıran hedef portu ``port=`` ile geçirmeli (bilet anahtarı).
+            peer_port = port
+            if peer_port is None:
+                try:
+                    peer_port = raw_socket.getpeername()[1]
+                except (OSError, IndexError, TypeError):
+                    peer_port = None
             ticket_key = session_tickets.resumption_key(host, peer_port, ca_path)
         resumption_on = ticket_key is not None
         record_bytes, priv_key, _c_rand, ticket = session_tickets.begin_resumption(
