@@ -173,12 +173,22 @@ class FakeTLS13Server:
       split_records (handshake'i 1'er byte'lık değil, küçük record'lara böl),
       coalesce (tüm şifreli handshake'i tek record'a koy), no_ccs,
       tls12 (supported_versions göndermeme), wrong_session_id, oversize_record,
-      cert_request, early_app_data
+      cert_request, early_app_data, psk_with_cert (PSK kabulünden sonra yine de
+      Certificate/CertificateVerify gönder), force_psk (ClientHello'da PSK
+      olmasa/HRR sonrası bile ServerHello'da pre_shared_key seç)
+
+    psk_store: dict verilirse sunucu PSK resumption destekler: tam handshake
+    sonrası gerçek (benzersiz) biletler verir ve ticket->PSK kaydını bu sözlükte
+    tutar; ClientHello'da tanıdığı bir kimlik + doğru binder varsa PSK'yı kabul
+    eder (self.resumed=True). Yanlış binder -> AssertionError.
     """
 
     def __init__(self, pki: PKI, *, suite: int = 0x1301, alpn: str | None = "http/1.1",
                  hrr_group: int | None = None, hrr_cookie: bytes | None = None,
-                 tamper: set | None = None, tickets: int = 1):
+                 tamper: set | None = None, tickets: int = 1,
+                 psk_store: dict | None = None):
+        self.psk_store = psk_store
+        self.resumed = False
         self.pki = pki
         self.suite = suite
         self.alpn = alpn
@@ -270,10 +280,18 @@ class FakeTLS13Server:
             pub = priv.public_key().public_bytes(serialization.Encoding.X962,
                                                  serialization.PublicFormat.UncompressedPoint)
 
+        psk = None
+        if "force_psk" in self.tamper:           # teklif edilmemiş PSK'yı seçen kötü niyetli sunucu
+            psk = b"\x07" * self.h.digest_size
+        elif self.psk_store is not None and 41 in ch["exts"]:
+            psk = self._select_psk(ch, msg)
         exts = b""
         if "tls12" not in self.tamper:
             exts += ext(43, b"\x03\x04")
         exts += ext(51, struct.pack("!HH", group, len(pub)) + pub)
+        if psk is not None:
+            exts += ext(41, b"\x00\x00")
+            self.resumed = True
         echo = os.urandom(32) if "wrong_session_id" in self.tamper else sid
         body = (b"\x03\x03" + os.urandom(32) + bytes([len(echo)]) + echo +
                 struct.pack("!HB", self.suite, 0) + struct.pack("!H", len(exts)) + exts)
@@ -286,7 +304,7 @@ class FakeTLS13Server:
         # key schedule
         hl = self.h.digest_size
         zero = b"\x00" * hl
-        early = hkdf_extract(self.hlib, zero, zero)
+        early = hkdf_extract(self.hlib, zero, psk if psk is not None else zero)
         derived = expand_label(self.h, early, "derived", self.hlib(b"").digest(), hl)
         hs_secret = hkdf_extract(self.hlib, derived, shared)
         th = self.th()
@@ -302,18 +320,21 @@ class FakeTLS13Server:
             p = self.alpn.encode()
             lst = bytes([len(p)]) + p
             ee_ext += ext(16, struct.pack("!H", len(lst)) + lst)
+        if "alps" in self.tamper:
+            ee_ext += ext(17513, b"\x00\x00")          # ALPS kabul (sunucu ayarları boş)
         msgs.append(hs(8, struct.pack("!H", len(ee_ext)) + ee_ext))
         if "cert_request" in self.tamper:
             msgs.append(hs(13, b"\x00\x00\x00"))
         for m in msgs:
             self.transcript += m
-        if "skip_cert" not in self.tamper:
+        send_cert = psk is None or "psk_with_cert" in self.tamper
+        if "skip_cert" not in self.tamper and send_cert:
             certs = b"".join(len(d).to_bytes(3, "big") + d + b"\x00\x00"
                              for d in self.pki.chain_der())
             cert_msg = hs(11, b"\x00" + len(certs).to_bytes(3, "big") + certs)
             self.transcript += cert_msg
             msgs.append(cert_msg)
-        if "skip_cv" not in self.tamper:
+        if "skip_cv" not in self.tamper and send_cert:
             content = b"\x20" * 64 + b"TLS 1.3, server CertificateVerify\x00" + self.th()
             signer = ec.generate_private_key(ec.SECP256R1()) if "wrong_key_cv" in self.tamper \
                 else self.pki.key
@@ -347,14 +368,53 @@ class FakeTLS13Server:
         th_sf = self.th()
         d2 = expand_label(self.h, hs_secret, "derived", self.hlib(b"").digest(), hl)
         master = hkdf_extract(self.hlib, d2, zero)
+        self.master = master
         self.c_ats = expand_label(self.h, master, "c ap traffic", th_sf, hl)
         self.s_ats = expand_label(self.h, master, "s ap traffic", th_sf, hl)
         self.app_write = self._traffic(self.s_ats)
         self.state = "WAIT_FINISHED"
         return out
 
+    def _select_psk(self, ch: dict, msg: bytes):
+        """pre_shared_key uzantısı: tanınan ilk kimliğin PSK'sı (binder doğrulanır) ya da None."""
+        d = ch["exts"][41]
+        assert ch["order"][-1] == 41, "pre_shared_key son uzantı olmalı"
+        ilen = struct.unpack("!H", d[:2])[0]
+        ids, p = [], 2
+        while p < 2 + ilen:
+            n = struct.unpack("!H", d[p:p + 2])[0]
+            ids.append(d[p + 2:p + 2 + n])
+            p += 2 + n + 4
+        binders_blob = d[p:]
+        blen = struct.unpack("!H", binders_blob[:2])[0]
+        binders, q = [], 2
+        while q < 2 + blen:
+            binders.append(binders_blob[q + 1:q + 1 + binders_blob[q]])
+            q += 1 + binders_blob[q]
+        for idx, ident in enumerate(ids):
+            psk = self.psk_store.get(ident)
+            if psk is None:
+                continue
+            hl = self.h.digest_size
+            early = hkdf_extract(self.hlib, b"\x00" * hl, psk)
+            bkey = expand_label(self.h, early, "res binder", self.hlib(b"").digest(), hl)
+            fkey = expand_label(self.h, bkey, "finished", b"", hl)
+            trunc = msg[:len(msg) - len(binders_blob)]
+            want = hmac.new(fkey, self.hlib(trunc).digest(), self.hlib).digest()
+            assert hmac.compare_digest(want, binders[idx]), "PSK binder hatalı"
+            return psk
+        return None
+
     def _on_encrypted(self, content: bytes, ctype: int) -> bytes:
+        if self.state == "WAIT_FINISHED" and "alps" in self.tamper and content[:1] == b"\x08":
+            # ALPS: istemci EncryptedExtensions'ı Finished'tan ÖNCE gelir ve transcript'e girer.
+            assert ctype == 22
+            self.client_ee = content
+            self.transcript += content
+            return b""
         if self.state == "WAIT_FINISHED":
+            if "alps" in self.tamper:
+                assert getattr(self, "client_ee", None), "ALPS kabul edildi ama istemci EE yollamadı"
             assert ctype == 22 and content[0] == 20, "client Finished bekleniyordu"
             hl = self.h.digest_size
             fkey = expand_label(self.h, self.c_hts, "finished", b"", hl)
@@ -365,8 +425,16 @@ class FakeTLS13Server:
             self.write = self.app_write
             self.state = "CONNECTED"
             out = b""
-            for _ in range(self.tickets):
-                nst = hs(4, struct.pack("!IIB", 7200, 1, 0) + b"\x00\x04tick" + b"\x00\x00")
+            if self.psk_store is not None:
+                rms = expand_label(self.h, self.master, "res master", self.th(), self.h.digest_size)
+            for i in range(self.tickets):
+                if self.psk_store is None:
+                    nst = hs(4, struct.pack("!IIB", 7200, 1, 0) + b"\x00\x04tick" + b"\x00\x00")
+                else:
+                    tick, nonce = os.urandom(24), bytes([i])
+                    self.psk_store[tick] = expand_label(self.h, rms, "resumption", nonce, self.h.digest_size)
+                    nst = hs(4, struct.pack("!IIB", 7200, 1, len(nonce)) + nonce +
+                             struct.pack("!H", len(tick)) + tick + b"\x00\x00")
                 out += self.write.seal(nst, 22)
             return out
         if ctype == 23:

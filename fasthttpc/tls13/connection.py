@@ -27,10 +27,14 @@ from ..crypto_math import (
     FastAESGCM as _AESGCM,
     FastChaCha20Poly1305 as _ChaCha,
 )
-from ..tls_crafter import TLSImpersonator
+from ..tls_crafter import (
+    TLSImpersonator, alps_accepted, build_client_encrypted_extensions,
+)
 from ..security import cert_validator as _cv
+from ..security import session_tickets as _st
 from ..security.cert_validator import CertificateValidationError
 from . import _compat as C
+from ..security.alerts import describe_alert
 from .errors import TLSError, TLSAlertError
 from .events import (
     Event,
@@ -89,6 +93,24 @@ def parse_alpn(ee_msg: bytes) -> str:
     return ""
 
 
+def parse_record_size_limit(ee_msg: bytes) -> int:
+    """EncryptedExtensions içindeki record_size_limit (ext 28, RFC 8449); yoksa 0."""
+    try:
+        total = struct.unpack("!H", ee_msg[4:6])[0]
+        cur, end = 6, min(6 + total, len(ee_msg))
+        while cur + 4 <= end:
+            et, el = struct.unpack("!HH", ee_msg[cur:cur + 4])
+            cur += 4
+            if et == 28:
+                if el != 2:
+                    raise TLSError("decode_error: bozuk record_size_limit uzantısı")
+                return struct.unpack("!H", ee_msg[cur:cur + 2])[0]
+            cur += el
+    except (struct.error, IndexError):
+        pass
+    return 0
+
+
 class _Direction:
     """Tek yön için AEAD durumu: anahtar, IV, sequence, traffic secret."""
 
@@ -143,6 +165,10 @@ class TLSClientConnection:
         ca_path: Ek/özel CA bundle yolu (cert_validator destekliyorsa iletilir).
         cert_validator: (cert_msg, host) -> x509.Certificate çağrılabilir;
             None ise security.cert_validator.validate_server_certificate.
+            Özel doğrulayıcı verilirse PSK resumption KULLANILMAZ (biletin
+            devraldığı kimliğin hangi güven kökünden geldiği bilinemez).
+        port: Hedef port; PSK bilet önbelleği anahtarının (host+port+ca_path)
+            parçasıdır. Bilinmiyorsa boş port ile anahtarlanır.
     """
 
     def __init__(
@@ -154,8 +180,10 @@ class TLSClientConnection:
         ca_path: Optional[str] = None,
         cert_validator: Optional[Callable] = None,
         impersonator: Optional[TLSImpersonator] = None,
+        port: Optional[int] = None,
     ):
         self.host = host
+        self.port = port
         self.profile = profile
         self.ca_path = ca_path
         self._cert_validator = cert_validator
@@ -168,6 +196,7 @@ class TLSClientConnection:
         self.cipher_name = "CHACHA20-POLY1305"
         self.key_len = 32
         self.alpn = ""
+        self._send_limit = C.MAX_PLAINTEXT   # sunucunun record_size_limit'inden türeyen azami düz metin
         self.peer_certificate = None
         self.signature_scheme: Optional[int] = None
 
@@ -189,7 +218,15 @@ class TLSClientConnection:
         self._hrr: Optional[dict] = None
         self._cert_seen = False
         self._cv_ok = False
+        # PSK resumption (security/session_tickets; varsayılan KAPALI). Senkron yolla
+        # AYNI önbelleği ve aynı saf fonksiyonları paylaşır.
+        self._ticket = None            # teklif edilen SessionTicket
+        self._ticket_key: Optional[str] = None
+        self._rms: Optional[bytes] = None
+        self.resumed = False
         self._close_sent = False
+        # ServerHello TLS 1.2 seçerse (security/tls12.py) tüm iş buna devredilir.
+        self._t12 = None
 
     # ------------------------------------------------------------------ API
     @property
@@ -204,7 +241,9 @@ class TLSClientConnection:
         """ClientHello record'unu üretir ve döner (ayrıca tampona koymaz)."""
         if self.state != ST_IDLE:
             raise TLSError("initiate() yalnızca bir kez çağrılabilir.")
-        record, _priv, _rand = self._imp.build_client_hello()
+        if self._cert_validator is None:
+            self._ticket_key = _st.resumption_key(self.host, self.port, self.ca_path)
+        record, _priv, _rand, self._ticket = _st.begin_resumption(self._imp, self._ticket_key)
         self._ch1 = record[5:]
         self._session_id = self._ch1[4 + 2 + 32 + 1:4 + 2 + 32 + 1 + self._ch1[4 + 2 + 32]]
         self._transcript = self._ch1
@@ -215,6 +254,8 @@ class TLSClientConnection:
         """Gönderilmeyi bekleyen tüm byte'ları döner ve tamponu boşaltır."""
         out = bytes(self._outbuf)
         self._outbuf.clear()
+        if self._t12 is not None:
+            out += self._t12.data_to_send()
         return out
 
     def send_application_data(self, data: bytes) -> bytes:
@@ -233,11 +274,14 @@ class TLSClientConnection:
 
         MAX_PLAINTEXT'ten büyük veri birden çok record'a bölünür.
         """
+        if self._t12 is not None:
+            self._t12_call(self._t12.send_record, data, content_type)
+            return
         if self._write is None:
             raise TLSError("Yazma anahtarı yok — handshake başlamadı.")
         if self.state == ST_CLOSED:
             raise TLSError("Bağlantı kapalı.")
-        mp = C.MAX_PLAINTEXT
+        mp = self._send_limit
         if not data:
             self._seal(b"", content_type)
             return
@@ -248,12 +292,18 @@ class TLSClientConnection:
         """İstemci kaynaklı KeyUpdate gönderir; yazma anahtarını döndürür."""
         if self.state != ST_CONNECTED:
             raise TLSError("KeyUpdate yalnızca handshake sonrası gönderilebilir.")
+        if self._t12 is not None:
+            raise TLSError("TLS 1.2'de KeyUpdate yoktur.")
         self._seal(C.build_key_update(request_peer), CT_HANDSHAKE)
         self._rotate_write()
         return self.data_to_send()
 
     def close(self) -> bytes:
         """close_notify alert'i üretir (şifreli, handshake sonrası)."""
+        if self._t12 is not None:
+            out = self._t12.close()
+            self.state = ST_CLOSED
+            return out
         if self._write is not None and not self._close_sent and self.state != ST_CLOSED:
             self._seal(b"\x01\x00", CT_ALERT)
             self._close_sent = True
@@ -262,6 +312,8 @@ class TLSClientConnection:
 
     def crypto_state(self) -> dict:
         """EncryptedSocket.state ile uyumlu (salt-okunur) özet."""
+        if self._t12 is not None:
+            return self._t12.crypto_state()
         return {
             "is_tls13": self.cipher_suite is not None,
             "using_app_keys": self.state == ST_CONNECTED,
@@ -270,6 +322,7 @@ class TLSClientConnection:
             "key_len": self.key_len,
             "alpn": self.alpn,
             "peer_certificate": self.peer_certificate,
+            "resumed": self.resumed,
         }
 
     def receive_data(self, data: bytes) -> list[Event]:
@@ -282,12 +335,16 @@ class TLSClientConnection:
             raise TLSError("receive_data() initiate()'den önce çağrıldı.")
         if self.state == ST_CLOSED:
             return []
+        if self._t12 is not None:
+            return self._t12_call(self._t12.receive_data, data)
         self._inbuf += data
         events: list[Event] = []
         try:
             while self.state != ST_CLOSED and len(self._inbuf) >= 5:
                 rtype = self._inbuf[0]
                 rlen = struct.unpack("!H", self._inbuf[3:5])[0]
+                if self.state != ST_CONNECTED and bytes(self._inbuf[:4]) == b"HTTP":
+                    raise TLSError("Sunucu TLS yerine düz HTTP ile yanıt verdi (bu port TLS konuşmuyor olabilir).")
                 if rlen > C.MAX_CIPHERTEXT:
                     raise TLSError(f"record_overflow: record uzunluğu {rlen} > {C.MAX_CIPHERTEXT}")
                 if len(self._inbuf) < 5 + rlen:
@@ -296,6 +353,13 @@ class TLSClientConnection:
                 payload = bytes(self._inbuf[5:5 + rlen])
                 del self._inbuf[:5 + rlen]
                 self._handle_record(rtype, header, payload, events)
+                if self._t12 is not None:
+                    # ServerHello TLS 1.2 seçti: kalan baytlar TLS 1.2 çekirdeğinindir.
+                    rest = bytes(self._inbuf)
+                    self._inbuf.clear()
+                    if rest:
+                        events.extend(self._t12_call(self._t12.receive_data, rest))
+                    break
         except TLSError:
             self.state = ST_CLOSED
             raise
@@ -364,14 +428,14 @@ class TLSClientConnection:
             elif was_connected:
                 events.append(AlertReceived(level, desc))
             else:
-                raise TLSAlertError(level, desc, f"Sunucudan Şifreli TLS Alert: {inner.hex()}")
+                raise TLSAlertError(level, desc, f"Sunucudan şifreli TLS alert: {describe_alert(bytes(inner))}")
         else:
             raise TLSError(f"unexpected_message: bilinmeyen iç content type {itype}")
 
     def _raise_alert(self, payload: bytes) -> None:
         level = payload[0] if len(payload) > 0 else 2
         desc = payload[1] if len(payload) > 1 else 0
-        raise TLSAlertError(level, desc, f"Sunucu el sıkışmayı reddetti (alert): {payload.hex()}")
+        raise TLSAlertError(level, desc, f"Sunucu el sıkışmayı reddetti: {describe_alert(bytes(payload))}")
 
     def _feed_handshake(self, data: bytes, events: list, epoch) -> None:
         # Handshake mesajları anahtar değişimi sınırını aşamaz (RFC 8446 §5.1).
@@ -388,6 +452,8 @@ class TLSClientConnection:
             msg = self._hs_buf[:4 + hs_len]
             self._hs_buf = self._hs_buf[4 + hs_len:]
             self._handle_handshake(msg, events)
+            if self._t12 is not None:
+                break                      # kalan baytlar _begin_tls12'de devredildi
             # ServerHello/Finished sonrası anahtar değişir; tamponda kalan veri
             # eski anahtarla gelmiş demektir -> protokol ihlali.
             if self._hs_buf and self._hs_buf_epoch != self._epoch:
@@ -396,7 +462,7 @@ class TLSClientConnection:
     def _handle_handshake(self, msg: bytes, events: list) -> None:
         hs_type = msg[0]
         if self.state == ST_WAIT_SH:
-            self._on_server_hello(msg)
+            self._on_server_hello(msg, events)
             return
         if self.state == ST_WAIT_ENCRYPTED:
             self._on_encrypted_handshake(msg, events)
@@ -407,9 +473,60 @@ class TLSClientConnection:
         raise TLSError(f"unexpected_message: durum={self.state}, hs_type={hs_type}")
 
     # ------------------------------------------------------- ServerHello / HRR
-    def _on_server_hello(self, msg: bytes) -> None:
+    def _begin_tls12(self, msg: bytes, events: list) -> None:
+        """ServerHello TLS 1.2 seçti: güvenli TLS 1.2 alt kümesine devret (security/tls12.py).
+
+        HRR sonrası TLS 1.2 seçimi protokol ihlalidir (sunucu 1.3'ü kabul etmişti).
+        """
+        from ..security import tls12 as _t12mod
+        if self._hrr is not None:
+            raise TLSError("unexpected_message: HelloRetryRequest'ten sonra sunucu TLS 1.2 seçti — "
+                           "protokol ihlali / olası downgrade.")
+        trailing = bytes(self._hs_buf)        # ServerHello'yla aynı record'daki artık handshake baytları
+        self._hs_buf = b""
+        try:
+            self._t12 = _t12mod.TLS12ClientConnection(
+                self.host, self._ch1, ca_path=self.ca_path, cert_validator=self._cert_validator,
+            )
+        except _t12mod.TLS12Error as e:
+            raise TLSError(str(e)) from e
+        self.state = ST_WAIT_ENCRYPTED
+        events.extend(self._t12_call(self._t12.start, msg, trailing))
+
+    def _t12_call(self, fn, *args):
+        """TLS 1.2 çekirdeğini çağırır; hatayı TLSError'a çevirir, durumu senkronlar."""
+        from ..security import tls12 as _t12mod
+        try:
+            res = fn(*args)
+        except _t12mod.TLS12AlertError as e:
+            self.state = ST_CLOSED
+            self._sync_t12()
+            raise TLSAlertError(e.level, e.description, str(e)) from e
+        except _t12mod.TLS12Error as e:
+            self.state = ST_CLOSED
+            self._sync_t12()
+            raise TLSError(str(e)) from e
+        self._sync_t12()
+        return res
+
+    def _sync_t12(self) -> None:
+        t = self._t12
+        self.cipher_suite, self.cipher_name, self.key_len = t.cipher_suite, t.cipher_name, t.key_len
+        self.alpn = t.alpn
+        self.peer_certificate = t.peer_certificate
+        self.signature_scheme = t.signature_scheme
+        if t.closed:
+            self.state = ST_CLOSED
+        elif t.handshake_complete:
+            self.state = ST_CONNECTED
+
+    def _on_server_hello(self, msg: bytes, events: Optional[list] = None) -> None:
         if msg[0] != HS_SERVER_HELLO:
             raise TLSError(f"unexpected_message: ServerHello beklenirken hs_type={msg[0]}")
+        from ..security import tls12 as _t12mod
+        if _t12mod.is_tls12_server_hello(msg):
+            self._begin_tls12(msg, events if events is not None else [])
+            return
         try:
             sh = C.parse_server_hello(msg, self._session_id)
         except C.TLSProtocolError as e:
@@ -430,6 +547,11 @@ class TLSClientConnection:
                 raise TLSError("illegal_parameter: ServerHello grubu HRR'de istenenden farklı")
 
         self._set_suite(sh["cipher_suite"])
+        try:
+            psk_accepted = _st.check_psk_selection(
+                self._ticket, sh.get("selected_identity"), sh["cipher_suite"], self._hrr is not None)
+        except _st.PskViolation as e:
+            raise TLSError(f"illegal_parameter: {e}") from e
         if not sh["server_pub"] or sh["selected_group"] is None:
             raise TLSError("ServerHello geçerli bir key_share içermiyor — handshake tamamlanamaz.")
         try:
@@ -439,9 +561,18 @@ class TLSClientConnection:
 
         self._transcript += msg
         th = self._hash(self._transcript).digest()
-        hs, ck, civ, sk, siv, c_hts, s_hts = _P.derive_tls13_keys(
-            shared, th, self.key_len, hash_alg=self._hash
-        )
+        if psk_accepted:
+            # Resumption: kimlik bileti veren handshake'ten devralınır; Certificate/CV gelmez.
+            self._order.psk_accepted = True
+            self.resumed = True
+            self.peer_certificate = self._ticket.peer_certificate
+            hs, ck, civ, sk, siv, c_hts, s_hts = _st.derive_handshake_keys_psk(
+                self._ticket.psk, shared, th, self.key_len, hash_alg=self._hash
+            )
+        else:
+            hs, ck, civ, sk, siv, c_hts, s_hts = _P.derive_tls13_keys(
+                shared, th, self.key_len, hash_alg=self._hash
+            )
         self._hs_secret, self._c_hts, self._s_hts = hs, c_hts, s_hts
         self._write = _Direction(c_hts, ck, civ, self.cipher_name)
         self._read = _Direction(s_hts, sk, siv, self.cipher_name)
@@ -499,6 +630,20 @@ class TLSClientConnection:
 
         if hs_type == HS_ENCRYPTED_EXTENSIONS:
             self.alpn = parse_alpn(msg)
+            self._send_client_ee = alps_accepted(
+                getattr(self._imp, "alps_advertised", False), msg, self.alpn)
+            limit = parse_record_size_limit(msg)
+            if limit:
+                if limit < 64:  # RFC 8449 §4: 64'ten küçük değer illegal_parameter
+                    raise TLSError(f"illegal_parameter: record_size_limit={limit} < 64")
+                # TLS 1.3'te sınır içerik tipi baytını da kapsar (RFC 8449 §4)
+                self._send_limit = min(C.MAX_PLAINTEXT, limit - 1)
+
+        elif hs_type in (HS_CERTIFICATE, HS_COMPRESSED_CERTIFICATE, HS_CERTIFICATE_VERIFY) and self.resumed:
+            raise TLSError(
+                "unexpected_message: PSK ile devam edilen oturumda sunucu Certificate/CertificateVerify "
+                "gönderdi — protokol ihlali (RFC 8446 §4.4.2)."
+            )
 
         elif hs_type in (HS_CERTIFICATE, HS_COMPRESSED_CERTIFICATE):
             if hs_type == HS_COMPRESSED_CERTIFICATE:
@@ -520,16 +665,17 @@ class TLSClientConnection:
                 raise TLSError("Sunucu Certificate göndermeden CertificateVerify gönderdi — protokol ihlali.")
             try:
                 self.signature_scheme = _cv.verify_certificate_verify(
-                    msg, self.peer_certificate, transcript_before
+                    msg, self.peer_certificate, transcript_before,
+                    offered_schemes=self._imp.profile.get("signature_algorithms"),
                 )
             except CertificateValidationError as e:
                 raise TLSError(f"TLS kimlik doğrulaması başarısız: {e}") from e
             self._cv_ok = True
 
         elif hs_type == HS_FINISHED:
-            if not self._cert_seen:
+            if not self.resumed and not self._cert_seen:
                 raise TLSError("Handshake Finished'a ulaştı ama sunucu sertifikası hiç doğrulanmadı.")
-            if not self._cv_ok:
+            if not self.resumed and not self._cv_ok:
                 raise TLSError("Sunucu CertificateVerify göndermedi veya doğrulanamadı.")
             hlen = self._hash().digest_size
             fkey = _P.tls13_hkdf_expand_label(self._s_hts, "finished", b"", hlen, hash_alg=self._hash)
@@ -555,11 +701,22 @@ class TLSClientConnection:
         # Server Finished dahil transcript -> application secret'lar
         th_sf = self._hash(self._transcript).digest()
         hlen = self._hash().digest_size
+        if getattr(self, "_send_client_ee", False):
+            # ALPS kabul edildi: istemci EncryptedExtensions Finished'tan ÖNCE
+            # gider, transcript'e girer (application secret'lar ise SERVER
+            # Finished'a kadar olan th_sf'ten türer).
+            cee = build_client_encrypted_extensions()
+            self._seal(cee, CT_HANDSHAKE)
+            self._transcript += cee
         fkey = _P.tls13_hkdf_expand_label(self._c_hts, "finished", b"", hlen, hash_alg=self._hash)
-        mac = hmac.new(fkey, th_sf, self._hash).digest()
+        mac = hmac.new(fkey, self._hash(self._transcript).digest(), self._hash).digest()
         finished = bytes([HS_FINISHED]) + len(mac).to_bytes(3, "big") + mac
         self._seal(finished, CT_HANDSHAKE)          # handshake anahtarıyla
         self._transcript += finished
+        if self._ticket_key is not None:
+            # resumption_master_secret: transcript client Finished DAHİL.
+            self._rms = _st.derive_resumption_master_secret(
+                self._hs_secret, self._hash(self._transcript).digest(), self._hash)
 
         c_ats, s_ats = application_traffic_secrets(self._hs_secret, th_sf, self._hash)
         ck, civ = C.traffic_key_iv(c_ats, self.key_len, self._hash)
@@ -578,6 +735,9 @@ class TLSClientConnection:
     def _on_post_handshake(self, msg: bytes, events: list) -> None:
         hs_type = msg[0]
         if hs_type == HS_NEW_SESSION_TICKET:
+            _st.store_new_session_tickets(
+                self._ticket_key, msg, self._rms, self.cipher_suite or 0,
+                peer_certificate=self.peer_certificate)
             events.append(NewSessionTicket(msg))
         elif hs_type == HS_KEY_UPDATE:
             try:

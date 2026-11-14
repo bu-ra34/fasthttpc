@@ -240,3 +240,94 @@ def test_newsessionticket_h2_akisini_bozmuyor():
     conn = Http2Connection(MockEsock(records))
     status, hdrs, body = conn.request("GET", "example.com", "/", [])
     assert status == 200, f"NewSessionTicket akışı bozdu, status={status}"
+
+
+# ---- GOAWAY (RFC 9113 §6.8) — canlı soak testinde www.debian.org'da bulundu ----
+
+def _goaway(last_sid, err=0):
+    return HTTP2Frame(8, FrameType.GOAWAY, 0, 0, struct.pack("!II", last_sid, err))
+
+
+def _yanit_200(sid):
+    # HPACK statik index 8 = ":status 200"; END_HEADERS | END_STREAM
+    return HTTP2Frame(1, FrameType.HEADERS, 0x4 | 0x1, sid, b"\x88")
+
+
+def test_goaway_no_error_ve_stream_kapsaniyorsa_yanit_tamamlanir():
+    """Sunucu bakım/boşta kapatma için NO_ERROR + last_stream_id=2^31-1 GOAWAY
+    gönderir; devam eden stream TAMAMLANMALI (eskiden ölümcül hata sayılıyordu)."""
+    sok = SahteSoket([_goaway(0x7FFFFFFF, 0), _yanit_200(1)])
+    conn = Http2Connection(sok)
+    status, _h, _b = conn.request("GET", "example.com", "/", [])
+    assert status == 200
+    assert conn.goaway == (0x7FFFFFFF, 0)
+
+
+def test_goaway_sonrasi_yeni_stream_acilmaz():
+    import pytest
+    from fasthttpc.protocol.http2_parser import Http2RefusedError
+    sok = SahteSoket([_goaway(1, 0), _yanit_200(1)])
+    conn = Http2Connection(sok)
+    assert conn.request("GET", "example.com", "/", [])[0] == 200
+    with pytest.raises(Http2RefusedError):
+        conn.request("GET", "example.com", "/2", [])
+
+
+def test_goaway_stream_kapsanmiyorsa_islenmedi_hatasi():
+    """last_stream_id < bizim stream: sunucu isteği İŞLEMEDİ -> yeniden denenebilir hata."""
+    import pytest
+    from fasthttpc.protocol.http2_parser import Http2RefusedError
+    sok = SahteSoket([_goaway(0, 0)])
+    conn = Http2Connection(sok)
+    with pytest.raises(Http2RefusedError):
+        conn.request("GET", "example.com", "/", [])
+
+
+def test_goaway_bozuk_payload_baglanti_hatasi():
+    import pytest
+    from fasthttpc.protocol.http2_parser import Http2ConnectionError, Http2RefusedError
+    sok = SahteSoket([HTTP2Frame(2, FrameType.GOAWAY, 0, 0, b"\x00\x00")])
+    conn = Http2Connection(sok)
+    with pytest.raises(Http2ConnectionError) as ei:
+        conn.request("GET", "example.com", "/", [])
+    assert not isinstance(ei.value, Http2RefusedError)
+
+
+def test_session_goaway_islenmeyen_istegi_yeni_baglantida_tekrarlar(monkeypatch):
+    """Session: GOAWAY ile işlenmeyen h2 isteği (POST dahil) yeni bağlantıda bir kez
+    yeniden denenir; GOAWAY almış bağlantı havuza geri konmaz."""
+    from fasthttpc import Session
+    from fasthttpc.protocol.http2_parser import Http2RefusedError
+
+    cagri = []
+
+    class FakeH2:
+        def __init__(self, red):
+            self.red = red
+            self.goaway = (0, 0) if red else None
+
+        def request(self, **kw):
+            cagri.append((self.red, kw["method"]))
+            if self.red:
+                raise Http2RefusedError("stream 1 işlenmedi")
+            return 200, [], b"ok"
+
+    class FakeConn:
+        def __init__(self, red):
+            self.tls_established = True
+            self.h2_conn = FakeH2(red)
+            self.closed = False
+
+        def close(self):
+            self.closed = True
+
+    conns = [FakeConn(True), FakeConn(False)]
+    verilen, iade = [], []
+    s = Session(impersonate="chrome_131")
+    monkeypatch.setattr(s.pool, "acquire", lambda url, timeout=None, **kw: verilen.append(conns[len(verilen)]) or verilen[-1])
+    monkeypatch.setattr(s.pool, "release", lambda c: iade.append(c))
+    r = s.post("https://example.com/", data=b"x")
+    assert r.status_code == 200
+    assert cagri == [(True, "POST"), (False, "POST")]
+    assert conns[0].closed and not conns[1].closed
+    assert iade == conns
