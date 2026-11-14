@@ -6,6 +6,7 @@ import queue
 import shutil
 import socket
 import subprocess
+import sys
 import threading
 import time
 
@@ -29,6 +30,22 @@ def s_server_supports(flag: str) -> bool:
     return flag in out
 
 
+_HTTP_MODES = ("-WWW", "-HTTP")
+
+
+def http_binmode_supported() -> bool:
+    """OpenSSL 3.x: `-http_server_binmode` (-WWW/-HTTP dosyalarını ikili kipte aç)."""
+    return OPENSSL is not None and s_server_supports("-http_server_binmode")
+
+
+def text_mode_files() -> bool:
+    """True: dosyalar Windows C çalışma zamanının METİN kipinde okunacak (0x1A = EOF, CRLF -> LF).
+
+    apps/s_server.c: ``opmode = (http_server_binmode == 1) ? "rb" : "r"``. Windows'ta bayrak
+    desteklenmiyorsa (OpenSSL < 3) test verisi bu kipe dayanıklı üretilmelidir."""
+    return sys.platform == "win32" and not http_binmode_supported()
+
+
 class SServer:
     """Kullanım: with SServer("-cert", c, "-key", k, "-WWW", cwd=dir) as s: s.port ..."""
 
@@ -43,8 +60,12 @@ class SServer:
     def __enter__(self) -> "SServer":
         for _ in range(5):
             self.port = free_port()
+            extra = []
+            if sys.platform == "win32" and any(a in _HTTP_MODES for a in self.args) \
+                    and http_binmode_supported():
+                extra = ["-http_server_binmode"]   # aksi hâlde ikili dosyalar 0x1A'da kesilir
             self.proc = subprocess.Popen(
-                [OPENSSL, "s_server", "-accept", f"127.0.0.1:{self.port}", *self.args],
+                [OPENSSL, "s_server", "-accept", f"127.0.0.1:{self.port}", *extra, *self.args],
                 stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                 cwd=self.cwd, env={**os.environ, "OPENSSL_CONF": os.devnull})
             threading.Thread(target=self._pump, daemon=True).start()

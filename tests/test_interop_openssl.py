@@ -23,7 +23,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from fasthttpc import AsyncSession, Session  # noqa: E402
 from fasthttpc.security import session_tickets  # noqa: E402
 from interop import pki  # noqa: E402
-from interop.openssl_server import OPENSSL, SServer  # noqa: E402
+from interop.openssl_server import OPENSSL, SServer, text_mode_files  # noqa: E402
 
 pytestmark = [pytest.mark.interop, pytest.mark.skipif(OPENSSL is None, reason="openssl CLI yok")]
 
@@ -35,11 +35,12 @@ PROFILES = ["chrome_131", "firefox_133", "safari_18"]
 
 # --------------------------------------------------------------------------- yardımcılar
 
-# Windows'ta `openssl s_server` (-WWW/-HTTP) dosyaları METİN kipinde açar (apps/s_server.c:
-# BIO_new_file(p, "r")): C çalışma zamanı 0x1A (Ctrl-Z) görünce EOF sayar ve CRLF -> LF çevirir.
-# Rastgele ikili veri bu yüzden ilk 0x1A'da (~256 baytta) kesilir. Windows'ta yük, 0x1A/CR/LF
-# içermeyen alfasayısal baytlardan üretilir; yine 3 MB'tır, yani çok sayıda TLS record'una bölünür
-# ve SHA-256 karşılaştırması aynı kuvvette kalır. Diğer platformlarda tam ikili (urandom) veri.
+# Windows'ta `openssl s_server` (-WWW/-HTTP) dosyaları varsayılan olarak METİN kipinde açar
+# (apps/s_server.c: opmode = http_server_binmode ? "rb" : "r"): C çalışma zamanı 0x1A (Ctrl-Z)
+# görünce EOF sayar ve CRLF -> LF çevirir; rastgele ikili veri ilk 0x1A'da (~256 baytta) kesilirdi.
+# OpenSSL 3.x'te `-http_server_binmode` ile ikili kip seçilir (interop/openssl_server.py bunu
+# win32'de otomatik ekler; veri tam ikili kalır). Bayrak yoksa (OpenSSL < 3) yük 0x1A/CR/LF
+# içermeyen alfasayısal baytlardan üretilir: yine 3 MB, çok record, aynı SHA-256 kuvveti.
 _METIN_GUVENLI = bytes.maketrans(bytes(range(256)),
                                  bytes((b"abcdefghijklmnopqrstuvwxyz"
                                         b"ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789")[i % 62] for i in range(256)))
@@ -47,14 +48,13 @@ _METIN_GUVENLI = bytes.maketrans(bytes(range(256)),
 
 def _big_payload(n: int) -> bytes:
     raw = os.urandom(n)
-    return raw.translate(_METIN_GUVENLI) if sys.platform == "win32" else raw
+    return raw.translate(_METIN_GUVENLI) if text_mode_files() else raw
 
 
 def text_mode_crlf(head: bytes) -> bytes:
-    """Windows'ta s_server dosyayı metin kipinde okurken CRLF -> LF çevirir; ``\\r\\r\\n`` ise
-    ``\\r\\n``'e iner (yalnızca CR+LF çifti birleşir). Başlık dosyalarını bu yüzden win32'de
-    ``\\r\\r\\n`` ile yazarız ki istemci gerçek CRLF görsün."""
-    return head.replace(b"\r\n", b"\r\r\n") if sys.platform == "win32" else head
+    """Metin kipi okumada (bkz. üstte) CRLF -> LF olur; ``\\r\\r\\n`` ise ``\\r\\n``'e iner (yalnızca
+    CR+LF çifti birleşir). Yalnızca ikili kip YOKSA başlık dosyaları bu yüzden ``\\r\\r\\n`` ile yazılır."""
+    return head.replace(b"\r\n", b"\r\r\n") if text_mode_files() else head
 
 
 class Env:
@@ -289,6 +289,15 @@ def _keyupdate_server(env):
     return SServer("-cert", cert, "-key", key, "-tls1_3", "-crlf", "-msg")
 
 
+@pytest.mark.skipif(
+    sys.platform == "win32",
+    reason="openssl s_server Windows'ta boru (pipe) stdin'ini soket G/Ç'si ile birlikte işleyemez: "
+           "select() stdin'de çalışmaz, apps/s_server.c sv_body 1 sn'lik bir yoklama döngüsüne düşer ve "
+           "apps/lib/apps.c has_stdin_waiting() yönlendirilmiş stdin için (PeekConsoleInput başarısız -> "
+           "!feof(stdin)) hep 'veri var' der; sonuç, el sıkışmadan ÖNCE stdin'de bloklayan read(). Testin "
+           "'GET /index.html' çıktısını bekleyip sonra komut yazması bu yüzden kilitlenir. "
+           "KeyUpdate (k/K) mantığı platformdan bağımsız sans-IO testlerle (test_tls13_core, "
+           "test_handshake, test_tls13_wrappers, tls13_fakeserver) Windows'ta da koşar.")
 @pytest.mark.parametrize("mode", MODES)
 @pytest.mark.parametrize("cmd", ["k", "K"])
 def test_keyupdate_sunucudan(env, cmd, mode):
