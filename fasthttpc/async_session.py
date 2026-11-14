@@ -461,7 +461,8 @@ class AsyncSession:
                     reader, writer = await async_connect_via_proxy(proxy, host, port, timeout=connect_to)
                     try:
                         stream = await AsyncTLSStream.negotiate(
-                            reader, writer, sni, self.impersonate, ca_path=self._ca_path, **kw)
+                            reader, writer, sni, self.impersonate, ca_path=self._ca_path,
+                            port=port, **kw)   # bilet anahtarı: proxy'nin değil hedefin portu
                     except BaseException:
                         writer.close()
                         raise
