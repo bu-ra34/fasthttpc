@@ -1,5 +1,42 @@
 # Changelog
 
+## [0.4.0] — 2026-11-14
+
+Tur 2: async tarafın senkronla eşitlenmesi, saha testleri ve bulunan hataların
+düzeltilmesi.
+
+### Async
+
+- **AsyncSession proxy desteği:** HTTP CONNECT ve SOCKS5.
+- **Async HTTP/2 multiplexing** (`fasthttpc/protocol/async_h2.py`): tek bağlantıda
+  eşzamanlı akışlar, `MAX_CONCURRENT_STREAMS` ve akış kontrol penceresine uyum.
+- AsyncSession için `Timeout` ve `Limits`.
+- Async HTTP/1.1 gövde çerçevelemesi düzeltmeleri (204/304/HEAD, chunked, kesik gövde).
+- AsyncSession h2 yanıtlarında `Response.http_version == "HTTP/2"`.
+
+### Saha testleri
+
+- `saha/` dizini (canlı site, soak, yük ve bellek betikleri) ve `saha/RAPOR.md`.
+- Bulunan 7 senkron hata düzeltildi:
+  1. `Connection: close` yanıtı havuz slotunu iade etmiyordu (sızıntı).
+  2. 204/304/HEAD yanıtlarında gövde beklenip zaman aşımı oluyordu.
+  3. `close_notify`'sız HTTP/1.0 EOF hata sayılıyordu.
+  4. Kesik gövde sessizce kabul ediliyordu (artık `ConnectionResetError`).
+  5. Zaman aşımında POST yeniden gönderiliyordu.
+  6. h2 `_stream_windows` sızıntısı.
+  7. `CookieJar` kilidi eksikti.
+
+### API
+
+- `Timeout(total=...)`: istek başına toplam süre sınırı.
+- `Response.http_version` alanı.
+
+### Bu turdaki düzeltmeler
+
+- Senkron h2 yolunda `:authority` standart olmayan portta `host:port` olarak gönderiliyor.
+- Senkron h2 yanıt başlıkları `Headers.add` ile okunuyor; çoklu `Set-Cookie` kaybolmuyor.
+- `dev` ve `all` extras'a `h2>=4` eklendi (async h2 birlikte-çalışma testleri atlanmıyor).
+
 ## [0.3.0] — 2026-11-07
 
 Beş paralel çalışma dalının (güvenlik, uyumluluk, sans-IO/async, performans,
