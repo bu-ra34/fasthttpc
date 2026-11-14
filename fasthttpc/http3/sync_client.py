@@ -59,15 +59,47 @@ class SyncH3Connection:
         self._flush()
 
     def connect(self) -> None:
+        """getaddrinfo sonuçlarını sırayla dener (Happy Eyeballs benzeri); toplam süre
+        ``connect_timeout``. ICMP reddi/hata anında, sessiz zaman aşımında kalan sürenin
+        payıyla sonraki adrese geçilir. Sertifika hatasında DURULUR (başka adres denenmez)."""
+        o = self._opts
+        try:
+            infos = socket.getaddrinfo(self._target[0], self._target[1], type=socket.SOCK_DGRAM)
+        except OSError as e:
+            raise Http3ConnectError(f"DNS çözümlenemedi: {e}", e) from e
+        addrs, seen = [], set()
+        for family, _, _, _, addr in infos:
+            if addr not in seen:
+                seen.add(addr)
+                addrs.append((family, addr))
+        if not addrs:
+            raise Http3ConnectError("UDP için adres bulunamadı")
+        deadline = time.monotonic() + o.connect_timeout
+        last: "Exception | None" = None
+        for i, (family, addr) in enumerate(addrs):
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            try:
+                self._attempt(family, addr, remaining / (len(addrs) - i))
+                return
+            except Http3ConnectError as e:
+                last = e
+                if isinstance(getattr(e, "cause", None), CertificateValidationError):
+                    raise
+        raise last or Http3ConnectError("QUIC el sıkışması zaman aşımı")
+
+    def _attempt(self, family, addr, timeout: float) -> None:
         o = self._opts
         host, port = self.origin
         try:
-            infos = socket.getaddrinfo(self._target[0], self._target[1], type=socket.SOCK_DGRAM)
-            family, _, _, _, addr = infos[0]
             self._sock = socket.socket(family, socket.SOCK_DGRAM)
             self._sock.setblocking(False)
             self._sock.connect(addr)
         except OSError as e:
+            if self._sock is not None:
+                self._sock.close()
+                self._sock = None
             raise Http3ConnectError(f"UDP soketi açılamadı: {e}", e) from e
         self.core = H3Core(host, port, ca_path=self._ca_path, impersonate=self._impersonate,
                            idle_timeout=o.idle_timeout, clock=time.monotonic)
@@ -75,10 +107,12 @@ class SyncH3Connection:
         self.core.connect(addr)
         try:
             self._run(lambda: self.core.handshake_done or self.core.closed,
-                      time.monotonic() + o.connect_timeout, "el sıkışma")
+                      time.monotonic() + timeout, "el sıkışma")
         except (TimeoutError, Http3Error) as e:
+            err = self.core.error
             self.close()
-            raise Http3ConnectError(f"QUIC el sıkışması başarısız: {e}", e) from e
+            raise (err if isinstance(err, Http3ConnectError) else
+                   Http3ConnectError(f"QUIC el sıkışması başarısız: {e}", e)) from e
         if not self.core.handshake_done:
             err = self.core.error
             self.close()
