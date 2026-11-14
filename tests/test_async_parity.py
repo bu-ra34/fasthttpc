@@ -194,6 +194,9 @@ def test_connect_timeout_tls_el_sikisma_takilirsa(ca):
     async def main():
         async def hang(r, w):
             await r.read()               # istemci kapatana kadar sessiz kal
+            # Sunucu tarafını da kapat: Python 3.12+ Server.wait_closed() açık
+            # kalan bağlantı transport'larını bekler; kapatılmazsa test asılı kalır.
+            w.close()
         srv = await asyncio.start_server(hang, "127.0.0.1", 0)
         port = srv.sockets[0].getsockname()[1]
         async with srv:
