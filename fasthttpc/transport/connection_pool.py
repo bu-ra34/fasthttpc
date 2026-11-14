@@ -45,7 +45,7 @@ class HTTPConnection:
 
     __slots__ = (
         "origin", "socket", "is_closed", "tls_established",
-        "conn_data", "ttfb_ms", "_lock", "in_use", "h2_conn", "idle_since",
+        "conn_data", "ttfb_ms", "_lock", "in_use", "h2_conn", "idle_since", "pool_key",
     )
 
     def __init__(self, origin: tuple[str, str, int]):
@@ -59,6 +59,7 @@ class HTTPConnection:
         self.in_use: bool           = False
         self.h2_conn                = None       # ALPN "h2" ise Http2Connection nesnesi
         self.idle_since: float      = 0.0
+        self.pool_key               = origin     # rotasyonda proxy'yi de içerir
 
     def connect(self, timeout: float = 30.0, resolver=None,
                 proxy: "ProxyConfig | None" = None) -> None:
@@ -203,13 +204,18 @@ class ConnectionPool:
 
                                                                               
 
-    def acquire(self, url: URL, block: bool = True, timeout: Optional[float] = None) -> HTTPConnection:
+    def acquire(self, url: URL, block: bool = True, timeout: Optional[float] = None,
+                proxy: Optional[str] = None) -> HTTPConnection:
         """
         URL için en hızlı canlı bağlantıyı döner.
         Yoksa yeni bağlantı kurar. Concurrency limiti Semaphore ile korunur.
+
+        ``proxy``: proxy rotasyonu için istek başına proxy URL'i (``self.proxy``'yi
+        geçersiz kılar; bağlantılar proxy başına ayrı havuzlanır).
         """
         origin = (url.scheme, url.host, url.port)
-        sem = self._get_semaphore(origin)
+        key = origin if proxy is None else origin + (proxy,)
+        sem = self._get_semaphore(key)
 
                                                                 
         acquired = sem.acquire(blocking=block, timeout=timeout or self.timeout)
@@ -218,7 +224,7 @@ class ConnectionPool:
 
         now = time.monotonic()
         with self._lock:
-            pool = self._pools[origin]
+            pool = self._pools[key]
             pool.sort()  # en düşük TTFB önce
             while pool:
                 conn = pool.pop(0)
@@ -235,9 +241,11 @@ class ConnectionPool:
 
                                               
         conn = HTTPConnection(origin)
+        conn.pool_key = key
         try:
             conn.connect(timeout=self.timeout, resolver=self.resolver,
-                         proxy=resolve_proxy(self.proxy, url.scheme))
+                         proxy=resolve_proxy(self.proxy if proxy is None else proxy,
+                                             url.scheme))
         except Exception:
             # Bağlantı kurulamadı: bu slot için hiç bağlantı verilmeyecek,
             # semaphore'u serbest bırakmazsak kalıcı olarak sızar (havuz asla
@@ -252,7 +260,7 @@ class ConnectionPool:
     def release(self, conn: HTTPConnection) -> None:
         """Bağlantıyı Keep-Alive amacıyla havuza geri koy."""
         conn.in_use = False
-        origin = conn.origin
+        origin = conn.pool_key
         sem    = self._get_semaphore(origin)
 
         if not conn.is_closed:
@@ -262,7 +270,10 @@ class ConnectionPool:
                 keep = getattr(self, "max_keepalive_connections", None)
                 if keep is None:
                     keep = self.max_connections
-                if len(pool) < keep:
+                # keepalive_expiry=0: keep-alive KAPALI (AsyncSession/httpx ile aynı);
+                # None: süre sınırı yok.
+                no_keepalive = self.idle_timeout is not None and self.idle_timeout <= 0
+                if len(pool) < keep and not no_keepalive:
                     pool.append(conn)
                 else:
                     conn.close()
@@ -336,8 +347,11 @@ class ConnectionPool:
     def stats(self) -> dict:
         """Her origin için havuz istatistiği döner."""
         with self._lock:
+            grouped: dict = {}
+            for (s, h, p, *_proxy), conns in self._pools.items():
+                grouped.setdefault(f"{s}://{h}:{p}", []).extend(conns)
             return {
-                f"{s}://{h}:{p}": {
+                name: {
                     "idle": len(conns),
                     "avg_ttfb_ms": round(
                         sum(c.ttfb_ms for c in conns if c.ttfb_ms != float("inf"))
@@ -345,5 +359,5 @@ class ConnectionPool:
                         2,
                     ),
                 }
-                for (s, h, p), conns in self._pools.items()
+                for name, conns in grouped.items()
             }

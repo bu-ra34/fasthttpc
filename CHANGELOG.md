@@ -1,5 +1,22 @@
 # Changelog
 
+## [Yayınlanmamış]
+
+- **Profil başına tarayıcı başlıkları:** `Session`/`AsyncSession` artık profilin
+  `user_agent`'ını ve gerçek tarayıcının varsayılan gezinme başlıklarını
+  gönderir (Chrome: sec-ch-ua*, sec-fetch-*, priority...; Firefox/Safari kendi
+  kümeleri, sec-ch-ua yok). Sıra profildeki `header_order` (h2) /
+  `h1_header_order` (h1) ile aynıdır; `Accept-Encoding` yalnızca açabildiğimiz
+  kodlamaları (br/zstd kuruluysa) içerir. Safari UA'sı macOS sürümünü 10_15_7
+  olarak dondurur.
+- **Oturum başlıkları:** `Session(headers={...})` / `s.headers` (iki sınıfta da
+  mutable). Öncelik: profil < oturum < istek; değeri `None` olan başlık
+  varsayılanı kaldırır.
+- `impersonate=None` ("default") profili TLS 1.2 ilan eder (EMS,
+  renegotiation_info, 0x0303, AEAD suite'leri).
+- Senkron `Session`: `options()`, `set_proxies()`, `resolver` niteliği;
+  `Limits(keepalive_expiry=0)` artık senkronda da keep-alive'ı kapatır.
+
 ## [0.4.0] — 2026-11-14
 
 Tur 2: async tarafın senkronla eşitlenmesi, saha testleri ve bulunan hataların

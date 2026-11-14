@@ -312,7 +312,6 @@ verir veya belgelenmiştir:
     null dışı sıkıştırma, TLS 1.1 ve altı. Renegotiation desteklenmez (HelloRequest'e
     `no_renegotiation` uyarısı verilir, tekrarlanırsa bağlantı kapanır).
   - *Kullanılmayan:* NewSessionTicket yalnızca ayrıştırılır; oturum devamı yoktur.
-  - `impersonate=None` ("default") profili TLS 1.2'yi ilan etmez; 1.2 seçen sunucu reddedilir.
 - **HelloRetryRequest:** destekleniyor (RFC 8446 §4.1.4, cookie dahil); ikinci
   HRR handshake'i sonlandırır.
 - **Session resumption (PSK/0-RTT) yok.** Her bağlantı tam handshake yapar.
