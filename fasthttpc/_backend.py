@@ -388,8 +388,8 @@ class AnyioStream:
 
     * ``write`` eşzamanlıdır (tampona yazar), ``drain`` tamponu gönderir;
       böylece StreamWriter ile aynı çağrı düzeni çalışır.
-    * Gönderme sırasında iptal/zaman aşımı olursa kısmen yazılmış olabilir:
-      akış bozulmuş sayılır (sonraki yazma ConnectionResetError).
+    * Gönderimi arka plan görevi yapar: ``drain`` iptal edilse de veri yarım
+      kalmaz (bkz. ``write`` altındaki not).
     * ``close`` eşzamanlıdır; kalan tamponu gönderip akışı arka planda kapatır,
       ``wait_closed`` bunu bekler.
     """
@@ -403,8 +403,8 @@ class AnyioStream:
         self._rbuf = bytearray()
         self._eof = False
         self._closing = False
-        self._broken = False
-        self._send_lock = anyio.Lock()
+        self._err: Optional[BaseException] = None
+        self._flusher: Any = None
         self._closed_evt = anyio.Event()
         self._close_started = False
 
@@ -476,32 +476,50 @@ class AnyioStream:
         return self._eof and not self._rbuf
 
     # ------------------------------------------------------------------ yazma
+    # ``write`` tampona yazar; tamponu BOŞALTAN arka plan "flusher" görevi
+    # (``_flush_loop``) soket yazmasını yapar. ``drain`` yalnızca flusher'ın
+    # bitmesini bekler: bekleyen görev iptal olsa/zaman aşımına uğrasa bile
+    # veri yarım kalmaz, flusher gönderimi tamamlar (asyncio taşıyıcısındaki
+    # tampon davranışıyla aynı). Gönderim hatası sonraki drain'de yükselir.
     def write(self, data: bytes) -> None:
         if self._closing:
             return
         self._wbuf += data
+        self._kick()        # drain beklenmese de (ör. RST_STREAM) gönderim başlar
 
-    async def _flush_locked(self) -> None:
+    def _kick(self) -> None:
+        if self._flusher is None and self._wbuf and self._err is None:
+            coro = self._flush_loop()
+            try:
+                self._flusher = spawn(coro, name="fasthttpc-flush")
+            except RuntimeError:
+                coro.close()
+
+    async def _flush_loop(self) -> None:
         anyio = _anyio()
-        if self._broken:
-            raise ConnectionResetError("Bağlantı bozuldu (gönderim yarıda kesilmişti).")
-        if not self._wbuf:
-            return
-        data = bytes(self._wbuf)
-        self._wbuf.clear()
-        ok = False
         try:
-            await self._s.send(data)
-            ok = True
+            while self._wbuf:
+                data = bytes(self._wbuf)
+                self._wbuf.clear()
+                await self._s.send(data)
         except (anyio.BrokenResourceError, anyio.ClosedResourceError) as e:
-            raise ConnectionResetError(f"Bağlantı koptu: {e}") from e
+            self._err = ConnectionResetError(f"Bağlantı koptu: {e}")
+        except OSError as e:
+            self._err = e
+        except Exception as e:  # noqa: BLE001
+            self._err = ConnectionResetError(f"Gönderim hatası: {e!r}")
         finally:
-            if not ok:
-                self._broken = True      # kısmi gönderim olmuş olabilir
+            self._flusher = None
 
     async def drain(self) -> None:
-        async with self._send_lock:
-            await self._flush_locked()
+        if self._err is not None:
+            raise self._err
+        self._kick()
+        f = self._flusher
+        if f is not None:
+            await f.wait()
+        if self._err is not None:
+            raise self._err
 
     # ----------------------------------------------------------------- kapanış
     def is_closing(self) -> bool:
@@ -524,14 +542,11 @@ class AnyioStream:
         try:
             with anyio.CancelScope(shield=True):
                 with anyio.move_on_after(1.0):
-                    async with self._send_lock:
-                        if self._wbuf and not self._broken:
-                            try:
-                                await self._s.send(bytes(self._wbuf))
-                            except Exception:  # noqa: BLE001
-                                pass
-                        self._wbuf.clear()
-                    await self._s.aclose()
+                    self._kick()
+                    f = self._flusher
+                    if f is not None:
+                        await f.wait()
+                await self._s.aclose()
         except Exception as e:  # noqa: BLE001
             logger.debug("akış kapatma hatası: %s", e)
         finally:
