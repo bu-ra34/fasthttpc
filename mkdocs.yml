@@ -1,0 +1,60 @@
+site_name: fasthttpc
+site_description: Pure-Python HTTP client with browser TLS/HTTP2 fingerprint impersonation
+site_url: https://cevpy.github.io/fasthttpc/
+repo_url: https://github.com/cevpy/fasthttpc
+repo_name: cevpy/fasthttpc
+edit_uri: edit/main/docs/
+strict: true
+
+theme:
+  name: material
+  features:
+    - navigation.sections
+    - navigation.top
+    - content.code.copy
+    - search.suggest
+
+markdown_extensions:
+  - admonition
+  - tables
+  - toc:
+      permalink: true
+  - pymdownx.highlight
+  - pymdownx.superfences
+
+plugins:
+  - search
+  - mkdocstrings:
+      handlers:
+        python:
+          options:
+            show_source: false
+            show_root_heading: true
+            members_order: source
+            docstring_style: null
+
+nav:
+  - Home: index.md
+  - Getting started:
+      - Quick start: quickstart.md
+      - Sync and async usage: usage.md
+      - Migrating from requests: migration-requests.md
+      - Migrating from httpx: migration-httpx.md
+  - Guides:
+      - Profiles and fingerprints: profiles.md
+      - Proxies: proxy.md
+      - TLS: tls.md
+      - HTTP/2: http2.md
+      - Timeouts, limits, retries: timeouts-limits-retries.md
+      - Testing with MockTransport: testing.md
+  - Upcoming features:
+      - Streaming responses: features/streaming.md
+      - Auth and hooks: features/auth-hooks.md
+      - Client certificates (mTLS): features/client-certs.md
+      - Legacy TLS: features/legacy-tls.md
+      - HTTP/3: features/http3.md
+      - Trio support: features/trio.md
+  - Reference:
+      - API reference: reference/api.md
+      - Security model: security.md
+      - Known limits: limits.md
