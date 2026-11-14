@@ -653,7 +653,7 @@ class AsyncSession:
 
     def _idle_purge(self) -> None:
         """Süresi dolan boşta bağlantıları kapatır."""
-        now = time.monotonic()
+        now = time.perf_counter()
         for key in list(self._idle):
             keep = []
             for o in self._idle[key]:
@@ -704,17 +704,17 @@ class AsyncSession:
                     o.release, o.reused = release, True
                     if metrics:
                         metrics.connection_reused = True
-                        metrics.connect_start = metrics.connect_end = time.monotonic()
+                        metrics.connect_start = metrics.connect_end = time.perf_counter()
                     return o
             if metrics:
-                metrics.connect_start = time.monotonic()
+                metrics.connect_start = time.perf_counter()
             reader, writer, alpn = await self._connect(u.host, u.port, proxy)
         except BaseException:
             release()
             raise
         if metrics:
-            metrics.connect_end = time.monotonic()
-            metrics.tls_end     = time.monotonic()
+            metrics.connect_end = time.perf_counter()
+            metrics.tls_end     = time.perf_counter()
         return _Opened(reader, writer, alpn, release, key=key,
                        loop=B.current_token())
 
@@ -723,7 +723,7 @@ class AsyncSession:
         try:
             if reusable:
                 self._idle_purge()
-                o.last_used = time.monotonic()
+                o.last_used = time.perf_counter()
                 cap = self.limits.max_keepalive_connections
                 if cap is None:
                     cap = self.limits.max_connections
@@ -750,7 +750,7 @@ class AsyncSession:
         if not loop_ok or not conn.usable:
             drop = True
         elif expiry is not None and conn.active_streams == 0 \
-                and time.monotonic() - conn.last_used > expiry:
+                and time.perf_counter() - conn.last_used > expiry:
             drop = True
         if drop:
             del self._h2[key]
@@ -796,8 +796,8 @@ class AsyncSession:
                 if r3 is not None:
                     if metrics:
                         metrics.bytes_sent = len(raw_body)
-                        metrics.first_byte_time = time.monotonic()
-                    return r3[0], r3[1], r3[2], time.monotonic(), "HTTP/3"
+                        metrics.first_byte_time = time.perf_counter()
+                    return r3[0], r3[1], r3[2], time.perf_counter(), "HTTP/3"
         key = self._origin_key(u, proxy)
         for attempt in (0, 1):
             conn = self._h2_get(key)
@@ -805,7 +805,7 @@ class AsyncSession:
             if conn is not None:
                 if metrics:
                     metrics.connection_reused = True
-                    metrics.connect_start = metrics.connect_end = time.monotonic()
+                    metrics.connect_start = metrics.connect_end = time.perf_counter()
             elif self.impersonate is not None and self._origin_proto.get(key) != "h1":
                 # Protokol henüz bilinmiyor: aynı kaynağa eşzamanlı gelen isteklerin
                 # tek bir h2 bağlantısını paylaşabilmesi için ilk el sıkışma serileşir.
@@ -858,13 +858,13 @@ class AsyncSession:
         authority = host if u.port == 443 else f"{host}:{u.port}"
         if metrics:
             metrics.bytes_sent = len(raw_body) + sum(len(k) + len(v) for k, v in h2_headers)
-        send_time = time.monotonic()
+        send_time = time.perf_counter()
         try:
             if stream:
                 h = await conn.request_stream(method, authority, u.raw_path.decode("latin-1"),
                                               h2_headers, raw_body)
                 if metrics:
-                    metrics.first_byte_time = h.first_byte_time or time.monotonic()
+                    metrics.first_byte_time = h.first_byte_time or time.perf_counter()
                 headers = Headers()
                 for k, v in h.headers:
                     headers.add(k, v)
@@ -876,7 +876,7 @@ class AsyncSession:
         except (Http2StreamError, Http2ConnectionError) as e:
             raise ConnectionError(f"HTTP/2 isteği başarısız: {e}") from e
         if metrics:
-            metrics.first_byte_time = r.first_byte_time or time.monotonic()
+            metrics.first_byte_time = r.first_byte_time or time.perf_counter()
         headers = Headers()
         for k, v in r.headers:
             headers.add(k, v)
@@ -1025,7 +1025,7 @@ class AsyncSession:
 
             writer.write(raw_request)
             await B.wait_for(writer.drain(), self._tmo().write)
-            send_time = time.monotonic()
+            send_time = time.perf_counter()
 
             hdr_acc = bytearray()
             sep     = -1
@@ -1034,7 +1034,7 @@ class AsyncSession:
                 if not chunk: break
                 got_bytes = True
                 if len(hdr_acc) == 0 and metrics:
-                    metrics.first_byte_time = time.monotonic()
+                    metrics.first_byte_time = time.perf_counter()
                 search_from = max(0, len(hdr_acc) - 3)
                 hdr_acc += chunk
                 sep = hdr_acc.find(b"\r\n\r\n", search_from)
@@ -1148,7 +1148,7 @@ class AsyncSession:
             req_headers["Content-Length"] = str(len(raw_body))
 
         if metrics:
-            metrics.request_start = time.monotonic()
+            metrics.request_start = time.perf_counter()
 
         try:
             status_code, resp_headers, body_raw, send_time, http_version = await self._exchange(
@@ -1156,9 +1156,9 @@ class AsyncSession:
 
             is_stream = not isinstance(body_raw, (bytes, bytearray))
             if metrics:
-                metrics.transfer_end   = time.monotonic()
+                metrics.transfer_end   = time.perf_counter()
                 metrics.bytes_received = 0 if is_stream else len(body_raw)
-                metrics.total_end      = time.monotonic()
+                metrics.total_end      = time.perf_counter()
 
             if is_stream:
                 body_final = b""
@@ -1176,7 +1176,7 @@ class AsyncSession:
             resp.tls_info = self._tls_infos.get((u.host, u.port, proxy_cfg))
             resp.url = str(url)
             if metrics and metrics.request_start:
-                resp.elapsed = time.monotonic() - metrics.request_start
+                resp.elapsed = time.perf_counter() - metrics.request_start
 
             if metrics:
                 resp.metrics = metrics
@@ -1355,7 +1355,7 @@ class AsyncSession:
         current_url    = url
         redirect_count = 0
         history: list[Response] = []
-        metrics = RequestMetrics(request_start=time.monotonic())
+        metrics = RequestMetrics(request_start=time.perf_counter())
         headers = self._merged_headers(headers)
         body = _api.encode_body(data, json, files, headers)
         req_hooks = _api.normalize_hooks(hooks)
