@@ -19,6 +19,18 @@ ya da ortam değişkeni FASTHTTPC_TLS_RESUMPTION=1.
 
 Yalnızca psk_dhe_ke modu kullanılır (her bağlantıda yine taze ECDHE; ileri
 gizlilik korunur). 0-RTT (early data) BİLEREK desteklenmez — replay'e açıktır.
+
+Senkron / async paylaşımı (KARAR): senkron yol (tls_adapter.negotiate) ve async
+sans-IO çekirdek (tls13/connection.py) AYNI süreç içi `default_cache`'i ve
+AYNI saf fonksiyonları (begin_resumption, check_psk_selection,
+store_new_session_tickets) kullanır. Bir bilet yalnızca anahtarı birebir
+eşleşen bağlantıda geçerlidir: (host, port, ca_path) — yani aynı güven kökünde
+doğrulanmış aynı hedef. Senkron alınan bilet bu yüzden async'te (ve tersi)
+kullanılabilir; bilet tek kullanımlık olduğundan iki yol aynı PSK'yı asla iki
+kez göndermez. İstisna: async çekirdeğe ÖZEL `cert_validator` verildiyse
+resumption hiç teklif edilmez ve bilet saklanmaz (kimliğin hangi güven
+kökünden geldiği bilinemez). Profil/ALPN anahtara girmez: sunucu ALPN'yi
+resumption'da yeniden seçer (EE) ve parmak izi güvenlik sınırı değildir.
 """
 from __future__ import annotations
 
