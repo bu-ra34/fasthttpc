@@ -9,6 +9,7 @@ import asyncio
 import ssl
 import warnings
 
+from . import _backend as B
 from ._log import get_logger
 from . import _api
 from ._api import USE_CLIENT_DEFAULT
@@ -367,12 +368,13 @@ class AsyncSession:
         self.cookie_jar    = CookieJar()
         self._plugins: list[Plugin]   = []
         self._rotator: Optional[ProxyRotator] = None
-        self._sem     = asyncio.Semaphore(self.limits.max_connections)
+        self._sem_obj: Any = None          # bkz. ``_sem`` (arka uca göre geç oluşturulur)
+        self._sem_kind: Optional[str] = None
         # HTTP/2: (host, port, proxy) -> canlı bağlantı; kaynak protokol önbelleği
         self._h2:           dict[tuple, AsyncHttp2Connection] = {}
         self._origin_proto: dict[tuple, str] = {}
-        self._origin_locks: dict[tuple, asyncio.Lock] = {}
-        self._bg_tasks:     set[asyncio.Task] = set()
+        self._origin_locks: dict[tuple, Any] = {}
+        self._bg_tasks:     set = set()
         # HTTP/1.1 keep-alive havuzu: (host, port, proxy, impersonate-mi) -> boşta bağlantılar.
         # Boştaki bağlantı semaphore slotu TUTMAZ (slot yalnızca kullanımdayken).
         self._idle: dict[tuple, list[_Opened]] = {}
@@ -403,6 +405,17 @@ class AsyncSession:
         """h2/protokol önbelleği anahtarı; mTLS'de sertifika kimliği anahtara girer."""
         k = (u.host, u.port, proxy)
         return k + (self.client_cert.identity,) if self.client_cert is not None else k
+
+    @property
+    def _sem(self):
+        """Bağlantı semaforu. Çalışan arka uca (asyncio | trio) göre oluşturulur;
+        döngü dışında kurulan oturum için geçici asyncio semaforu, trio altında
+        ilk kullanımda değiştirilir."""
+        kind = B.current_backend(None)
+        if self._sem_obj is None or (kind is not None and kind != self._sem_kind):
+            self._sem_obj = B.Semaphore(self.limits.max_connections)
+            self._sem_kind = kind or "asyncio"
+        return self._sem_obj
 
     @property
     def cookies(self) -> dict[str, str]:
@@ -486,7 +499,7 @@ class AsyncSession:
                 logger.debug("Ön ısıtma başarısız %s: %s", host, e)
                 return host, False
             o = _Opened(reader, writer, alpn, lambda: None, key=self._h1_key(u, proxy_cfg),
-                        loop=asyncio.get_running_loop())
+                        loop=B.current_token())
             try:
                 key = self._origin_key(u, proxy_cfg)
                 if alpn == "h2":
@@ -504,9 +517,13 @@ class AsyncSession:
                 return host, False
 
         tasks = [_warm_one(h) for h in hosts for _ in range(count)]
-        for coro in asyncio.as_completed(tasks):
-            host, ok = await coro
-            results[host] = results.get(host, 0) + (1 if ok else 0)
+        if B.current_backend() == "asyncio":
+            for coro in asyncio.as_completed(tasks):
+                host, ok = await coro
+                results[host] = results.get(host, 0) + (1 if ok else 0)
+        else:
+            for host, ok in await B.gather(*tasks):
+                results[host] = results.get(host, 0) + (1 if ok else 0)
 
         return results
 
@@ -535,12 +552,12 @@ class AsyncSession:
         connect_to = self._tmo().connect
         sni = host
         if proxy is None and self.resolver is not None:
-            host = await asyncio.wait_for(self._resolve(host), connect_to)   # DoH: TCP IP'ye, TLS/SNI özgün ada
+            host = await B.wait_for(self._resolve(host), connect_to)   # DoH: TCP IP'ye, TLS/SNI özgün ada
 
         async def _go():
             if not tls:
                 if proxy is None:
-                    reader, writer = await asyncio.open_connection(host, port)
+                    reader, writer = await B.open_connection(host, port)
                 else:
                     reader, writer = await async_connect_via_proxy(
                         proxy, host, port, timeout=connect_to)
@@ -568,7 +585,7 @@ class AsyncSession:
             ctx = ssl.create_default_context(cafile=self._ca_path)
             ctx.set_alpn_protocols(["http/1.1"])
             if proxy is None:
-                reader, writer = await asyncio.open_connection(
+                reader, writer = await B.open_connection(
                     host, port, ssl=ctx, server_hostname=sni)
             else:
                 reader, writer = await async_connect_via_proxy(proxy, host, port, timeout=connect_to)
@@ -582,13 +599,12 @@ class AsyncSession:
                     raise
             return reader, writer, "http/1.1"
 
-        return await asyncio.wait_for(_go(), connect_to)
+        return await B.wait_for(_go(), connect_to)
 
     async def _resolve(self, host: str) -> str:
         """DoH çözücüyle (senkron, thread'de) IP'ye çevirir; hata olursa özgün ad."""
         try:
-            ip = await asyncio.get_running_loop().run_in_executor(
-                None, self.resolver.resolve_one, host)
+            ip = await B.run_in_thread(self.resolver.resolve_one, host)
         except Exception as e:
             logger.debug("DoH çözümlemesi başarısız (%s), OS çözücüsüne dönülüyor: %s", host, e)
             return host
@@ -655,9 +671,8 @@ class AsyncSession:
     def _idle_pop(self, key: tuple) -> "Optional[_Opened]":
         self._idle_purge()
         lst = self._idle.get(key)
-        try:
-            loop = asyncio.get_running_loop()
-        except RuntimeError:
+        loop = B.current_token()
+        if loop is None:
             return None
         while lst:
             o = lst.pop()               # en son kullanılan (LIFO) en taze olandır
@@ -673,7 +688,7 @@ class AsyncSession:
         """Havuz slotu alır; boşta uygun HTTP/1.1 bağlantısı varsa onu, yoksa yenisini
         açar. Slot ``release()`` ile geri verilir."""
         try:
-            await asyncio.wait_for(self._sem.acquire(), self._tmo().pool)
+            await B.wait_for(self._sem.acquire(), self._tmo().pool)
         except asyncio.TimeoutError:
             raise asyncio.TimeoutError(
                 f"Bağlantı havuzu {self._tmo().pool} sn içinde boşalmadı "
@@ -700,7 +715,7 @@ class AsyncSession:
             metrics.connect_end = time.monotonic()
             metrics.tls_end     = time.monotonic()
         return _Opened(reader, writer, alpn, release, key=key,
-                       loop=asyncio.get_running_loop())
+                       loop=B.current_token())
 
     async def _h1_finish(self, o: "_Opened", reusable: bool) -> None:
         """İstek bitti: bağlantıyı havuza koyar ya da kapatır; slot HER durumda geri verilir."""
@@ -729,10 +744,7 @@ class AsyncSession:
         if conn is None:
             return None
         drop = False
-        try:
-            loop_ok = conn.loop is asyncio.get_running_loop()
-        except RuntimeError:
-            loop_ok = False
+        loop_ok = conn.loop is not None and conn.loop is B.current_token()
         expiry = self.limits.keepalive_expiry
         if not loop_ok or not conn.usable:
             drop = True
@@ -742,7 +754,7 @@ class AsyncSession:
         if drop:
             del self._h2[key]
             if loop_ok and not conn.closed:
-                task = asyncio.ensure_future(conn.close())
+                task = B.spawn(conn.close())
                 self._bg_tasks.add(task)
                 task.add_done_callback(self._bg_tasks.discard)
             return None
@@ -755,7 +767,7 @@ class AsyncSession:
             on_close=opened.release, profile=self.impersonate,
         )
         try:
-            await asyncio.wait_for(conn.start(), self._tmo().connect)
+            await B.wait_for(conn.start(), self._tmo().connect)
         except BaseException:
             await conn.close()
             opened.release()
@@ -796,7 +808,7 @@ class AsyncSession:
             elif self.impersonate is not None and self._origin_proto.get(key) != "h1":
                 # Protokol henüz bilinmiyor: aynı kaynağa eşzamanlı gelen isteklerin
                 # tek bir h2 bağlantısını paylaşabilmesi için ilk el sıkışma serileşir.
-                async with self._origin_locks.setdefault(key, asyncio.Lock()):
+                async with self._origin_locks.setdefault(key, B.Lock()):
                     conn = self._h2_get(key)
                     if conn is None:
                         opened = await self._open(u, proxy, metrics)
@@ -902,7 +914,7 @@ class AsyncSession:
         bağlantı-kapanışlı (eof) gövdede 2 sn sessizlik gövdenin sonu sayılır
         (eski HTTP/1.0 davranışı); akışta okuma zaman aşımı hata olur."""
         async def more() -> bytes:
-            return await asyncio.wait_for(reader.read(65536), timeout=read_to)
+            return await B.wait_for(reader.read(65536), timeout=read_to)
 
         framing = AsyncSession._h1_framing(method, status, headers)
         if framing == "none":
@@ -978,7 +990,7 @@ class AsyncSession:
             yield bytes(buf)
         while True:                          # bağlantı kapanana kadar (HTTP/1.0)
             try:
-                c = await asyncio.wait_for(reader.read(65536),
+                c = await B.wait_for(reader.read(65536),
                                            timeout=read_to if stream else 2.0)
             except ConnectionResetError:
                 return
@@ -1011,13 +1023,13 @@ class AsyncSession:
                 metrics.bytes_sent = len(raw_request)
 
             writer.write(raw_request)
-            await asyncio.wait_for(writer.drain(), self._tmo().write)
+            await B.wait_for(writer.drain(), self._tmo().write)
             send_time = time.monotonic()
 
             hdr_acc = bytearray()
             sep     = -1
             while True:
-                chunk = await asyncio.wait_for(reader.read(4096), timeout=read_to)
+                chunk = await B.wait_for(reader.read(4096), timeout=read_to)
                 if not chunk: break
                 got_bytes = True
                 if len(hdr_acc) == 0 and metrics:
@@ -1245,7 +1257,7 @@ class AsyncSession:
                 await resp.aclose()      # akış yanıtıysa bağlantıyı bırak
             logger.debug("%d. yeniden deneme %.2fs sonra", attempt, delay)
             if delay:
-                await asyncio.sleep(delay)
+                await B.sleep(delay)
 
     # --- kimlik / hook / hop ------------------------------------------------
 
@@ -1378,7 +1390,7 @@ class AsyncSession:
                         break
                     await resp.aclose()      # tekrar denenecek yanıt (akışsa bağlantıyı bırak)
                     if delay:
-                        await asyncio.sleep(delay)
+                        await B.sleep(delay)
                     attempt += 1
                 history.extend(extras)
                 if history:
@@ -1504,7 +1516,7 @@ class AsyncSession:
             else:
                 method, url, kw = req
             tasks.append(self.request(method, url, **kw))
-        return await asyncio.gather(*tasks)
+        return await B.gather(*tasks)
 
                                                                                 
 
@@ -1520,32 +1532,19 @@ class AsyncSession:
 
     async def close(self) -> None:
         conns, self._h2 = list(self._h2.values()), {}
-        try:
-            running = asyncio.get_running_loop()
-        except RuntimeError:
-            running = None
+        running = B.current_token()
         idle = [o for lst in self._idle.values() for o in lst]
         self._idle = {}
         waits = []
         for o in idle:
             self._drop_conn(o)
-            if o.loop is running:
-                waits.append((o, asyncio.ensure_future(o.writer.wait_closed())))
-        if waits:
-            # Karşı taraf TLS close_notify'a yanıt vermezse (ssl kapanış zaman aşımı
-            # 30 sn) close() takılmasın: kısa süre bekle, kalanı arka planda kapanır.
-            _, pending = await asyncio.wait([t for _, t in waits], timeout=1.0)
-            for o, t in waits:
-                if t in pending:
-                    t.cancel()
-                    inner = getattr(o.writer, "writer", o.writer)
-                    transport = getattr(inner, "transport", None)
-                    if transport is not None:
-                        transport.abort()       # TCP'yi şimdi bırak
-                elif not t.cancelled() and t.exception() is not None:
-                    logger.debug("wait_closed hatası yok sayıldı: %s", t.exception())
+            if running is not None and o.loop is running:
+                waits.append(o.writer)
+        # Karşı taraf TLS close_notify'a yanıt vermezse (ssl kapanış zaman aşımı
+        # 30 sn) close() takılmasın: kısa süre bekle, kalanı arka planda kapanır.
+        await B.close_streams(waits, 1.0)
         for c in conns:
-            if c.loop is running:
+            if running is not None and c.loop is running:
                 await c.close()
         if self._h3 is not None:
             await self._h3.close()
@@ -1615,11 +1614,11 @@ class AsyncWebSocket:
                 f"Sec-WebSocket-Version: 13\r\n\r\n"
             )
             writer.write(req.encode("latin-1"))
-            await asyncio.wait_for(writer.drain(), session.timeout.write)
+            await B.wait_for(writer.drain(), session.timeout.write)
 
             resp = bytearray()
             while b"\r\n\r\n" not in resp:
-                chunk = await asyncio.wait_for(reader.read(4096), session.timeout.read)
+                chunk = await B.wait_for(reader.read(4096), session.timeout.read)
                 if not chunk:
                     raise ConnectionError(
                         f"WebSocket Upgrade yanıtı tamamlanmadan bağlantı kapandı: {bytes(resp[:200])!r}")
@@ -1681,7 +1680,7 @@ class AsyncWebSocket:
             try:
                 self._writer.write(WebSocketFrame(
                     WebSocketFrame.OP_CLOSE, (1000).to_bytes(2, "big")).serialize())
-                await asyncio.wait_for(self._writer.drain(), 2.0)
+                await B.wait_for(self._writer.drain(), 2.0)
             except (OSError, asyncio.TimeoutError, RuntimeError) as e:
                 logger.debug("WebSocket CLOSE frame'i gönderilemedi: %s", e)
         self._writer.close()
