@@ -125,6 +125,7 @@ class Session:
         # Oturum düzeyi varsayılan başlıklar (requests gibi mutable): profilin
         # tarayıcı başlıklarını geçersiz kılar, istek başlıkları bunları.
         self.headers       = Headers(headers)
+        self.resolver      = resolver      # opsiyonel DoHResolver (AsyncSession ile aynı ad)
         self._rotator      = None
         self.timeout       = Timeout.from_value(timeout)
         self.max_redirects = max_redirects
