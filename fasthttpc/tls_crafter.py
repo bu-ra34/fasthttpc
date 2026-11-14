@@ -393,6 +393,11 @@ class TLSImpersonator:
         if self._ext_order is not None:
             return self._ext_order
         order = list(self.profile.get("extensions_order", []))
+        if os.environ.get("FASTHTTPC_NO_ECH_GREASE") == "1":
+            # ECH GREASE'i tanıyıp TLS'i kendisi sonlandıran ara proxy'ler için
+            # (ör. kurumsal/sandbox egress proxy'leri) kaçış kapısı. JA4'te
+            # extension sayısı 1 azalır; varsayılan KAPALI (gerçek tarayıcı gibi).
+            order = [e for e in order if e != "ech_grease"]
         if self.profile.get("shuffle_extensions"):
             lo = 1 if order and order[0] == "GREASE" else 0
             hi = len(order) - 1 if order and order[-1] == "GREASE" else len(order)
