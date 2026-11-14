@@ -643,3 +643,64 @@ def test_trio_acik_akis_readuntil_ve_sinirlar(backend, srvloop):
         w.close()
         await w.wait_closed()
     run_client(backend, client)
+
+
+# ============================================================ akış (stream)
+@pytest.fixture(scope="module")
+def yerel():
+    from saha.yerel_sunucu import YerelSunucu
+    with YerelSunucu() as s:
+        yield s
+
+
+def test_h1_akis_gelisi_gozu_ve_aiter(backend, yerel):
+    async def client():
+        async with AsyncSession(verify=yerel.ca_path, timeout=5) as s:
+            t = time.monotonic()
+            r = await s.get(yerel.url + "/lines?n=3&d=0.3", stream=True)
+            assert time.monotonic() - t < 0.25            # gövde beklenmeden döner
+            assert b"".join([c async for c in r.aiter_bytes()]) == b"satir-0\nsatir-1\nsatir-2\n"
+            await r.aclose()
+            async with s.stream("GET", yerel.url + "/chunked?i=Q") as r:
+                assert await r.aread() == b"parca1-parca2-Q"
+            async with s.stream("GET", yerel.url + "/gzlines?n=3") as r:
+                assert [ln async for ln in r.aiter_lines()] == ["satir-0", "satir-1", "satir-2"]
+    run_client(backend, client)
+
+
+def test_h1_akis_okuma_zaman_asimi_ve_yarida_kapatma(backend, yerel):
+    async def client():
+        async with AsyncSession(verify=yerel.ca_path, timeout=Timeout(5, read=0.3)) as s:
+            r = await s.get(yerel.url + "/lines?n=3&d=1.5", stream=True)
+            with pytest.raises(asyncio.TimeoutError):
+                async for _ in r.aiter_bytes():
+                    pass
+            await r.aclose()
+            async with s.stream("GET", yerel.url + "/chunked?i=Q") as r:
+                it = r.aiter_bytes()
+                await it.__anext__()           # yarıda bırak; bağlantı sızmaz
+            assert sem_value(s) == s.limits.max_connections
+    run_client(backend, client)
+
+
+def test_h2_akis_parca_parca(backend, srvloop, pki, ca):
+    async def script(c):
+        await c.handshake()
+        f = await c.next_frame(FrameType.HEADERS)
+        c.send(c.response_headers(f.stream_id, 200))
+        for i in range(4):
+            c.send(c.data(f.stream_id, b"p%d" % i))
+            await c.flush()
+            await asyncio.sleep(0.05)
+        c.send(c.data(f.stream_id, b"", end=True))
+        await c.flush()
+        while await c.next_frame() is not None:
+            pass
+    srv, port, conns = srvloop.call(start_h2(pki, script))
+
+    async def client():
+        async with sess(ca) as s:
+            async with s.stream("GET", f"https://localhost:{port}/") as r:
+                chunks = [c async for c in r.aiter_bytes()]
+            assert b"".join(chunks) == b"p0p1p2p3" and len(chunks) >= 2
+    run_client(backend, client)
