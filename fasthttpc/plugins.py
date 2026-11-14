@@ -135,11 +135,12 @@ class RateLimitPlugin(Plugin):
         return request
 
     async def async_on_request(self, request: dict) -> dict:
+        from . import _backend as B      # asyncio ya da trio (çalışan arka uca uygun kilit)
         if self._alock is None:
-            self._alock = asyncio.Lock()
+            self._alock = B.Lock()
         async with self._alock:
             wait = self._interval - (time.monotonic() - self._last_req)
             if wait > 0:
-                await asyncio.sleep(wait)
+                await B.sleep(wait)
             self._last_req = time.monotonic()
         return request

@@ -1,4 +1,4 @@
-"""Asenkron sarmalayıcı: asyncio StreamReader/StreamWriter + sans-IO çekirdek.
+"""Asenkron sarmalayıcı: asyncio StreamReader/StreamWriter (ya da trio'da anyio akışı) + sans-IO çekirdek.
 
 İki yüzey sunar:
   * EncryptedSocket'in await'li karşılığı: `await send_record(...)`,
@@ -10,15 +10,15 @@
 """
 from __future__ import annotations
 
-import asyncio
-from typing import Optional
+from typing import Any, Optional
 
+from .. import _backend as B
 from .connection import TLSClientConnection
 from ._records import RecordQueue
 
 
 class AsyncTLSStream:
-    def __init__(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter,
+    def __init__(self, reader: Any, writer: Any,
                  conn: TLSClientConnection):
         self.reader = reader
         self.writer = writer
@@ -39,7 +39,7 @@ class AsyncTLSStream:
         **conn_kwargs,
     ) -> "AsyncTLSStream":
         """TCP bağlantısı açar ve TLS handshake'ini yapar."""
-        reader, writer = await asyncio.open_connection(host, port)
+        reader, writer = await B.open_connection(host, port)
         try:
             conn_kwargs.setdefault("port", port)
             return await cls.negotiate(reader, writer, server_hostname or host,
@@ -51,8 +51,8 @@ class AsyncTLSStream:
     @classmethod
     async def negotiate(
         cls,
-        reader: asyncio.StreamReader,
-        writer: asyncio.StreamWriter,
+        reader: Any,
+        writer: Any,
         host: str,
         profile_name: Optional[str] = None,
         **conn_kwargs,
