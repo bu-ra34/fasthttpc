@@ -802,9 +802,13 @@ def _handle_hrr(raw_socket: socket.socket, impersonator: TLSImpersonator,
 class TLSAdapter:
     @staticmethod
     def negotiate(raw_socket: socket.socket, host: str, profile_name: str, *,
-                  ca_path: str | None = None, port: int | None = None) -> EncryptedSocket:
-        """ca_path: None -> certifi + sistem CA'ları; aksi halde YALNIZCA o PEM dosyası."""
-        impersonator = TLSImpersonator(host, profile=profile_name)
+                  ca_path: str | None = None, port: int | None = None,
+                  legacy_tls: bool = False) -> EncryptedSocket:
+        """ca_path: None -> certifi + sistem CA'ları; aksi halde YALNIZCA o PEM dosyası.
+
+        legacy_tls: eski sunucu uyumluluk modu (varsayılan False = davranış değişmez);
+        bkz. security/tls12_legacy.py."""
+        impersonator = TLSImpersonator(host, profile=profile_name, legacy_tls=legacy_tls)
 
         # PSK resumption (faz4) — VARSAYILAN KAPALI; bkz. session_tickets.enable_resumption.
         ticket_key = None
@@ -848,7 +852,8 @@ class TLSAdapter:
         from . import tls12
         if tls12.is_tls12_server_hello(server_hello_payload):
             return tls12.negotiate_tls12(
-                raw_socket, host, record_bytes, server_hello_payload, sh_trailing, ca_path=ca_path
+                raw_socket, host, record_bytes, server_hello_payload, sh_trailing, ca_path=ca_path,
+                legacy_tls=legacy_tls,
             )
         if sh_trailing:
             raise _unexpected("ServerHello sonrasında şifresiz handshake verisi.")
