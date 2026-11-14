@@ -127,6 +127,12 @@ def test_desteklenmeyen_anahtarlar(ca, tmp_path):
         ClientCert([leaf.cert.public_bytes(serialization.Encoding.DER)], small)
 
 
+@pytest.mark.skipif(
+    sys.platform == "win32",
+    reason="Windows'ta POSIX izin bitleri yok: os.chmod yalnızca salt-okunur bitini değiştirir, "
+           "os.fstat().st_mode her zaman 0o666 civarı gelir (Python docs: os.chmod 'Availability' / "
+           "'Windows' notu); kütüphane uyarıyı bilinçli olarak yalnızca os.name == 'posix' iken üretir "
+           "(client_cert._oku), yani 0o644 -> uyarı davranışı bu platformda tanımsız.")
 def test_izin_uyarisi(ca, tmp_path, caplog):
     c = _client(ca, "p256")
     cp, kp = pki.write(tmp_path, "w", c)

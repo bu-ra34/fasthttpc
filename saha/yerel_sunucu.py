@@ -114,13 +114,29 @@ class YerelSunucu:
         self.sock.bind(("127.0.0.1", 0))
         self.sock.listen(256)
         self.port = self.sock.getsockname()[1]
+        # ::1'de de AYNI portta dinle (varsa): "localhost"u önce ::1'e çözen istemciler (Windows)
+        # bağlantıyı ilk denemede kurar. IPv6 yoksa / port doluysa sessizce yalnız IPv4.
+        self.sock6 = None
+        try:
+            s6 = socket.socket(socket.AF_INET6, socket.SOCK_STREAM)
+            try:
+                s6.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 1)
+                s6.bind(("::1", self.port))
+                s6.listen(256)
+                self.sock6 = s6
+            except OSError:
+                s6.close()
+        except OSError:
+            pass
         self.kabul_edilen_baglanti = 0   # kaç TCP bağlantısı kabul edildi
         self.istek_sayisi = 0
         self.acik_baglanti = 0
         self._kilit = threading.Lock()
         self._dur = False
         self._soketler: set = set()
-        threading.Thread(target=self._kabul_dongusu, daemon=True).start()
+        for ls in (self.sock, self.sock6):
+            if ls is not None:
+                threading.Thread(target=self._kabul_dongusu, args=(ls,), daemon=True).start()
 
     @property
     def url(self) -> str:
@@ -128,10 +144,12 @@ class YerelSunucu:
 
     def durdur(self) -> None:
         self._dur = True
-        try:
-            self.sock.close()
-        except OSError:
-            pass
+        for ls in (self.sock, self.sock6):
+            try:
+                if ls is not None:
+                    ls.close()
+            except OSError:
+                pass
         with self._kilit:
             for s in list(self._soketler):
                 try:
@@ -147,10 +165,10 @@ class YerelSunucu:
         self.durdur()
 
     # ------------------------------------------------------------------
-    def _kabul_dongusu(self) -> None:
+    def _kabul_dongusu(self, ls) -> None:
         while not self._dur:
             try:
-                raw, _ = self.sock.accept()
+                raw, _ = ls.accept()
             except OSError:
                 return
             threading.Thread(target=self._baglanti, args=(raw,), daemon=True).start()
