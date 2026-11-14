@@ -1,5 +1,61 @@
 # Changelog
 
+## [0.6.0] — 2026-11-15
+
+requests/httpx'e göre kalan on eksik kapatıldı: akış, mTLS, auth, senkron
+hook'lar, trio, İngilizce dokümantasyon, PyPI paketlemesi, tip bilgisi, HTTP/3
+ve isteğe bağlı eski TLS modu. 953 → 1498 test; Python 3.10–3.13; CI artık
+Linux, Windows ve macOS'ta.
+
+### Yeni özellikler
+- **Akış (streaming):** `stream=True`, `iter_bytes/iter_text/iter_lines/iter_raw`,
+  `aiter_*`, `with s.stream(...)` bağlamı. HTTP/1.1 ve HTTP/2, senkron ve async.
+  HTTP/2'de geri basınç: WINDOW_UPDATE yalnızca tüketilen veri için gönderilir.
+  Yönlendirme ve 401 ara yanıtlarının gövdesi atılır, yeniden denenen yanıt kapatılır.
+- **mTLS (`cert=`):** PEM, şifreli PKCS#8 ve PKCS#12; RSA ≥2048, P-256, P-384,
+  Ed25519. TLS 1.3 ve 1.2 (statik RSA dahil). Uygun sertifika/şema yoksa boş
+  Certificate gönderilir. Anahtar dosyası herkesçe okunabilirse uyarı (POSIX).
+- **Auth:** Basic, Digest (RFC 7616; MD5, SHA-256 ve -sess
+  türevleri, qop=auth/auth-int, userhash), Bearer, `.netrc`, özel auth sınıfları.
+- **Hook'lar:** requests tarzı `hooks={"response": [...]}` ve httpx tarzı
+  `event_hooks={"request": [...], "response": [...]}`. Eklentilerde senkron
+  `on_request` ve async `async_on_request`.
+- **trio:** `pip install fasthttpc[trio]` ile `AsyncSession` trio altında da
+  çalışır (anyio üzerinden). asyncio yolu değişmedi.
+- **HTTP/3 (deneysel):** `pip install fasthttpc[http3]` (aioquic). Alt-Svc keşfi,
+  UDP engelliyse h2'ye düşüş, Chrome QUIC profili. Sertifika uygulama verisinden
+  önce fasthttpc tarafından doğrulanır. `cert=` verildiğinde HTTP/3 kullanılmaz.
+- **`legacy_tls=True`:** eski sunucular için CBC suite'leri (Encrypt-then-MAC
+  tercihli, Lucky13 önlemi) ve statik RSA. Varsayılan kapalı; TLS 1.0/1.1
+  bilinçli olarak desteklenmez.
+- **Happy Eyeballs (RFC 8305):** çok adresli host'larda IPv6/IPv4 yarıştırılır
+  (senkron ve async).
+- Session/AsyncSession: `auth=`, `params=`, `cookies=`, istek düzeyi `timeout=`,
+  `head()`, `r.next`; `Response.tls_info`.
+
+### Paketleme ve dokümantasyon
+- İngilizce README (Türkçesi `README.tr.md`), mkdocs sitesi, requests/httpx
+  geçiş kılavuzları.
+- SPDX lisans, `py.typed`, PyPI metadata ve extras (`http3`, `trio`, `all`);
+  Trusted Publishing ile yayın iş akışı.
+- mypy yapılandırması ve CI'da tip denetimi.
+
+### Düzeltmeler
+- Senkron HTTP/1: başlık bloğu CRLFCRLF'den önce kesilirse sahte 200 yanıtı
+  dönüyordu; artık hata.
+- WebSocket yolu `verify=` ile verilen özel CA'yı yok sayıyordu (güvenlik).
+- Fatal alert sonrası bağlantı düzenli kapanır (`shutdown(SHUT_WR)` + sınırlı
+  boşaltma); alert artık RST'ye kurban gitmez.
+- HTTP/3: getaddrinfo adresleri sırayla denenir (IPv6'sı ölü host'larda h3
+  kurulmuyordu); Windows'ta UDP ICMP reddi (WSAECONNRESET) doğru işlenir.
+- Async proxy: proxy'ye bağlanma zaman aşımı da `ProxyError` (senkronla aynı).
+- Süre ölçümleri `time.perf_counter` ile (Windows'ta 15 ms çözünürlük sorunu).
+
+### Bilinen sınırlamalar
+- Async TLS el sıkışma hatasında sunucuya alert gönderilmiyor.
+- HTTP/3 yalnızca yerel testlerle doğrulandı; gerçek internette denenmedi.
+- Bağımsız güvenlik denetimi henüz yapılmadı.
+
 ## [0.5.0] — 2026-11-14
 
 Dört eksik kapatıldı: profil başına HTTP/2 parmak izi, güvenli TLS 1.2, async

@@ -20,6 +20,7 @@ from cryptography.hazmat.primitives import serialization
 from fasthttpc.protocol.http2_parser import (
     FrameType, HTTP2Frame, HpackDecoder, HpackEncoder, _strip_headers_frame_fields,
 )
+from netutil import start_dual
 from tls13_fakeserver import FakeTLS13Server
 
 PREFACE = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n"
@@ -138,7 +139,7 @@ async def start_tls13(pki, handler=None, **server_kw):
         servers.append(srv)
         await async_serve(srv, r, w, handler)
 
-    server = await asyncio.start_server(on_conn, "127.0.0.1", 0)
+    server = await start_dual(on_conn)
     return server, server.sockets[0].getsockname()[1], servers
 
 
@@ -166,7 +167,7 @@ async def start_stdlib_tls(pki, tmp_path, body=b"stdlib tamam"):
         finally:
             w.close()
 
-    server = await asyncio.start_server(on_conn, "127.0.0.1", 0, ssl=ctx)
+    server = await start_dual(on_conn, ssl=ctx)
     return server, server.sockets[0].getsockname()[1], requests
 
 
@@ -322,5 +323,5 @@ async def start_h2(pki, script, **server_kw):
         except (OSError, asyncio.CancelledError, asyncio.TimeoutError):
             pass
 
-    server = await asyncio.start_server(on_conn, "127.0.0.1", 0)
+    server = await start_dual(on_conn)
     return server, server.sockets[0].getsockname()[1], conns

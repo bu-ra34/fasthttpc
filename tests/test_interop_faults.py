@@ -15,7 +15,7 @@ import pytest
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from interop.relay import Relay  # noqa: E402
-from test_interop_openssl import MODES, Env, _get, _rejects  # noqa: E402,F401
+from test_interop_openssl import MODES, Env, _get, _rejects, text_mode_crlf  # noqa: E402,F401
 from test_interop_openssl import env  # noqa: E402,F401  (fixture)
 
 pytestmark = pytest.mark.interop
@@ -27,8 +27,9 @@ def _cl_file(env):
     olarak tolere edilir). Truncation testleri için başlıkları dosyada olan (-HTTP) bir yanıt hazırla."""
     body = env.big
     head = b"HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nContent-Length: %d\r\n\r\n" % len(body)
-    (env.dir / "big_cl.http").write_bytes(head + body)
-    (env.dir / "small_cl.http").write_bytes(b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello")
+    (env.dir / "big_cl.http").write_bytes(text_mode_crlf(head) + body)
+    (env.dir / "small_cl.http").write_bytes(
+        text_mode_crlf(b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\n") + b"hello")
 
 
 def _run(env, mode, s2c=None, c2s=None, path="/index.html", expect=None, **srv_args):

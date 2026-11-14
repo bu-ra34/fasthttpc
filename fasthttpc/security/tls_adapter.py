@@ -41,6 +41,7 @@ from .keyshare import (
     is_supported_group,
 )
 from . import session_tickets
+from . import mtls
 from .cert_validator import (
     validate_server_certificate,
     verify_certificate_verify,
@@ -271,8 +272,8 @@ def parse_key_update(msg: bytes) -> bool:
 class HandshakeOrderValidator:
     """İstemci tarafı TLS 1.3 handshake mesaj sırası (RFC 8446 §A.1).
 
-    ServerHello -> EncryptedExtensions -> (Certificate | CompressedCertificate)
-    -> CertificateVerify -> Finished.  Sonrasında yalnızca NewSessionTicket ve
+    ServerHello -> EncryptedExtensions -> [CertificateRequest] ->
+    (Certificate | CompressedCertificate) -> CertificateVerify -> Finished.  Sonrasında yalnızca NewSessionTicket ve
     KeyUpdate kabul edilir. psk_accepted=True ise EE -> Finished.
     Tek bir HelloRetryRequest'e izin verilir:
     expect(2, is_hrr=True) sonrası ikinci bir ServerHello beklenir.
@@ -296,6 +297,9 @@ class HandshakeOrderValidator:
     def __init__(self, psk_accepted: bool = False):
         self.state = "WAIT_SH"
         self.hrr_seen = False
+        # RFC 8446 §4.3.2: EncryptedExtensions ile Certificate arasında EN FAZLA bir
+        # CertificateRequest (mTLS). PSK devamında hiç gelmez (WAIT_FIN'de reddedilir).
+        self.cert_request_seen = False
         # PSK resumption kabul edildiyse (ServerHello ext 41) sıra:
         # EE -> Finished (Certificate/CertificateVerify gönderilmez).
         # ServerHello işlendikten sonra da set edilebilir.
@@ -316,11 +320,12 @@ class HandshakeOrderValidator:
         if self.psk_accepted and self.state == "WAIT_EE" and hs_type == _HS_ENCRYPTED_EXTENSIONS:
             self.state = "WAIT_FIN"
             return self.state
+        if hs_type == _HS_CERTIFICATE_REQUEST and self.state == "WAIT_CERT" and not self.cert_request_seen:
+            self.cert_request_seen = True     # durum aynı kalır: Certificate hâlâ beklenir
+            return self.state
         nxt = self._TRANSITIONS[self.state].get(hs_type)
         if nxt is None:
             name = self._NAMES.get(hs_type, f"tip {hs_type}")
-            if hs_type == 13:  # CertificateRequest: sunucu mTLS istiyor
-                raise _unexpected("Sunucu istemci sertifikası istedi (CertificateRequest) — desteklenmiyor.")
             raise _unexpected(f"{self.state} durumunda beklenmeyen handshake mesajı: {name}.")
         self.state = nxt
         return nxt
@@ -546,6 +551,14 @@ class EncryptedSocket:
         if hs_type == 4:      # NewSessionTicket
             self._on_new_session_ticket(msg)
             return
+        if hs_type == _HS_CERTIFICATE_REQUEST:
+            # Post-handshake auth desteklenmiyor; post_handshake_auth extension'ı İLAN EDİLMEZ
+            # (RFC 8446 §4.2.6) -> unexpected_message alert'i ile kapat (§4.6.2).
+            try:
+                self.send_record(b"\x02\x0a", content_type=0x15, use_app_keys=True)
+            except Exception:  # best-effort
+                pass
+            raise _unexpected("handshake sonrası CertificateRequest — post_handshake_auth ilan edilmedi.")
         if hs_type == _HS_KEY_UPDATE:
             self._handle_key_update(msg)
             return
@@ -802,9 +815,18 @@ def _handle_hrr(raw_socket: socket.socket, impersonator: TLSImpersonator,
 class TLSAdapter:
     @staticmethod
     def negotiate(raw_socket: socket.socket, host: str, profile_name: str, *,
-                  ca_path: str | None = None, port: int | None = None) -> EncryptedSocket:
-        """ca_path: None -> certifi + sistem CA'ları; aksi halde YALNIZCA o PEM dosyası."""
-        impersonator = TLSImpersonator(host, profile=profile_name)
+                  ca_path: str | None = None, port: int | None = None,
+                  legacy_tls: bool = False, client_cert=None) -> EncryptedSocket:
+        """ca_path: None -> certifi + sistem CA'ları; aksi halde YALNIZCA o PEM dosyası.
+
+        legacy_tls: eski sunucu uyumluluk modu (varsayılan False = davranış değişmez);
+        bkz. security/tls12_legacy.py.
+
+        client_cert: security.client_cert.ClientCert (mTLS). CertificateRequest gelirse
+        Certificate + CertificateVerify gönderilir (uygun şema yoksa boş Certificate).
+        Kimliği PSK bilet önbelleği anahtarına girer.
+        """
+        impersonator = TLSImpersonator(host, profile=profile_name, legacy_tls=legacy_tls)
 
         # PSK resumption (faz4) — VARSAYILAN KAPALI; bkz. session_tickets.enable_resumption.
         ticket_key = None
@@ -817,7 +839,9 @@ class TLSAdapter:
                     peer_port = raw_socket.getpeername()[1]
                 except (OSError, IndexError, TypeError):
                     peer_port = None
-            ticket_key = session_tickets.resumption_key(host, peer_port, ca_path)
+            ticket_key = session_tickets.resumption_key(
+                host, peer_port, ca_path,
+                *((client_cert.identity,) if client_cert is not None else ()))
         resumption_on = ticket_key is not None
         record_bytes, priv_key, _c_rand, ticket = session_tickets.begin_resumption(
             impersonator, ticket_key)
@@ -848,7 +872,9 @@ class TLSAdapter:
         from . import tls12
         if tls12.is_tls12_server_hello(server_hello_payload):
             return tls12.negotiate_tls12(
-                raw_socket, host, record_bytes, server_hello_payload, sh_trailing, ca_path=ca_path
+                raw_socket, host, record_bytes, server_hello_payload, sh_trailing, ca_path=ca_path,
+                legacy_tls=legacy_tls,
+                client_cert=client_cert,
             )
         if sh_trailing:
             raise _unexpected("ServerHello sonrasında şifresiz handshake verisi.")
@@ -928,6 +954,7 @@ class TLSAdapter:
         handshake_buffer = b""
         leaf_cert = None
         send_client_ee = False
+        cert_req = None
 
         while not order.done:
             msg, m_type = esock.recv_record()
@@ -966,6 +993,13 @@ class TLSAdapter:
                             raise TLSProtocolError(f"illegal_parameter: record_size_limit={rsl} < 64")
                         # TLS 1.3'te sınır içerik tipi baytını da kapsar
                         state["send_limit"] = min(MAX_PLAINTEXT, rsl - 1)
+
+                elif hs_type == _HS_CERTIFICATE_REQUEST:
+                    # RFC 8446 §4.3.2 (sıra/tekrar order.expect ile zaten denetlendi)
+                    try:
+                        cert_req = mtls.parse_certificate_request_13(hs_payload)
+                    except mtls.MtlsProtocolError as e:
+                        raise TLSProtocolError(str(e)) from e
 
                 elif hs_type in (_HS_CERTIFICATE, _HS_COMPRESSED_CERTIFICATE, _HS_CERTIFICATE_VERIFY) \
                         and psk_accepted:
@@ -1030,6 +1064,17 @@ class TLSAdapter:
             client_ee = build_client_encrypted_extensions()
             esock.send_record(client_ee, content_type=0x16, use_app_keys=False)
             state["handshake_messages"] += client_ee
+        if cert_req is not None:
+            # RFC 8446 §4.4.2-4.4.3: Certificate [+ CertificateVerify], Finished'tan ÖNCE.
+            # Uygun sertifika/şema yoksa boş Certificate (sunucu karar verir). Mantık saf
+            # fonksiyonlarda (security/mtls.py); async çekirdekle ortak.
+            auth_msgs, auth_scheme = mtls.client_auth_flight_13(
+                client_cert, cert_req, hash_func, state["handshake_messages"])
+            for m in auth_msgs:
+                esock.send_record(m, content_type=0x16, use_app_keys=False)
+                state["handshake_messages"] += m
+            state["client_signature_scheme"] = auth_scheme
+            state["client_cert_sent"] = auth_scheme is not None
         f_key = PureCryptoEngine.tls13_hkdf_expand_label(
             state["client_hts"], "finished", b"", hash_len, hash_alg=hash_func
         )

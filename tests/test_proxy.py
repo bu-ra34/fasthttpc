@@ -288,3 +288,47 @@ def test_psk_bilet_anahtari_proxy_degil_hedef_portu(trust_leaf, monkeypatch):
     assert r.status_code == 200
     srv.close()
     assert anahtarlar == [("example.com", 8443)], anahtarlar
+
+
+def test_async_proxy_connect_zaman_asimi_proxyerror(monkeypatch):
+    """Proxy'ye TCP bağlantısı zaman aşımına uğrarsa (Windows'ta kapalı port ret'i ~2 sn'de bildirilir)
+    sync yolla aynı: ProxyError (ConnectionError), ham TimeoutError değil."""
+    import asyncio
+
+    from fasthttpc import _backend as B
+    from fasthttpc.transport.proxy import ProxyConfig, ProxyError, async_connect_via_proxy
+
+    async def asili(*a, **k):
+        await asyncio.sleep(30)
+    monkeypatch.setattr(B, "open_connection", asili)
+
+    async def main():
+        with pytest.raises(ProxyError, match="bağlanılamadı"):
+            await async_connect_via_proxy(ProxyConfig("http", "127.0.0.1", 9), "example.com", 443,
+                                          timeout=0.2)
+    asyncio.run(main())
+
+
+@pytest.mark.parametrize("url", ["https://example.com/", "http://example.com/"])
+def test_async_session_proxy_connect_zaman_asimi_proxyerror(monkeypatch, url):
+    """AsyncSession proxy yolunu aynı süreli DIŞ bir zaman aşımıyla da sarar; proxy'ye TCP
+    bağlanırken süre dolunca dış zamanlayıcı içtekini geçer. Sonuç yine ProxyError olmalı
+    (Windows CI'da kapalı porta ret ~2 sn'de geldiği için görüldü)."""
+    import asyncio
+
+    from fasthttpc import AsyncSession
+    from fasthttpc import _backend as B
+    from fasthttpc.transport.proxy import ProxyError
+
+    async def asili(*a, **k):
+        await asyncio.sleep(30)
+    monkeypatch.setattr(B, "open_connection", asili)
+
+    async def main():
+        a = AsyncSession(timeout=0.2, proxy="http://127.0.0.1:9")
+        try:
+            with pytest.raises(ProxyError, match="bağlanılamadı"):
+                await a.get(url)
+        finally:
+            await a.close()
+    asyncio.run(asyncio.wait_for(main(), 10))

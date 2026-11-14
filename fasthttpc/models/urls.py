@@ -1,5 +1,6 @@
                           
-from urllib.parse import urlparse, urlencode, parse_qs
+from typing import Any
+from urllib.parse import urlparse, urlencode, parse_qs, unquote
 
 class QueryParams:
     """Immutable (değişmez) query parametreleri yönetimi."""
@@ -38,6 +39,9 @@ class URL:
         except UnicodeError:
             pass
         self.host = host
+        # URL'deki ``user:pass@`` (str(URL)/istek satırına ASLA yazılmaz; auth için).
+        self.username = unquote(parsed.username) if parsed.username else ""
+        self.password = unquote(parsed.password) if parsed.password else ""
 
         try:
             self.port = parsed.port or (443 if self.scheme == "https" else 80)
@@ -52,12 +56,14 @@ class URL:
         self.raw_query = parsed.query
         self.params = QueryParams(parsed.query)
 
-    def copy_with(self, **kwargs) -> 'URL':
+    def copy_with(self, **kwargs: Any) -> 'URL':
         """İstenen parametreleri değiştirerek yeni bir URL nesnesi döner."""
                                         
         new_url = URL.__new__(URL)
         new_url.scheme = kwargs.get("scheme", self.scheme)
         new_url.host = kwargs.get("host", self.host)
+        new_url.username = kwargs.get("username", self.username)
+        new_url.password = kwargs.get("password", self.password)
         new_url.port = kwargs.get("port", self.port)
         new_url.path = kwargs.get("path", self.path)
         if "params" in kwargs:
