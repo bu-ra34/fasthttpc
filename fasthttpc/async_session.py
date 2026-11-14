@@ -21,6 +21,8 @@ from .models.headers  import Headers
 from .models.response import Response, HTTPStatusError
 from .metrics         import RequestMetrics
 from .cache           import ResponseCache
+from .cookies         import CookieJar
+from .multipart       import encode_multipart
 from .protocol.http1_parser import HTTP1Parser
 from .models.request  import Request
 from .config          import Limits, Timeout, resolve_verify
@@ -241,6 +243,10 @@ class AsyncSession:
     - Metrics (resp.metrics)
     - iter_content() streaming
 
+    Parametreler senkron :class:`~fasthttpc.session.Session` ile aynıdır
+    (``resolver`` dahil); sıra farkı: ``timeout`` ve ``max_redirects``
+    ``max_connections``'tan önce gelir (isimle çağırın).
+
     Kullanım:
         async with AsyncSession(impersonate="chrome_131") as session:
             resp = await session.get("https://example.com")
@@ -265,6 +271,7 @@ class AsyncSession:
         limits:          "Limits | None" = None,
         proxies                       = None,
         proxy                         = None,
+        resolver                      = None,
     ):
         # impersonate verilirse TLS, fasthttpc.tls13 çekirdeğiyle (tarayıcı
         # ClientHello'su) kurulur ve profilin ALPN'i (h2, http/1.1) kullanılır;
@@ -280,7 +287,8 @@ class AsyncSession:
         self.max_redirects = max_redirects
         self.limits        = limits if limits is not None else Limits(max_connections=max_connections)
         self._proxy_spec   = _proxy_spec(proxy, proxies)
-        self.cookies:  dict[str, str] = {}
+        self.resolver      = resolver      # opsiyonel DoHResolver (senkron Session ile aynı)
+        self.cookie_jar    = CookieJar()
         self._plugins: list[Plugin]   = []
         self._rotator: Optional[ProxyRotator] = None
         self._sem     = asyncio.Semaphore(self.limits.max_connections)
@@ -301,6 +309,32 @@ class AsyncSession:
             self._cache = None
 
                                                                                
+
+    @property
+    def cookies(self) -> dict[str, str]:
+        """İsim->değer sözlüğü (salt okunur görünüm; yazmak için ``cookie_jar``)."""
+        return self.cookie_jar.as_dict()
+
+    def _update_cookies(self, response_headers: Headers, url: URL) -> None:
+        self.cookie_jar.update_from_headers(
+            response_headers.get_list("set-cookie"),
+            request_host=url.host, request_path=url.path,
+        )
+
+    def _cookie_header(self, url: URL) -> str:
+        return self.cookie_jar.header_for(
+            host=url.host, path=url.path, secure=(url.scheme == "https"))
+
+    def pool_stats(self) -> dict:
+        """Kaynak başına boştaki keep-alive bağlantı sayısı (+ canlı h2 bağlantıları)."""
+        self._idle_purge()
+        stats: dict[str, dict] = {}
+        for (host, port, _proxy, _imp), lst in self._idle.items():
+            stats.setdefault(f"https://{host}:{port}", {"idle": 0, "h2": 0})["idle"] += len(lst)
+        for (host, port, _proxy), conn in self._h2.items():
+            if conn.usable:
+                stats.setdefault(f"https://{host}:{port}", {"idle": 0, "h2": 0})["h2"] += 1
+        return stats
 
     def use(self, plugin: Plugin) -> "AsyncSession":
         """Plugin ekle. Zincir çağrı destekli: session.use(p1).use(p2)"""
@@ -400,6 +434,9 @@ class AsyncSession:
         ``tls=False``: düz TCP (``ws://``), yine proxy tüneli üzerinden olabilir.
         """
         connect_to = self.timeout.connect
+        sni = host
+        if proxy is None and self.resolver is not None:
+            host = await asyncio.wait_for(self._resolve(host), connect_to)   # DoH: TCP IP'ye, TLS/SNI özgün ada
 
         async def _go():
             if not tls:
@@ -413,12 +450,13 @@ class AsyncSession:
                 kw = {"alpn": list(alpn)} if alpn is not None else {}
                 if proxy is None:
                     stream = await AsyncTLSStream.connect(
-                        host, port, self.impersonate, ca_path=self._ca_path, **kw)
+                        host, port, self.impersonate, server_hostname=sni,
+                        ca_path=self._ca_path, **kw)
                 else:
                     reader, writer = await async_connect_via_proxy(proxy, host, port, timeout=connect_to)
                     try:
                         stream = await AsyncTLSStream.negotiate(
-                            reader, writer, host, self.impersonate, ca_path=self._ca_path, **kw)
+                            reader, writer, sni, self.impersonate, ca_path=self._ca_path, **kw)
                     except BaseException:
                         writer.close()
                         raise
@@ -426,20 +464,34 @@ class AsyncSession:
             ctx = ssl.create_default_context(cafile=self._ca_path)
             ctx.set_alpn_protocols(["http/1.1"])
             if proxy is None:
-                reader, writer = await asyncio.open_connection(host, port, ssl=ctx)
+                reader, writer = await asyncio.open_connection(
+                    host, port, ssl=ctx, server_hostname=sni)
             else:
                 reader, writer = await async_connect_via_proxy(proxy, host, port, timeout=connect_to)
                 try:
                     if hasattr(writer, "start_tls"):   # Python 3.11+
-                        await writer.start_tls(ctx, server_hostname=host)
+                        await writer.start_tls(ctx, server_hostname=sni)
                     else:
-                        writer = await _start_tls_py310(reader, writer, ctx, host)
+                        writer = await _start_tls_py310(reader, writer, ctx, sni)
                 except BaseException:
                     writer.close()
                     raise
             return reader, writer, "http/1.1"
 
         return await asyncio.wait_for(_go(), connect_to)
+
+    async def _resolve(self, host: str) -> str:
+        """DoH çözücüyle (senkron, thread'de) IP'ye çevirir; hata olursa özgün ad."""
+        try:
+            ip = await asyncio.get_running_loop().run_in_executor(
+                None, self.resolver.resolve_one, host)
+        except Exception as e:
+            logger.debug("DoH çözümlemesi başarısız (%s), OS çözücüsüne dönülüyor: %s", host, e)
+            return host
+        if ip:
+            logger.debug("DoH: %s -> %s", host, ip)
+            return ip
+        return host
 
     def _slot_releaser(self) -> "Callable[[], None]":
         released = False
@@ -882,8 +934,9 @@ class AsyncSession:
             ),
         }
         req_headers.update(req_dict.get("headers", {}))
-        if self.cookies:
-            req_headers["Cookie"] = "; ".join(f"{k}={v}" for k, v in self.cookies.items())
+        cookie_header = self._cookie_header(u)
+        if cookie_header and not any(k.lower() == "cookie" for k in req_headers):
+            req_headers["Cookie"] = cookie_header
 
         cache_entry = None
         if self._cache and method.upper() == "GET":
@@ -911,14 +964,13 @@ class AsyncSession:
             ce  = resp_headers.get("content-encoding", "").lower()
             body_final = HTTP1Parser._decompress(bytes(body_raw), ce)
 
-            for cs in resp_headers.get_list("set-cookie"):
-                main = cs.split(";")[0].strip()
-                if "=" in main:
-                    k, v = main.split("=", 1)
-                    self.cookies[k.strip()] = v.strip()
+            self._update_cookies(resp_headers, u)
 
             resp = Response(status_code=status_code, headers=resp_headers, body=body_final)
             resp.http_version = http_version
+            resp.url = str(url)
+            if metrics and metrics.request_start:
+                resp.elapsed = time.monotonic() - metrics.request_start
 
             if metrics:
                 resp.metrics = metrics
@@ -957,18 +1009,15 @@ class AsyncSession:
             {"method": method, "url": url, "headers": headers or {}, "body": body}
         )
         h = dict(req_dict.get("headers") or {})
-        if self.cookies and not any(k.lower() == "cookie" for k in h):
-            h["Cookie"] = "; ".join(f"{k}={v}" for k, v in self.cookies.items())
+        cookie_header = self._cookie_header(URL(req_dict["url"]))
+        if cookie_header and not any(k.lower() == "cookie" for k in h):
+            h["Cookie"] = cookie_header
         req = Request(method=req_dict["method"], url=req_dict["url"], headers=h,
                       data=req_dict.get("body") or None)
         if "host" not in req.headers:
             req.headers["Host"] = req.url.host
         resp = await self.transport.handle_async_request(req)
-        for cs in resp.headers.get_list("set-cookie"):
-            main = cs.split(";")[0].strip()
-            if "=" in main:
-                k, v = main.split("=", 1)
-                self.cookies[k.strip()] = v.strip()
+        self._update_cookies(resp.headers, req.url)
         return await self._run_response_hooks(resp)
 
     async def _send_with_retries(self, method, url, **kwargs) -> Response:
@@ -995,24 +1044,32 @@ class AsyncSession:
     async def request(
         self,
         method:          str,
-        url:             str,
+        url:             "str | URL",
         data:            Any  = None,
         json:            Any  = None,
         headers:         Optional[dict] = None,
+        files:           Optional[dict] = None,
         allow_redirects: bool = True,
     ) -> Response:
         import json as jsonlib
 
+        url = str(url)
         body    = b""
         h       = dict(headers or {})
 
-        if json is not None:
+        if files is not None:
+            body, ct = encode_multipart(
+                fields=data if isinstance(data, dict) else None, files=files)
+            h.setdefault("Content-Type", ct)
+        elif json is not None:
             body = jsonlib.dumps(json).encode("utf-8")
             h.setdefault("Content-Type", "application/json")
         elif isinstance(data, dict):
             from urllib.parse import urlencode
             body = urlencode(data).encode("ascii")
             h.setdefault("Content-Type", "application/x-www-form-urlencoded")
+        elif isinstance(data, str):
+            body = data.encode("utf-8")
         elif isinstance(data, (bytes, bytearray)):
             body = bytes(data)
 
@@ -1079,23 +1136,34 @@ class AsyncSession:
 
                                                                                 
 
-    async def get(self, url: str, headers: Optional[dict] = None, allow_redirects: bool = True) -> Response:
+    async def get(self, url, headers: Optional[dict] = None, allow_redirects: bool = True) -> Response:
         return await self.request("GET", url, headers=headers, allow_redirects=allow_redirects)
 
-    async def post(self, url: str, data=None, json=None, headers: Optional[dict] = None) -> Response:
-        return await self.request("POST", url, data=data, json=json, headers=headers)
+    async def post(self, url, data=None, json=None, headers: Optional[dict] = None,
+                   files=None, allow_redirects: bool = True) -> Response:
+        return await self.request("POST", url, data=data, json=json, headers=headers,
+                                  files=files, allow_redirects=allow_redirects)
 
-    async def put(self, url: str, data=None, json=None, headers: Optional[dict] = None) -> Response:
-        return await self.request("PUT", url, data=data, json=json, headers=headers)
+    async def put(self, url, data=None, json=None, headers: Optional[dict] = None,
+                  files=None, allow_redirects: bool = True) -> Response:
+        return await self.request("PUT", url, data=data, json=json, headers=headers,
+                                  files=files, allow_redirects=allow_redirects)
 
-    async def patch(self, url: str, data=None, json=None, headers: Optional[dict] = None) -> Response:
-        return await self.request("PATCH", url, data=data, json=json, headers=headers)
+    async def patch(self, url, data=None, json=None, headers: Optional[dict] = None,
+                    allow_redirects: bool = True) -> Response:
+        return await self.request("PATCH", url, data=data, json=json, headers=headers,
+                                  allow_redirects=allow_redirects)
 
-    async def delete(self, url: str, headers: Optional[dict] = None) -> Response:
-        return await self.request("DELETE", url, headers=headers)
+    async def delete(self, url, headers: Optional[dict] = None,
+                     allow_redirects: bool = True) -> Response:
+        return await self.request("DELETE", url, headers=headers, allow_redirects=allow_redirects)
 
-    async def head(self, url: str, headers: Optional[dict] = None) -> Response:
+    async def head(self, url, headers: Optional[dict] = None) -> Response:
         return await self.request("HEAD", url, headers=headers, allow_redirects=False)
+
+    async def options(self, url, headers: Optional[dict] = None,
+                      allow_redirects: bool = True) -> Response:
+        return await self.request("OPTIONS", url, headers=headers, allow_redirects=allow_redirects)
 
                                                                                
 
@@ -1118,6 +1186,10 @@ class AsyncSession:
     async def ws_connect(self, url: str) -> "AsyncWebSocket":
         """Async WebSocket bağlantısı açar."""
         return await AsyncWebSocket.connect(url, self)
+
+    async def websocket(self, url: str) -> "AsyncWebSocket":
+        """Senkron ``Session.websocket`` ile aynı ad (``ws_connect`` takma adı)."""
+        return await self.ws_connect(url)
 
                                                                                 
 
