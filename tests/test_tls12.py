@@ -609,14 +609,39 @@ def test_tls12_hatalari_tlsprotocolerror_alt_sinifi(pki, files):
         _connect(port, files[0])
 
 
-def test_default_profil_tls12_ilan_etmedigi_icin_reddeder(pki, files):
-    """'default' profil supported_versions'ta 0x0303 ilan etmez; 1.2 seçen sunucu reddedilir."""
-    srv = Fake12Server(pki)
-    port, t, ls = serve_fake_in_thread(srv)
-    with pytest.raises(ConnectionError, match="TLS 1.2 ilan"):
-        s = socket.create_connection(("127.0.0.1", port), timeout=5)
-        TLSAdapter.negotiate(s, HOST, None, ca_path=files[0])
+def test_default_profil_fake_sunucuyla_tls12(pki, files):
+    """'default' profil (impersonate=None) EMS/renegotiation_info/0x0303 ilan eder."""
+    srv, es, t = _run_fake(pki, files, profile=None)
+    assert es.state["is_tls12"] and not es.state["is_tls13"]
+    es.close()
     t.join(5)
+
+
+@pytest.mark.parametrize("cipher,kind,sid", SUITE_MATRIX)
+def test_default_profil_stdlib_tls12_her_suite(files, cipher, kind, sid):
+    ca, cert = _cert_for(files, kind)
+    srv = StdlibTLS12(cert, cipher, alpn=["http/1.1"])
+    try:
+        es = _connect(srv.port, ca, profile=None)
+        assert es.state["is_tls12"] and es.state["cipher_suite"] == sid
+        assert b"merhaba tls12" in _get(es)
+        es.close()
+    finally:
+        srv.close()
+    assert srv.negotiated[0][0] == "TLSv1.2" and srv.negotiated[0][1] == cipher
+    assert not srv.errors, srv.errors
+
+
+def test_default_profil_clienthello_tls12_uzantilari():
+    from fasthttpc.fingerprint import extension_ids_from_client_hello
+    from fasthttpc.tls_crafter import TLSImpersonator
+    ch, _, _ = TLSImpersonator("example.com", profile=None).build_client_hello()
+    exts = extension_ids_from_client_hello(ch)
+    assert 0x0017 in exts and 0xFF01 in exts      # EMS, renegotiation_info
+    assert ch[9:11] == b"\x03\x03"                  # client_version 0x0303 (legacy)
+    from fasthttpc.fingerprint import ja3_string_from_client_hello
+    suites = ja3_string_from_client_hello(ch).split(",")[1].split("-")
+    assert {"49195", "49199", "52393"} <= set(suites)
 
 
 # ------------------------------------------------------------------ async yol
@@ -740,3 +765,31 @@ def test_async_cekirdek_tls12_durum_gecisleri(pki, files):
     assert any(type(e).__name__ == "ConnectionClosed" for e in ev)
     s.close()
     t.join(3)
+
+
+def test_default_profil_session_http11_tls12(files):
+    from fasthttpc import Session
+    ca, cert = _cert_for(files, "rsa")
+    srv = StdlibTLS12(cert, "ECDHE-RSA-AES128-GCM-SHA256", alpn=["http/1.1"])
+    try:
+        with Session(impersonate=None, verify=ca) as s:
+            r = s.get(f"https://localhost:{srv.port}/")
+        assert r.status_code == 200 and r.content == b"merhaba tls12"
+    finally:
+        srv.close()
+
+
+def test_default_profil_async_tls_cekirdegi_tls12(files):
+    ca, cert = _cert_for(files, "rsa")
+    srv = StdlibTLS12(cert, "ECDHE-RSA-AES256-GCM-SHA384", alpn=["http/1.1"])
+
+    async def main():
+        st = await _async_negotiate(srv.port, ca, profile=None)
+        try:
+            assert st.state["is_tls12"] and st.conn.cipher_suite == 0xC030
+        finally:
+            st.close()
+    try:
+        asyncio.run(main())
+    finally:
+        srv.close()

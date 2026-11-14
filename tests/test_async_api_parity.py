@@ -24,13 +24,61 @@ def test_http_metotlari_ayni_parametreler(name):
     assert inspect.iscoroutinefunction(getattr(AsyncSession, name))
 
 
-def test_public_yuzey_senkronun_ustkumesi():
-    sync_pub = {n for n in dir(Session) if not n.startswith("_")}
-    async_pub = {n for n in dir(AsyncSession) if not n.startswith("_")}
-    # senkron-özel: pool (ConnectionPool nesnesi), pre_warm hariç hepsi karşılanır
-    missing = sync_pub - async_pub - {"pool"}
-    assert missing == set(), missing
-    assert "options" in async_pub
+# Bilinçli, belgelenmiş farklar: ``use`` (Plugin kancaları coroutine), ``gather``
+# (asyncio.gather), ``ws_connect`` (``websocket`` takma adı) yalnızca async'te.
+ASYNC_ONLY = {"use", "gather", "ws_connect"}
+SYNC_ONLY: set = set()
+
+
+def _public(cls):
+    return {n for n in dir(cls) if not n.startswith("_")}
+
+
+def test_public_yuzey_iki_yonlu_esit():
+    sync_pub, async_pub = _public(Session), _public(AsyncSession)
+    assert sync_pub - async_pub == SYNC_ONLY, sync_pub - async_pub
+    assert async_pub - sync_pub == ASYNC_ONLY, async_pub - sync_pub
+    assert "options" in sync_pub and "set_proxies" in sync_pub
+
+
+def test_ortak_metot_imzalari_ayni():
+    for n in sorted(_public(Session) & _public(AsyncSession)):
+        f, g = getattr(Session, n), getattr(AsyncSession, n)
+        if callable(f):
+            assert params(f) == params(g), n
+            assert inspect.iscoroutinefunction(g) == (
+                inspect.iscoroutinefunction(f) or n in ASYNC_COROUTINES), n
+
+
+# Async'te coroutine olan, senkronda düz fonksiyon olan ortak metotlar.
+ASYNC_COROUTINES = {"request", "get", "post", "put", "patch", "delete", "head", "options",
+                    "pre_warm", "websocket", "close"}
+
+
+def test_ornek_nitelikleri_iki_yonlu_esit():
+    s, a = Session(), AsyncSession()
+    pub = lambda o: {n for n in vars(o) if not n.startswith("_")}
+    assert pub(s) - pub(a) == {"pool"} and pub(a) - pub(s) == set()
+    s.close()
+    run(a.close())
+
+
+def test_init_varsayilanlari_ayni_anlamda():
+    for name in ("impersonate", "verify", "retries", "limits", "proxies", "proxy",
+                 "resolver", "headers", "transport", "cache", "cache_ttl"):
+        ps, pa = (inspect.signature(c.__init__).parameters[name] for c in (Session, AsyncSession))
+        assert ps.default == pa.default, name
+
+
+def test_session_headers_iki_tarafta_mutable_ve_ayni_tur():
+    s, a = Session(headers={"X-A": "1"}), AsyncSession(headers={"X-A": "1"})
+    for o in (s, a):
+        assert o.headers["x-a"] == "1"
+        o.headers["X-B"] = "2"
+        del o.headers["X-A"]
+        assert dict(o.headers.items()) == {"x-b": "2"} and type(o.headers) is type(s.headers)
+    s.close()
+    run(a.close())
 
 
 def sess(ca, **kw):
