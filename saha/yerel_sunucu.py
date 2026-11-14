@@ -316,6 +316,15 @@ class YerelSunucu:
             except (OSError, ssl.SSLError):
                 pass
             return False
+        elif yol == "/hdrcut":
+            # Başlık bloğu (CRLF CRLF) HİÇ tamamlanmadan temiz TLS kapanışı
+            s.sendall(b"HTTP/1.1 200 OK\nContent-Length: 1000\n\n0123456789")
+            s.settimeout(0.5)
+            try:
+                s.unwrap()
+            except (OSError, ssl.SSLError):
+                pass
+            return False
         elif yol == "/trailer":
             # chunked + trailer, kapanış satırı AYRI TLS kaydında gelir
             s.sendall(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n0\r\n")
