@@ -93,7 +93,14 @@ class AsyncTLSStream:
             data = await self.reader.read(65536)
             if not data:
                 raise ConnectionResetError("TLS şifreli paket beklenirken bağlantı koptu!")
-            self._records.extend(self.conn.receive_data(data))
+            try:
+                self._records.extend(self.conn.receive_data(data))
+            except Exception:
+                # Hata öncesi kuyruğa alınan alert'ler best-effort gönderilir.
+                out = self.conn.data_to_send()
+                if out and not self.writer.is_closing():
+                    self.writer.write(out)
+                raise
             out = self.conn.data_to_send()
             if out:
                 self.writer.write(out)
