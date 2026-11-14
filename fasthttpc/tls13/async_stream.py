@@ -41,6 +41,7 @@ class AsyncTLSStream:
         """TCP bağlantısı açar ve TLS handshake'ini yapar."""
         reader, writer = await asyncio.open_connection(host, port)
         try:
+            conn_kwargs.setdefault("port", port)
             return await cls.negotiate(reader, writer, server_hostname or host,
                                        profile_name, **conn_kwargs)
         except BaseException:
@@ -56,6 +57,11 @@ class AsyncTLSStream:
         profile_name: Optional[str] = None,
         **conn_kwargs,
     ) -> "AsyncTLSStream":
+        if conn_kwargs.get("port") is None:
+            # Port verilmediyse (proxy tüneli) eş adresinden; resumption anahtarı için.
+            peer = writer.get_extra_info("peername")
+            if peer:
+                conn_kwargs["port"] = peer[1]
         conn = TLSClientConnection(host, profile_name, **conn_kwargs)
         self = cls(reader, writer, conn)
         writer.write(conn.initiate())
