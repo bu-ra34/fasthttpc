@@ -13,7 +13,7 @@ class RequestMetrics:
     Tek bir HTTP isteğinin zaman ve boyut ölçümlerini tutar.
     resp.metrics ile erişilir.
 
-    Zaman damgaları: monotonic (float, saniye)
+    Zaman damgaları: time.perf_counter (float, saniye; Windows'ta monotonic ~15,6 ms çözünürlüklüdür)
     """
                      
     request_start:     float = 0.0                      
