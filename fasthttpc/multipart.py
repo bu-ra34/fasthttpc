@@ -84,7 +84,7 @@ def encode_multipart(
 
         if isinstance(file_value, bytes):
             data = file_value
-        elif hasattr(file_value, "read"):
+        elif not isinstance(file_value, tuple) and hasattr(file_value, "read"):
                                                   
             data = file_value.read()
         elif isinstance(file_value, tuple):

@@ -80,3 +80,24 @@ extend-exclude = ["build", "dist"]
 # sözdizimi hataları, geçersiz karşılaştırmalar, yanlış yerde return/yield,
 # tanımsız isimler. Temizlik sonrası genişletilebilir.
 select = ["E9", "F63", "F7", "F82"]
+
+[tool.mypy]
+python_version = "3.10"
+strict = true
+# Only modules that are already strict-clean are checked; extend the list as
+# other modules are annotated. Imports are followed silently so errors in
+# not-yet-clean modules do not fail the run.
+follow_imports = "silent"
+files = [
+    "fasthttpc/models/headers.py",
+    "fasthttpc/models/urls.py",
+    "fasthttpc/config.py",
+    "fasthttpc/retry.py",
+    "fasthttpc/cookies.py",
+    "fasthttpc/cache.py",
+    "fasthttpc/metrics.py",
+    "fasthttpc/timeout.py",
+    "fasthttpc/_log.py",
+    "fasthttpc/transport/mock.py",
+    "fasthttpc/multipart.py",
+]
