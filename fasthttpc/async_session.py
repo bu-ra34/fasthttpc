@@ -10,6 +10,9 @@ import ssl
 import warnings
 
 from ._log import get_logger
+from . import _api
+from ._api import USE_CLIENT_DEFAULT
+from .auth import resolve_auth, netrc_credentials, BasicAuth
 
 logger = get_logger("async")
 import time
@@ -44,97 +47,14 @@ def _resolve_location(base: URL, location: str) -> str:
     return _impl(base, location)
 
 
-class Plugin:
-    """
-    Base plugin sınıfı. Kalıtım alarak özelleştirin.
-    Metodlar opsiyonel — sadece gerekli hook'ları override edin.
-    """
-    async def on_request(self, request: dict) -> dict:
-        """İstek gönderilmeden önce çağrılır. request dict'i döndürün."""
-        return request
-
-    async def on_response(self, response: Response) -> Response:
-        """Yanıt alındıktan sonra çağrılır. response döndürün."""
-        return response
-
-    async def on_error(self, error: Exception) -> Optional[Exception]:
-        """Hata oluştuğunda çağrılır. None → hatayı yut; Exception → yeniden fırlat."""
-        return error
+from .plugins import Plugin, RetryPlugin, LoggingPlugin, RateLimitPlugin, call_async  # noqa: E402,F401
 
 
-class RetryPlugin(Plugin):
-    """Belirli durum kodlarında isteği otomatik tekrar dener.
+async def _maybe(out):
+    """Hook düz değer ya da coroutine döndürebilir."""
+    import inspect
+    return await out if inspect.isawaitable(out) else out
 
-    Yeniden deneme, istek döngüsünün SAHİBİ olan ``AsyncSession.request``
-    tarafından uygulanır; bir ``on_response`` hook'u yanıtı dönüştürebilir ama
-    yeni bir istek başlatamaz. Bu yüzden plugin yalnızca politikayı bildirir,
-    kararı session verir.
-
-    Args:
-        max_retries: Azami yeniden deneme sayısı (ilk istek hariç).
-        retry_on:    Yeniden denenecek HTTP durum kodları.
-        backoff:     Üstel bekleme taban süresi (saniye). 0 ise beklenmez.
-    """
-
-    def __init__(self, max_retries: int = 3,
-                 retry_on: tuple = (429, 500, 502, 503, 504),
-                 backoff: float = 0.5):
-        self.max_retries = max_retries
-        self.retry_on = set(retry_on)
-        self.backoff = backoff
-
-    def should_retry(self, response: Response, attempt: int) -> bool:
-        return attempt < self.max_retries and response.status_code in self.retry_on
-
-    def delay_for(self, response: Response, attempt: int) -> float:
-        """Retry-After başlığına saygı duyar, yoksa üstel bekleme uygular."""
-        retry_after = response.headers.get("retry-after", "")
-        if retry_after:
-            try:
-                return max(0.0, float(retry_after.strip()))
-            except ValueError:
-                pass
-        return self.backoff * (2 ** attempt) if self.backoff else 0.0
-
-
-class LoggingPlugin(Plugin):
-    """İstekleri ve yanıtları loglar."""
-    def __init__(self, verbose: bool = False):
-        self._verbose = verbose
-
-    async def on_request(self, request: dict) -> dict:
-        print(f"[LOG] → {request['method']} {request['url']}")
-        return request
-
-    async def on_response(self, response: Response) -> Response:
-        status = response.status_code
-        size   = len(response.body)
-        print(f"[LOG] ← {status} ({size}B)")
-        if self._verbose and hasattr(response, "metrics"):
-            print(f"       ttfb={response.metrics.ttfb:.1f}ms total={response.metrics.total_time:.1f}ms")
-        return response
-
-
-class RateLimitPlugin(Plugin):
-    """Saniyedeki istek sayısını sınırlar."""
-    def __init__(self, rps: float = 10.0):
-        self._interval = 1.0 / rps
-        self._last_req = 0.0
-        self._lock     = asyncio.Lock()
-
-    async def on_request(self, request: dict) -> dict:
-        async with self._lock:
-            now   = time.monotonic()
-            wait  = self._interval - (now - self._last_req)
-            if wait > 0:
-                await asyncio.sleep(wait)
-            self._last_req = time.monotonic()
-        return request
-
-
-                                                                               
-                                   
-                                                                               
 
 class ProxyRotator:
     """
@@ -274,6 +194,11 @@ class AsyncSession:
         proxy                         = None,
         resolver                      = None,
         headers                       = None,
+        auth                          = None,
+        hooks:           "dict | None" = None,
+        event_hooks:     "dict | None" = None,
+        trust_env:       bool          = True,
+        params                        = None,
     ):
         # impersonate verilirse TLS, fasthttpc.tls13 çekirdeğiyle (tarayıcı
         # ClientHello'su) kurulur ve profilin ALPN'i (h2, http/1.1) kullanılır;
@@ -281,6 +206,12 @@ class AsyncSession:
         # impersonate=None -> stdlib ssl, yalnızca HTTP/1.1.
         from .session import _proxy_spec
         self.impersonate   = impersonate
+        # requests/httpx uyumu (Session ile aynı): kimlik, hook'lar, varsayılan params.
+        self.auth          = auth
+        self.hooks         = _api.normalize_hooks(hooks)
+        self.event_hooks   = _api.normalize_event_hooks(event_hooks)
+        self.trust_env     = trust_env
+        self.params        = params
         # Oturum düzeyi varsayılan başlıklar (mutable; Session ile aynı öncelik:
         # profil başlıkları < headers < istek başlıkları; None değer kaldırır).
         self.headers       = Headers(headers)
@@ -341,22 +272,27 @@ class AsyncSession:
                 stats.setdefault(f"https://{host}:{port}", {"idle": 0, "h2": 0})["h2"] += 1
         return stats
 
+    def _tmo(self) -> Timeout:
+        """Etkin zaman aşımı: istek düzeyi ``timeout=`` varsa o, yoksa oturumunki."""
+        return _api.effective_timeout(self, self.timeout)
+
     def use(self, plugin: Plugin) -> "AsyncSession":
-        """Plugin ekle. Zincir çağrı destekli: session.use(p1).use(p2)"""
+        """Plugin ekle (``Session.use`` ile aynı arayüz; kancalar düz fonksiyon ya da coroutine).
+
+        Zincir çağrı destekli: ``session.use(p1).use(p2)``.
+        """
         self._plugins.append(plugin)
         return self
 
     async def _run_request_hooks(self, req: dict) -> dict:
         for plugin in self._plugins:
-            req = await plugin.on_request(req)
+            req = await call_async(plugin, "on_request", req)
         return req
 
     async def _run_response_hooks(self, resp: Response) -> Response:
         for plugin in self._plugins:
-            resp = await plugin.on_response(resp)
+            resp = await call_async(plugin, "on_response", resp)
         return resp
-
-                                                                               
 
     def set_proxies(self, proxies: list[str], strategy: str = "round_robin") -> "AsyncSession":
         """Proxy listesini ayarla ve rotasyonu etkinleştir.
@@ -438,7 +374,7 @@ class AsyncSession:
         kurulur. impersonate=None: stdlib ssl, yalnızca http/1.1.
         ``tls=False``: düz TCP (``ws://``), yine proxy tüneli üzerinden olabilir.
         """
-        connect_to = self.timeout.connect
+        connect_to = self._tmo().connect
         sni = host
         if proxy is None and self.resolver is not None:
             host = await asyncio.wait_for(self._resolve(host), connect_to)   # DoH: TCP IP'ye, TLS/SNI özgün ada
@@ -574,10 +510,10 @@ class AsyncSession:
         """Havuz slotu alır; boşta uygun HTTP/1.1 bağlantısı varsa onu, yoksa yenisini
         açar. Slot ``release()`` ile geri verilir."""
         try:
-            await asyncio.wait_for(self._sem.acquire(), self.timeout.pool)
+            await asyncio.wait_for(self._sem.acquire(), self._tmo().pool)
         except asyncio.TimeoutError:
             raise asyncio.TimeoutError(
-                f"Bağlantı havuzu {self.timeout.pool} sn içinde boşalmadı "
+                f"Bağlantı havuzu {self._tmo().pool} sn içinde boşalmadı "
                 f"(max_connections={self.limits.max_connections}).") from None
         release = self._slot_releaser()
         key = self._h1_key(u, proxy)
@@ -652,11 +588,11 @@ class AsyncSession:
     async def _start_h2(self, key: tuple, opened: "_Opened") -> AsyncHttp2Connection:
         stream = opened.writer          # AsyncTLSStream: read/write/drain/close/wait_closed
         conn = AsyncHttp2Connection(
-            stream, read_timeout=self.timeout.read, write_timeout=self.timeout.write,
+            stream, read_timeout=self._tmo().read, write_timeout=self._tmo().write,
             on_close=opened.release, profile=self.impersonate,
         )
         try:
-            await asyncio.wait_for(conn.start(), self.timeout.connect)
+            await asyncio.wait_for(conn.start(), self._tmo().connect)
         except BaseException:
             await conn.close()
             opened.release()
@@ -836,7 +772,7 @@ class AsyncSession:
         döner; aksi halde (Connection: close, HTTP/1.0, eof çerçeveli gövde, hata,
         iptal) kapatılır. Slot her durumda serbest bırakılır."""
         reader, writer = opened.reader, opened.writer
-        read_to = self.timeout.read
+        read_to = self._tmo().read
         reusable = False
         finished = False
         got_bytes = False        # yanıttan en az 1 bayt geldi mi (yeniden deneme güvenliği)
@@ -851,7 +787,7 @@ class AsyncSession:
                 metrics.bytes_sent = len(raw_request)
 
             writer.write(raw_request)
-            await asyncio.wait_for(writer.drain(), self.timeout.write)
+            await asyncio.wait_for(writer.drain(), self._tmo().write)
             send_time = time.monotonic()
 
             hdr_acc = bytearray()
@@ -996,7 +932,7 @@ class AsyncSession:
             if proxy and self._rotator:
                 self._rotator.mark_failed(proxy)
             for plugin in self._plugins:
-                e2 = await plugin.on_error(e)
+                e2 = await call_async(plugin, "on_error", e)
                 if e2 is None:
                     return Response(0, body=b"")
             raise
@@ -1009,20 +945,27 @@ class AsyncSession:
         if self.transport is None:
             return await self._raw_request(method, url, headers=headers, body=body,
                                            metrics=metrics)
-        req_dict = await self._run_request_hooks(
-            {"method": method, "url": url, "headers": headers or {}, "body": body}
-        )
-        h = {k: v for k, v in dict(req_dict.get("headers") or {}).items() if v is not None}
-        cookie_header = self._cookie_header(URL(req_dict["url"]))
-        if cookie_header and not any(k.lower() == "cookie" for k in h):
-            h["Cookie"] = cookie_header
-        req = Request(method=req_dict["method"], url=req_dict["url"], headers=h,
-                      data=req_dict.get("body") or None)
-        if "host" not in req.headers:
-            req.headers["Host"] = req.url.host
-        resp = await self.transport.handle_async_request(req)
-        self._update_cookies(resp.headers, req.url)
-        return await self._run_response_hooks(resp)
+        try:
+            req_dict = await self._run_request_hooks(
+                {"method": method, "url": url, "headers": headers or {}, "body": body}
+            )
+            h = {k: v for k, v in dict(req_dict.get("headers") or {}).items() if v is not None}
+            cookie_header = self._cookie_header(URL(req_dict["url"]))
+            if cookie_header and not any(k.lower() == "cookie" for k in h):
+                h["Cookie"] = cookie_header
+            req = Request(method=req_dict["method"], url=req_dict["url"], headers=h,
+                          data=req_dict.get("body") or None)
+            if "host" not in req.headers:
+                req.headers["Host"] = req.url.host
+            req.timeout = self._tmo()
+            resp = await self.transport.handle_async_request(req)
+            self._update_cookies(resp.headers, req.url)
+            return await self._run_response_hooks(resp)
+        except Exception as e:
+            for plugin in self._plugins:
+                if await call_async(plugin, "on_error", e) is None:
+                    return Response(0, body=b"")
+            raise
 
     async def _send_with_retries(self, method, url, **kwargs) -> Response:
         """``self.retries`` politikasına göre ``_send``'i tekrarlar."""
@@ -1045,100 +988,173 @@ class AsyncSession:
             if delay:
                 await asyncio.sleep(delay)
 
+    # --- kimlik / hook / hop ------------------------------------------------
+
+    def _auth_for(self, auth, url_creds, host: str):
+        """(Auth | None, kaynak): istek > oturum > .netrc (trust_env) > URL'deki user:pass@."""
+        chosen = self.auth if auth is USE_CLIENT_DEFAULT else auth
+        if chosen is not None:
+            return resolve_auth(chosen), "explicit"
+        if self.trust_env:
+            creds = netrc_credentials(host)
+            if creds:
+                return BasicAuth(*creds), "netrc"
+        if url_creds:
+            return BasicAuth(*url_creds), "url"
+        return None, None
+
+    async def _call_hooks(self, event: str, arg, req_hooks=None, **kw):
+        """Hook'ları çalıştırır. Yanıtta requests hook'u ``None`` dışı dönerse yanıt değişir."""
+        if event == "request":
+            for fn in _api.hook_list(self.event_hooks, "request"):
+                await _maybe(fn(arg))
+            return arg
+        for fn in _api.hook_list(self.event_hooks, "response"):
+            await _maybe(fn(arg))
+        for fn in _api.hook_list(self.hooks, "response") + _api.hook_list(req_hooks, "response"):
+            out = await _maybe(fn(arg, **kw))
+            if out is not None:
+                arg = out
+        return arg
+
+    async def _hop(self, auth, method, url, headers, body, metrics, req_hooks, hkw):
+        """Tek yönlendirme adımı: auth akışı (401 yeniden denemesi dahil) + hook'lar.
+
+        Döner: (son yanıt, ara yanıtlar). Ara yanıtlar (ör. 401 challenge) ``history``'ye girer.
+        """
+        has_req_hooks = bool(_api.hook_list(self.event_hooks, "request"))
+        extras: list[Response] = []
+        if auth is None and not has_req_hooks:
+            resp = await self._send_with_retries(method, url, headers=headers, body=body, metrics=metrics)
+            return await self._call_hooks("response", resp, req_hooks, **hkw), extras
+        removed = [k for k, v in headers.items() if v is None]
+        base = Request(method, url, data=body or None,
+                       headers={k: v for k, v in headers.items() if v is not None})
+        flow = auth.auth_flow(base) if auth is not None else None
+        req = next(flow) if flow is not None else base
+        while True:
+            await self._call_hooks("request", req)
+            h = {k.decode("latin-1"): v.decode("latin-1") for k, v in req.headers.raw
+                 if k.lower() != b"content-length"}
+            lower = {x.lower() for x in h}
+            h.update({k: None for k in removed if k.lower() not in lower})
+            target = url if req.url is base.url else str(req.url)
+            resp = await self._send_with_retries(req.method, target, headers=h,
+                                           body=req.body or b"", metrics=metrics)
+            resp = await self._call_hooks("response", resp, req_hooks, **hkw)
+            if flow is None:
+                return resp, extras
+            try:
+                req = flow.send(resp)
+            except StopIteration:
+                return resp, extras
+            extras.append(resp)
+
     async def request(
         self,
         method:          str,
         url:             "str | URL",
-        data:            Any  = None,
-        json:            Any  = None,
-        headers:         Optional[dict] = None,
-        files:           Optional[dict] = None,
+        data             = None,
+        json             = None,
+        headers          = None,
+        files            = None,
         allow_redirects: bool = True,
+        params           = None,
+        cookies          = None,
+        auth             = USE_CLIENT_DEFAULT,
+        timeout          = USE_CLIENT_DEFAULT,
+        hooks            = None,
     ) -> Response:
-        import json as jsonlib
+        """HTTP isteği. requests/httpx uyumlu ek parametreler:
 
-        url = str(url)
-        body    = b""
-        h       = self._merged_headers(headers)
-
-        if files is not None:
-            body, ct = encode_multipart(
-                fields=data if isinstance(data, dict) else None, files=files)
-            h.setdefault("Content-Type", ct)
-        elif json is not None:
-            body = jsonlib.dumps(json).encode("utf-8")
-            h.setdefault("Content-Type", "application/json")
-        elif isinstance(data, dict):
-            from urllib.parse import urlencode
-            body = urlencode(data).encode("ascii")
-            h.setdefault("Content-Type", "application/x-www-form-urlencoded")
-        elif isinstance(data, str):
-            body = data.encode("utf-8")
-        elif isinstance(data, (bytes, bytearray)):
-            body = bytes(data)
-
-        metrics       = RequestMetrics(request_start=time.monotonic())
-        current_url   = url
-        redirect_cnt  = 0
-        history       = []
-
+        ``params`` (dict/liste/str; URL'deki sorguya eklenir), ``cookies`` (yalnızca bu
+        istek için; yönlendirmede başka origin'e gitmez), ``auth`` (oturumunkini ezer;
+        ``None`` oturum auth'unu kapatır), ``timeout`` (float, ``(connect, read)`` ya da
+        :class:`Timeout`; ``None`` sınırsız), ``hooks`` (``{"response": [fn]}``).
+        """
+        url, url_creds = _api.split_userinfo(url)
+        url = _api.apply_params(url, self.params, params)
+        current_url    = url
+        redirect_count = 0
+        history: list[Response] = []
+        metrics = RequestMetrics(request_start=time.monotonic())
+        headers = self._merged_headers(headers)
+        body = _api.encode_body(data, json, files, headers)
+        req_hooks = _api.normalize_hooks(hooks)
+        req_cookies = _api.parse_cookie_arg(cookies)
+        tmo = _api.resolve_timeout(timeout, self.timeout)
+        token = _api.set_timeout_override(self, tmo)
+        hkw = _api.hook_kwargs(self, tmo or self.timeout)
+        first_origin = URL(current_url).origin
         retry_plugins = [p for p in self._plugins if isinstance(p, RetryPlugin)]
-
-        while True:
-            attempt = 0
+        try:
             while True:
-                resp = await self._send_with_retries(
-                    method, current_url, headers=h, body=body, metrics=metrics
-                )
-                retrying = False
-                for plugin in retry_plugins:
-                    if plugin.should_retry(resp, attempt):
-                        delay = plugin.delay_for(resp, attempt)
-                        logger.debug("HTTP %s alındı, %.2fs sonra tekrar denenecek",
-                                     resp.status_code, delay)
-                        if delay:
-                            await asyncio.sleep(delay)
-                        retrying = True
+                cur = URL(current_url)
+                same_origin = cur.origin == first_origin
+                hop_auth, _src = self._auth_for(
+                    auth if same_origin else None, url_creds if same_origin else None, cur.host)
+                if not same_origin and _src == "explicit":
+                    hop_auth = None
+                hop_headers = dict(headers)
+                if same_origin and req_cookies and not _api._has(hop_headers, "cookie"):
+                    jar = self.cookie_jar.header_for(
+                        host=cur.host, path=cur.path, secure=(cur.scheme == "https"))
+                    hop_headers["Cookie"] = _api.merge_cookie_header(jar, req_cookies)
+                attempt = 0
+                while True:
+                    resp, extras = await self._hop(hop_auth, method, current_url, hop_headers,
+                                             body, metrics, req_hooks, hkw)
+                    delay = None
+                    for plugin in retry_plugins:
+                        if plugin.should_retry(resp, attempt):
+                            delay = plugin.delay_for(resp, attempt)
+                            break
+                    if delay is None:
                         break
-                if not retrying:
-                    break
-                attempt += 1
+                    if delay:
+                        await asyncio.sleep(delay)
+                    attempt += 1
+                history.extend(extras)
+                if history:
+                    resp.history = list(history)
 
-            if history:
-                resp.history = list(history)
+                if not allow_redirects or resp.status_code not in (301, 302, 303, 307, 308):
+                    if not allow_redirects:
+                        resp.next = _api.next_request(resp, method, current_url, headers, body)
+                    return resp
 
-            if not allow_redirects or resp.status_code not in (301, 302, 303, 307, 308):
-                return resp
+                if redirect_count >= self.max_redirects:
+                    raise ConnectionError(f"Maksimum yönlendirme sayısına ulaşıldı ({self.max_redirects}).")
 
-            if redirect_cnt >= self.max_redirects:
-                raise ConnectionError("Max redirect aşıldı")
+                location = resp.headers.get("location", "")
+                if not location:
+                    return resp
 
-            location = resp.headers.get("location", "")
-            if not location:
-                return resp
+                history.append(resp)
+                metrics.redirect_count += 1
 
-            history.append(resp)
-            metrics.redirect_count += 1
+                base = URL(current_url) if isinstance(current_url, str) else current_url
+                current_url = _resolve_location(base, location)
 
-            base = URL(current_url)
-            location = _resolve_location(base, location)
+                # Farklı bir origin'e gidiyorsak Authorization/Cookie TAŞINMAZ;
+                # aksi hâlde kimlik bilgisi üçüncü bir siteye sızar.
+                new_url = URL(current_url)
+                if (new_url.scheme, new_url.host, new_url.port) != base.origin and headers:
+                    headers = {
+                        k: v for k, v in dict(headers).items()
+                        if k.lower() not in ("authorization", "cookie", "proxy-authorization")
+                    }
 
-            new = URL(location)
-            if (new.scheme, new.host, new.port) != base.origin:
-                # Farklı origin'e giderken kimlik bilgisi taşınmaz
-                h = {k: v for k, v in h.items()
-                     if k.lower() not in ("authorization", "cookie", "proxy-authorization")}
+                if resp.status_code in (301, 302, 303):
+                    method = "GET"
+                    body   = b""
+                    headers = {k: v for k, v in headers.items()
+                               if k.lower() not in ("content-type", "content-length")}
 
-            current_url = location
-            if resp.status_code in (301, 302, 303):
-                method = "GET"
-                body = b""
-                h = {k: v for k, v in h.items()
-                     if k.lower() not in ("content-type", "content-length")}
-
-            redirect_cnt += 1
-
-                                                                                
+                redirect_count += 1
+                logger.debug("Yönlendirme (%s) -> %s", resp.status_code, current_url)
+        finally:
+            _api.reset_timeout_override(token)
 
     def _merged_headers(self, headers) -> dict:
         """Oturum başlıkları + istek başlıkları (istek kazanır; büyük/küçük harf
@@ -1154,36 +1170,51 @@ class AsyncSession:
                 merged[k] = v
         return merged
 
-    async def get(self, url, headers: Optional[dict] = None, allow_redirects: bool = True) -> Response:
-        return await self.request("GET", url, headers=headers, allow_redirects=allow_redirects)
+    async def get(self, url, headers=None, allow_redirects=True, params=None, cookies=None,
+                  auth=USE_CLIENT_DEFAULT, timeout=USE_CLIENT_DEFAULT, hooks=None) -> Response:
+        return await self.request("GET", url, headers=headers, allow_redirects=allow_redirects,
+                                  params=params, cookies=cookies, auth=auth, timeout=timeout,
+                                  hooks=hooks)
 
-    async def post(self, url, data=None, json=None, headers: Optional[dict] = None,
-                   files=None, allow_redirects: bool = True) -> Response:
-        return await self.request("POST", url, data=data, json=json, headers=headers,
-                                  files=files, allow_redirects=allow_redirects)
+    async def post(self, url, data=None, json=None, headers=None, files=None, allow_redirects=True,
+                   params=None, cookies=None, auth=USE_CLIENT_DEFAULT, timeout=USE_CLIENT_DEFAULT,
+                   hooks=None) -> Response:
+        return await self.request("POST", url, data=data, json=json, headers=headers, files=files,
+                                  allow_redirects=allow_redirects, params=params, cookies=cookies,
+                                  auth=auth, timeout=timeout, hooks=hooks)
 
-    async def put(self, url, data=None, json=None, headers: Optional[dict] = None,
-                  files=None, allow_redirects: bool = True) -> Response:
-        return await self.request("PUT", url, data=data, json=json, headers=headers,
-                                  files=files, allow_redirects=allow_redirects)
+    async def put(self, url, data=None, json=None, headers=None, files=None, allow_redirects=True,
+                  params=None, cookies=None, auth=USE_CLIENT_DEFAULT, timeout=USE_CLIENT_DEFAULT,
+                  hooks=None) -> Response:
+        return await self.request("PUT", url, data=data, json=json, headers=headers, files=files,
+                                  allow_redirects=allow_redirects, params=params, cookies=cookies,
+                                  auth=auth, timeout=timeout, hooks=hooks)
 
-    async def patch(self, url, data=None, json=None, headers: Optional[dict] = None,
-                    allow_redirects: bool = True) -> Response:
+    async def patch(self, url, data=None, json=None, headers=None, allow_redirects=True,
+                    params=None, cookies=None, auth=USE_CLIENT_DEFAULT, timeout=USE_CLIENT_DEFAULT,
+                    hooks=None) -> Response:
         return await self.request("PATCH", url, data=data, json=json, headers=headers,
-                                  allow_redirects=allow_redirects)
+                                  allow_redirects=allow_redirects, params=params, cookies=cookies,
+                                  auth=auth, timeout=timeout, hooks=hooks)
 
-    async def delete(self, url, headers: Optional[dict] = None,
-                     allow_redirects: bool = True) -> Response:
-        return await self.request("DELETE", url, headers=headers, allow_redirects=allow_redirects)
+    async def delete(self, url, headers=None, allow_redirects=True, params=None, cookies=None,
+                     auth=USE_CLIENT_DEFAULT, timeout=USE_CLIENT_DEFAULT, hooks=None) -> Response:
+        return await self.request("DELETE", url, headers=headers, allow_redirects=allow_redirects,
+                                  params=params, cookies=cookies, auth=auth, timeout=timeout,
+                                  hooks=hooks)
 
-    async def head(self, url, headers: Optional[dict] = None) -> Response:
-        return await self.request("HEAD", url, headers=headers, allow_redirects=False)
+    async def head(self, url, headers=None, allow_redirects=False, params=None, cookies=None,
+                   auth=USE_CLIENT_DEFAULT, timeout=USE_CLIENT_DEFAULT, hooks=None) -> Response:
+        """HEAD; ``allow_redirects`` varsayılanı ``False`` (requests/httpx gibi)."""
+        return await self.request("HEAD", url, headers=headers, allow_redirects=allow_redirects,
+                                  params=params, cookies=cookies, auth=auth, timeout=timeout,
+                                  hooks=hooks)
 
-    async def options(self, url, headers: Optional[dict] = None,
-                      allow_redirects: bool = True) -> Response:
-        return await self.request("OPTIONS", url, headers=headers, allow_redirects=allow_redirects)
-
-                                                                               
+    async def options(self, url, headers=None, allow_redirects=True, params=None, cookies=None,
+                      auth=USE_CLIENT_DEFAULT, timeout=USE_CLIENT_DEFAULT, hooks=None) -> Response:
+        return await self.request("OPTIONS", url, headers=headers,
+                                  allow_redirects=allow_redirects, params=params, cookies=cookies,
+                                  auth=auth, timeout=timeout, hooks=hooks)
 
     async def gather(self, *requests: tuple) -> list[Response]:
         """
