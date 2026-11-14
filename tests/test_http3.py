@@ -12,7 +12,7 @@ from fasthttpc import AsyncSession, Session  # noqa: E402
 from fasthttpc.http3 import Http3Options, parse_alt_svc  # noqa: E402
 from fasthttpc.security.cert_validator import CertificateValidationError  # noqa: E402
 
-from h3_servers import H3TestServer, make_ca, make_leaf  # noqa: E402
+from h3_servers import H3TestServer, NoFqdnHTTPServer, make_ca, make_leaf  # noqa: E402
 
 
 @pytest.fixture(scope="module")
@@ -194,7 +194,7 @@ def test_fallback_to_h2_when_udp_dead(pki):
             self.send_response(200); self.send_header("Content-Length", "2")
             self.send_header("Alt-Svc", f'h3=":{port}"; ma=60'); self.end_headers(); self.wfile.write(b"ok")
         def log_message(self, *a): pass
-    httpd = http.server.ThreadingHTTPServer(("127.0.0.1", port), H)
+    httpd = NoFqdnHTTPServer(("127.0.0.1", port), H)   # macOS: getfqdn gecikmesi yok
     ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER); ctx.load_cert_chain(pki["crt"], pki["key"])
     httpd.socket = ctx.wrap_socket(httpd.socket, server_side=True)
     threading.Thread(target=httpd.serve_forever, daemon=True).start()
