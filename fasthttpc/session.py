@@ -459,7 +459,7 @@ class Session:
                                  self.impersonate, req.url.host)
                     conn.socket = TLSAdapter.negotiate(
                         conn.socket, req.url.host, self.impersonate,
-                        ca_path=self._ca_path,
+                        ca_path=self._ca_path, port=req.url.port,
                     )
                     conn.socket.raw_socket.settimeout(self.timeout.read_timeout)
                     conn.tls_established = True

@@ -304,7 +304,7 @@ class ConnectionPool:
                 conn.connect(timeout=self.timeout, resolver=self.resolver,
                              proxy=resolve_proxy(self.proxy, url.scheme))
                 if tls_negotiate_fn:
-                    conn.socket = tls_negotiate_fn(conn.socket, url.host, impersonate)
+                    conn.socket = tls_negotiate_fn(conn.socket, url.host, impersonate, port=url.port)
                     conn.tls_established = True
                 conn.idle_since = time.monotonic()
                 with self._lock:
