@@ -454,7 +454,7 @@ class AsyncSession:
         stream = opened.writer          # AsyncTLSStream: read/write/drain/close/wait_closed
         conn = AsyncHttp2Connection(
             stream, read_timeout=self.timeout.read, write_timeout=self.timeout.write,
-            on_close=opened.release,
+            on_close=opened.release, profile=self.impersonate,
         )
         try:
             await asyncio.wait_for(conn.start(), self.timeout.connect)
