@@ -470,7 +470,7 @@ class AsyncSession:
                         req_headers: dict, raw_body: bytes, metrics):
         """Bağlantıyı bulur/kurar ve isteği h2 veya HTTP/1.1 ile yapar.
 
-        ``(status, Headers, body_raw, send_time)`` döner.
+        ``(status, Headers, body_raw, send_time, http_version)`` döner.
         """
         key = (u.host, u.port, proxy)
         for attempt in (0, 1):
@@ -531,7 +531,7 @@ class AsyncSession:
         headers = Headers()
         for k, v in r.headers:
             headers.add(k, v)
-        return r.status, headers, r.body, send_time
+        return r.status, headers, r.body, send_time, "HTTP/2"
 
     @staticmethod
     async def _h1_read_body(reader, method: str, status: int, headers: Headers,
@@ -647,7 +647,7 @@ class AsyncSession:
             body_raw = await self._h1_read_body(reader, method, status_code, resp_headers,
                                                 first_body_chunk, read_to)
 
-            return status_code, resp_headers, bytes(body_raw), send_time
+            return status_code, resp_headers, bytes(body_raw), send_time, "HTTP/1.1"
         finally:
             writer.close()
             try:
@@ -701,7 +701,7 @@ class AsyncSession:
             metrics.request_start = time.monotonic()
 
         try:
-            status_code, resp_headers, body_raw, send_time = await self._exchange(
+            status_code, resp_headers, body_raw, send_time, http_version = await self._exchange(
                 method, u, proxy_cfg, req_headers, raw_body, metrics)
 
             if metrics:
@@ -719,6 +719,7 @@ class AsyncSession:
                     self.cookies[k.strip()] = v.strip()
 
             resp = Response(status_code=status_code, headers=resp_headers, body=body_final)
+            resp.http_version = http_version
 
             if metrics:
                 resp.metrics = metrics

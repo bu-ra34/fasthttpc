@@ -167,10 +167,16 @@ class Session:
         if metrics:
             metrics.bytes_sent = len(req.body) + sum(len(k) + len(v) for k, v in h2_headers)
 
+        host = req.url.host
+        if ":" in host:
+            host = f"[{host}]"
+        default_port = 443 if req.url.scheme == "https" else 80
+        authority = host if req.url.port == default_port else f"{host}:{req.url.port}"
+
         try:
             status_code, resp_header_pairs, body_raw = conn.h2_conn.request(
                 method=req.method,
-                authority=req.url.host,
+                authority=authority,
                 path=req.url.raw_path.decode("latin-1"),
                 headers=h2_headers,
                 body=req.body,
@@ -185,7 +191,7 @@ class Session:
 
         resp_headers = Headers()
         for k, v in resp_header_pairs:
-            resp_headers[k] = v
+            resp_headers.add(k, v)
 
         ce = resp_headers.get("content-encoding", "").lower()
         body_raw = HTTP1Parser._decompress(body_raw, ce)
