@@ -1,10 +1,10 @@
 # fasthttpc
 
-[![CI](https://github.com/cevpy/fasthttpc/actions/workflows/ci.yml/badge.svg)](https://github.com/cevpy/fasthttpc/actions/workflows/ci.yml)
+[![CI](https://github.com/bu-ra34/fasthttpc/actions/workflows/ci.yml/badge.svg)](https://github.com/bu-ra34/fasthttpc/actions/workflows/ci.yml)
 [![PyPI](https://img.shields.io/pypi/v/fasthttpc.svg)](https://pypi.org/project/fasthttpc/)
 [![Python versions](https://img.shields.io/pypi/pyversions/fasthttpc.svg)](https://pypi.org/project/fasthttpc/)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
-[![Docs](https://img.shields.io/badge/docs-mkdocs-informational.svg)](https://cevpy.github.io/fasthttpc/)
+[![Docs](https://img.shields.io/badge/docs-mkdocs-informational.svg)](https://bu-ra34.github.io/fasthttpc/)
 
 [English](README.md) | [Türkçe](README.tr.md)
 
@@ -142,18 +142,18 @@ via GitHub security advisories.
 - Pure-Python crypto framing is slower than OpenSSL for large bulk transfers.
 
 The full, detailed list is in [README.tr.md](README.tr.md) and the
-[documentation](https://cevpy.github.io/fasthttpc/).
+[documentation](https://bu-ra34.github.io/fasthttpc/).
 
 ## Documentation
 
 Quick start, async usage, profiles, proxies, TLS, HTTP/2, testing, migration
-guides and the API reference live at <https://cevpy.github.io/fasthttpc/>
+guides and the API reference live at <https://bu-ra34.github.io/fasthttpc/>
 (sources in [`docs/`](docs/)).
 
 ## Development
 
 ```bash
-git clone https://github.com/cevpy/fasthttpc && cd fasthttpc
+git clone https://github.com/bu-ra34/fasthttpc && cd fasthttpc
 pip install -e ".[dev]"
 pytest            # offline unit tests
 ruff check .
