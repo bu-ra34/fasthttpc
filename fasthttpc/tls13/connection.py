@@ -34,6 +34,7 @@ from ..security import cert_validator as _cv
 from ..security import session_tickets as _st
 from ..security.cert_validator import CertificateValidationError
 from . import _compat as C
+from ..security.alerts import describe_alert
 from .errors import TLSError, TLSAlertError
 from .events import (
     Event,
@@ -90,6 +91,24 @@ def parse_alpn(ee_msg: bytes) -> str:
     except (struct.error, IndexError):
         pass
     return ""
+
+
+def parse_record_size_limit(ee_msg: bytes) -> int:
+    """EncryptedExtensions içindeki record_size_limit (ext 28, RFC 8449); yoksa 0."""
+    try:
+        total = struct.unpack("!H", ee_msg[4:6])[0]
+        cur, end = 6, min(6 + total, len(ee_msg))
+        while cur + 4 <= end:
+            et, el = struct.unpack("!HH", ee_msg[cur:cur + 4])
+            cur += 4
+            if et == 28:
+                if el != 2:
+                    raise TLSError("decode_error: bozuk record_size_limit uzantısı")
+                return struct.unpack("!H", ee_msg[cur:cur + 2])[0]
+            cur += el
+    except (struct.error, IndexError):
+        pass
+    return 0
 
 
 class _Direction:
@@ -177,6 +196,7 @@ class TLSClientConnection:
         self.cipher_name = "CHACHA20-POLY1305"
         self.key_len = 32
         self.alpn = ""
+        self._send_limit = C.MAX_PLAINTEXT   # sunucunun record_size_limit'inden türeyen azami düz metin
         self.peer_certificate = None
         self.signature_scheme: Optional[int] = None
 
@@ -261,7 +281,7 @@ class TLSClientConnection:
             raise TLSError("Yazma anahtarı yok — handshake başlamadı.")
         if self.state == ST_CLOSED:
             raise TLSError("Bağlantı kapalı.")
-        mp = C.MAX_PLAINTEXT
+        mp = self._send_limit
         if not data:
             self._seal(b"", content_type)
             return
@@ -323,6 +343,8 @@ class TLSClientConnection:
             while self.state != ST_CLOSED and len(self._inbuf) >= 5:
                 rtype = self._inbuf[0]
                 rlen = struct.unpack("!H", self._inbuf[3:5])[0]
+                if self.state != ST_CONNECTED and bytes(self._inbuf[:4]) == b"HTTP":
+                    raise TLSError("Sunucu TLS yerine düz HTTP ile yanıt verdi (bu port TLS konuşmuyor olabilir).")
                 if rlen > C.MAX_CIPHERTEXT:
                     raise TLSError(f"record_overflow: record uzunluğu {rlen} > {C.MAX_CIPHERTEXT}")
                 if len(self._inbuf) < 5 + rlen:
@@ -406,14 +428,14 @@ class TLSClientConnection:
             elif was_connected:
                 events.append(AlertReceived(level, desc))
             else:
-                raise TLSAlertError(level, desc, f"Sunucudan Şifreli TLS Alert: {inner.hex()}")
+                raise TLSAlertError(level, desc, f"Sunucudan şifreli TLS alert: {describe_alert(bytes(inner))}")
         else:
             raise TLSError(f"unexpected_message: bilinmeyen iç content type {itype}")
 
     def _raise_alert(self, payload: bytes) -> None:
         level = payload[0] if len(payload) > 0 else 2
         desc = payload[1] if len(payload) > 1 else 0
-        raise TLSAlertError(level, desc, f"Sunucu el sıkışmayı reddetti (alert): {payload.hex()}")
+        raise TLSAlertError(level, desc, f"Sunucu el sıkışmayı reddetti: {describe_alert(bytes(payload))}")
 
     def _feed_handshake(self, data: bytes, events: list, epoch) -> None:
         # Handshake mesajları anahtar değişimi sınırını aşamaz (RFC 8446 §5.1).
@@ -610,6 +632,12 @@ class TLSClientConnection:
             self.alpn = parse_alpn(msg)
             self._send_client_ee = alps_accepted(
                 getattr(self._imp, "alps_advertised", False), msg, self.alpn)
+            limit = parse_record_size_limit(msg)
+            if limit:
+                if limit < 64:  # RFC 8449 §4: 64'ten küçük değer illegal_parameter
+                    raise TLSError(f"illegal_parameter: record_size_limit={limit} < 64")
+                # TLS 1.3'te sınır içerik tipi baytını da kapsar (RFC 8449 §4)
+                self._send_limit = min(C.MAX_PLAINTEXT, limit - 1)
 
         elif hs_type in (HS_CERTIFICATE, HS_COMPRESSED_CERTIFICATE, HS_CERTIFICATE_VERIFY) and self.resumed:
             raise TLSError(
@@ -637,7 +665,8 @@ class TLSClientConnection:
                 raise TLSError("Sunucu Certificate göndermeden CertificateVerify gönderdi — protokol ihlali.")
             try:
                 self.signature_scheme = _cv.verify_certificate_verify(
-                    msg, self.peer_certificate, transcript_before
+                    msg, self.peer_certificate, transcript_before,
+                    offered_schemes=self._imp.profile.get("signature_algorithms"),
                 )
             except CertificateValidationError as e:
                 raise TLSError(f"TLS kimlik doğrulaması başarısız: {e}") from e

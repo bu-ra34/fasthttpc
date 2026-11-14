@@ -315,6 +315,9 @@ _SIG_SCHEMES = {
 }
 
 
+_ECDSA_SCHEME_CURVE = {0x0403: "secp256r1", 0x0503: "secp384r1", 0x0603: "secp521r1"}
+
+
 def build_certificate_verify_content(transcript_hash: bytes) -> bytes:
     """RFC 8446 §4.4.3'teki imzalanan içeriği kurar.
 
@@ -327,6 +330,7 @@ def verify_certificate_verify(
     hs_payload: bytes,
     leaf_cert,
     transcript_hash: bytes,
+    offered_schemes=None,
 ) -> int:
     """Sunucunun CertificateVerify mesajını doğrular.
 
@@ -335,6 +339,8 @@ def verify_certificate_verify(
         leaf_cert:       Doğrulanmış leaf sertifika (x509.Certificate).
         transcript_hash: Certificate mesajı DAHİL, CertificateVerify HARİÇ
                          handshake transcript'inin hash'i.
+        offered_schemes: ClientHello.signature_algorithms'ta teklif ettiğimiz şemalar;
+                         verilirse dışındaki bir şema reddedilir (RFC 8446 §4.4.3).
 
     Returns:
         Kullanılan SignatureScheme değeri.
@@ -369,6 +375,12 @@ def verify_certificate_verify(
             f"(rsa_pkcs1_* şemaları TLS 1.3 CertificateVerify'da kullanılamaz.)"
         )
 
+    if offered_schemes is not None and scheme not in {a for a in offered_schemes if isinstance(a, int)}:
+        raise CertificateValidationError(
+            f"Sunucu CertificateVerify'da teklif etmediğimiz SignatureScheme 0x{scheme:04x} kullandı "
+            f"(RFC 8446 §4.4.3)."
+        )
+
     kind, hash_name = _SIG_SCHEMES[scheme]
     content = build_certificate_verify_content(transcript_hash)
     pubkey = leaf_cert.public_key()
@@ -379,6 +391,13 @@ def verify_certificate_verify(
                 raise CertificateValidationError(
                     f"Sunucu ECDSA şeması (0x{scheme:04x}) bildirdi ama sertifikadaki "
                     f"anahtar EC değil ({type(pubkey).__name__})."
+                )
+            # RFC 8446 §4.2.3: TLS 1.3'te ECDSA şeması eğriye bağlıdır.
+            want_curve = _ECDSA_SCHEME_CURVE[scheme]
+            if pubkey.curve.name != want_curve:
+                raise CertificateValidationError(
+                    f"ECDSA şeması 0x{scheme:04x} {want_curve} eğrisi gerektirir ama sertifika anahtarı "
+                    f"{pubkey.curve.name} (RFC 8446 §4.2.3)."
                 )
             pubkey.verify(signature, content, ec.ECDSA(getattr(_h, hash_name.upper())()))
 
