@@ -26,6 +26,7 @@ from typing import Mapping, Optional, Union
 from urllib.parse import unquote, urlsplit
 
 from .._log import get_logger
+from .happy_eyeballs import CONNECTION_ATTEMPT_DELAY, create_connection
 
 logger = get_logger("proxy")
 
@@ -222,7 +223,7 @@ def connect_via_proxy(proxy: ProxyConfig, host: str, port: int,
     Dönen soket üzerinde doğrudan ``TLSAdapter.negotiate`` çalıştırılabilir.
     """
     try:
-        sock = socket.create_connection((proxy.host, proxy.port), timeout=timeout)
+        sock = create_connection((proxy.host, proxy.port), timeout=timeout)
     except OSError as e:
         raise ProxyError(f"Proxy'ye bağlanılamadı ({proxy.host}:{proxy.port}): {e}") from e
     try:

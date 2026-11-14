@@ -17,6 +17,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Optional
 
 from ..models.urls import URL
+from .happy_eyeballs import connect_infos
 from .proxy import ProxyConfig, connect_via_proxy, resolve_proxy
 
 
@@ -98,32 +99,22 @@ class HTTPConnection:
         except socket.gaierror as e:
             raise ConnectionError(f"'{host}' adresi çözümlenemedi: {e}") from e
 
-        last_error: Exception | None = None
-        for family, socktype, proto, _canon, sockaddr in infos:
-            raw = socket.socket(family, socktype, proto)
-            try:
-                self._apply_socket_options(raw)
-                raw.settimeout(timeout)
-                raw.connect(sockaddr)
-            except PermissionError as e:
-                raw.close()
-                raise ConnectionError(
-                    f"'{host}:{port}' adresine bağlanılamadı (İzin reddedildi / Errno 13). "
-                    f"Bu genellikle şunlardan kaynaklanır: (1) ağın/güvenlik duvarının giden "
-                    f"bağlantıyı engellemesi, (2) sandbox/container ortamının ham soket açmaya "
-                    f"izin vermemesi, (3) zorunlu bir proxy üzerinden geçilmesi gerektiği halde "
-                    f"doğrudan bağlanılmaya çalışılması. Orijinal hata: {e}"
-                ) from e
-            except OSError as e:
-                raw.close()
-                last_error = e
-                continue
-
-            self.socket = raw
-            self.is_closed = False
-            return
-
-        raise ConnectionError(f"'{host}:{port}' adresine bağlanılamadı: {last_error}")
+        # Happy Eyeballs (RFC 8305): adresler (AAAA + A) sırayla değil yarıştırılır;
+        # ör. Windows'ta "localhost" -> ::1 reddi ~2 sn sürer, IPv4 250 ms'de kazanır.
+        try:
+            raw = connect_infos(infos, timeout, prepare=self._apply_socket_options)
+        except PermissionError as e:
+            raise ConnectionError(
+                f"'{host}:{port}' adresine bağlanılamadı (İzin reddedildi / Errno 13). "
+                f"Bu genellikle şunlardan kaynaklanır: (1) ağın/güvenlik duvarının giden "
+                f"bağlantıyı engellemesi, (2) sandbox/container ortamının ham soket açmaya "
+                f"izin vermemesi, (3) zorunlu bir proxy üzerinden geçilmesi gerektiği halde "
+                f"doğrudan bağlanılmaya çalışılması. Orijinal hata: {e}"
+            ) from e
+        except OSError as e:
+            raise ConnectionError(f"'{host}:{port}' adresine bağlanılamadı: {e}") from e
+        self.socket = raw
+        self.is_closed = False
 
     @staticmethod
     def _apply_socket_options(raw: socket.socket) -> None:
