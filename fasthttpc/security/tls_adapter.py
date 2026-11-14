@@ -456,9 +456,13 @@ class EncryptedSocket:
             rec_type, record_header, payload = self._read_raw_record()
 
             if rec_type == 20:  # change_cipher_spec — TLS 1.3'te uyumluluk için, yok say
+                # RFC 8446 §5: yalnızca tek byte 0x01 geçerli (el sıkışma sonrası CCS'in tolere edilmesi
+                # test_record_layer_perf tarafından bilinçli olarak korunuyor).
+                if payload != b"\x01":
+                    raise _unexpected("beklenmeyen/geçersiz change_cipher_spec record'u.")
                 continue
             if rec_type == 21:  # açık (şifresiz) alert
-                raise ConnectionError(f"Açık TLS Alert Alındı: {payload.hex()}")
+                raise ConnectionError(f"Açık (şifresiz) TLS alert alındı: {describe_alert(payload)}")
             if rec_type != 23:
                 raise _unexpected(f"şifreli bağlantıda beklenmeyen record tipi {rec_type}.")
 
