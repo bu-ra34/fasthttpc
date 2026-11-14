@@ -2,9 +2,60 @@ import struct
 import os
 import threading
 from .fingerprint import get_profile, _random_grease
+import random as _random_mod
 from .security.keyshare import (
     KeyShareSet, SUPPORTED_GROUPS, GROUP_X25519, group_name,
 )
+
+# ALPS (application_settings) eski kod noktası — Chrome 131 bunu kullanır
+# (17613'e geçiş Chrome 133'te). RFC taslağı: draft-vvv-tls-alps.
+EXT_ALPS = 17513
+EXT_ECH = 65037          # encrypted_client_hello (yalnızca GREASE gönderiyoruz)
+_SYS_RANDOM = _random_mod.SystemRandom()
+
+
+def encrypted_extensions_types(hs_payload: bytes) -> list[int]:
+    """EncryptedExtensions (4 byte handshake başlığı DAHİL) içindeki extension tipleri."""
+    types: list[int] = []
+    try:
+        total = struct.unpack("!H", hs_payload[4:6])[0]
+        cur, end = 6, min(6 + total, len(hs_payload))
+        while cur + 4 <= end:
+            t, ln = struct.unpack("!HH", hs_payload[cur:cur + 4])
+            types.append(t)
+            cur += 4 + ln
+    except (struct.error, IndexError):
+        pass
+    return types
+
+
+def build_client_encrypted_extensions(settings: bytes = b"") -> bytes:
+    """İstemcinin EncryptedExtensions mesajı (hs_type=8) — yalnızca ALPS içerir.
+
+    Sunucu EncryptedExtensions'ında application_settings döndürdüyse (ALPS
+    kabul), istemci Finished'tan ÖNCE kendi ALPS'ini bu mesajla yollamak
+    ZORUNDADIR (BoringSSL sunucuları bunu bekler). ``settings`` boş: Chrome
+    h2 için istemci tarafı ayarı taşımaz.
+    """
+    ext = struct.pack("!HH", EXT_ALPS, len(settings)) + settings
+    body = struct.pack("!H", len(ext)) + ext
+    return b"\x08" + struct.pack("!I", len(body))[1:] + body
+
+
+def alps_accepted(profile_alps: bool, ee_payload: bytes, alpn: str) -> bool:
+    """Sunucu ALPS'i kabul ettiyse (ve ALPN h2 ise) True."""
+    return bool(profile_alps and alpn == "h2" and EXT_ALPS in encrypted_extensions_types(ee_payload))
+
+
+def _supported_cert_compression() -> list[int]:
+    """Açabildiğimiz sertifika sıkıştırma algoritmaları (zlib=1 her zaman, brotli=2 kuruluysa)."""
+    algs = [0x0001]
+    try:
+        import brotli  # noqa: F401
+        algs.append(0x0002)
+    except ImportError:
+        pass
+    return algs
 
                                      
                              
@@ -25,6 +76,12 @@ def clear_ticket_cache() -> None:
         _ticket_cache.clear()
 
 
+# Yalnızca gerçekten uygulayabiliyorsak ilan edebileceğimiz (PQ/hibrit) gruplar:
+# desteklenmiyorsa supported_groups'ta ilan edilirse sunucu HRR ile bunu ister
+# ve handshake kırılır (bkz. keyshare.HAVE_MLKEM).
+_NEEDS_SUPPORT = frozenset({0x11EC, 0x6399})
+
+
 class TLSImpersonator:
     def __init__(self, target_host, profile=None):
         self.target_host = target_host.encode("utf-8")
@@ -40,8 +97,11 @@ class TLSImpersonator:
         # aynı olmalıdır).
         self._grease_ext_values: list[int] = []
         self._grease_ext_idx = 0
+        self._key_share_grease = False
+        self._ext_order: list[str] | None = None     # bağlantı başına sabitlenen (karıştırılmış) sıra
         self.key_shares = KeyShareSet(self._key_share_groups())
         self._cookie: bytes | None = None
+        self._is_retry = False
         self._client_random: bytes | None = None
         self._session_id: bytes | None = None
         self.last_client_hello: bytes = b""
@@ -57,6 +117,7 @@ class TLSImpersonator:
         HRR ile desteklenmeyen bir grup isterse negotiate() net hata verir.
         """
         wanted = self.profile.get("key_share_groups", [GROUP_X25519])
+        self._key_share_grease = "GREASE" in wanted
         groups = [g for g in wanted if isinstance(g, int) and g in SUPPORTED_GROUPS]
         if not groups:
             groups = [GROUP_X25519]
@@ -133,7 +194,8 @@ class TLSImpersonator:
             self._used_grease_exts.add(val)
             self._grease_ext_values.append(val)
         self._grease_ext_idx += 1
-        return self._ext(val, b"")
+        # BoringSSL: ilk GREASE extension boş, sondaki (2.) GREASE 1 byte (0x00) taşır.
+        return self._ext(val, b"" if self._grease_ext_idx == 1 else b"\x00")
 
     def _pack_sni(self) -> bytes:
         host_len = len(self.target_host)
@@ -153,7 +215,7 @@ class TLSImpersonator:
         for g in profile_groups:
             if g == "GREASE":
                 groups.append(self._grease_group)
-            elif isinstance(g, int):
+            elif isinstance(g, int) and (g in SUPPORTED_GROUPS or g not in _NEEDS_SUPPORT):
                 groups.append(g)
         if not groups:
             groups = [0x001D, 0x0017, 0x0018]
@@ -204,6 +266,10 @@ class TLSImpersonator:
 
     def _pack_key_share(self) -> bytes:
         entries = self.key_shares.entries()
+        if self._key_share_grease and self._cookie is None and not self._is_retry:
+            # RFC 8701 GREASE key_share girdisi: supported_groups'taki GREASE
+            # grubuyla aynı değer, 1 byte (0x00) veri.
+            entries = struct.pack("!HHB", self._grease_group, 1, 0) + entries
         ext = self._ext(0x0033, struct.pack("!H", len(entries)) + entries)
         if self._cookie is not None:
             # HRR cookie'si (RFC 8446 §4.2.2) 2. ClientHello'da aynen geri yollanır.
@@ -237,46 +303,62 @@ class TLSImpersonator:
         return self._ext(0x002B, struct.pack("!B", len(raw)) + raw)
 
     def _pack_compress_certificate(self) -> bytes:
-        algorithms = [0x0002, 0x0001]
+        wanted = self.profile.get("cert_compression", [0x0002, 0x0001])
+        have = _supported_cert_compression()
+        algorithms = [a for a in wanted if a in have] or [0x0001]
         raw = b"".join(struct.pack("!H", a) for a in algorithms)
         payload = struct.pack("!B", len(raw)) + raw
         return self._ext(0x001B, payload)
 
     def _pack_delegated_credentials(self) -> bytes:
-        algs = [0x0403, 0x0503, 0x0603, 0x0804]
+        algs = self.profile.get("delegated_credentials", [0x0403, 0x0503, 0x0603, 0x0804])
         raw = b"".join(struct.pack("!H", a) for a in algs)
         payload = struct.pack(f"!H{len(raw)}s", len(raw), raw)
         return self._ext(0x0022, payload)
 
     def _pack_record_size_limit(self) -> bytes:
-        return self._ext(0x001C, struct.pack("!H", 0x4001))
+        return self._ext(0x001C, struct.pack("!H", self.profile.get("record_size_limit", 0x4001)))
+
+    def _pack_alps(self) -> bytes:
+        """application_settings (ALPS): desteklenen protokol listesi (Chrome: ["h2"])."""
+        protos = self.profile.get("alps_protocols", ["h2"])
+        raw = b"".join(struct.pack("!B", len(p)) + p.encode() for p in protos)
+        return self._ext(EXT_ALPS, struct.pack("!H", len(raw)) + raw)
+
+    def _pack_ech_grease(self) -> bytes:
+        """ECH GREASE (RFC 9849 §6.2 / draft-ietf-tls-esni): GERÇEK ECH DEĞİL.
+
+        ``outer`` ClientHelloOuter biçiminde rastgele config_id/enc/payload.
+        Sunucu ECH anahtarı yoksa yok sayar; varsa (retry_configs) yanıt
+        EncryptedExtensions içinde gelir ve yok sayılır.
+        """
+        cfg = self.profile.get("ech_grease", {})
+        aead = _SYS_RANDOM.choice(cfg.get("aead_ids", [0x0001]))
+        plen = _SYS_RANDOM.choice(cfg.get("payload_lens", [144, 176, 208, 240]))
+        body = (
+            b"\x00"                                    # ECHClientHelloType: outer
+            + struct.pack("!HH", 0x0001, aead)          # HKDF-SHA256, AEAD
+            + os.urandom(1)                             # config_id
+            + struct.pack("!H", 32) + os.urandom(32)    # enc (X25519 boyutu)
+            + struct.pack("!H", plen) + os.urandom(plen)
+        )
+        return self._ext(EXT_ECH, body)
 
     def _pack_padding(self, ext_body_len: int, tail_len: int = 0) -> bytes:
-        """
-        ClientHello toplam uzunluğunu 512 byte'ın katına yuvarlayacak şekilde
-        padding ekle (Chrome davranışı).
+        """BoringSSL tarzı padding (RFC 7685): handshake mesajı 256..511 bayt
+        ise 512'ye tamamlanır, aksi halde padding EKLENMEZ (Chrome/Safari
+        davranışı). Boş döner -> extension hiç yazılmaz.
 
-        ClientHello yapısı:
-          TLS record header  : 5 byte
-          Handshake header   : 4 byte
-          client_version     : 2
-          client_random      : 32
-          session_id         : 1 + 32
-          cipher_suites      : 2 + len
-          compression        : 2
-          extensions length  : 2
-          extensions         : ext_body_len (padding hariç)
+        Handshake mesajı = 4 (başlık) + 2 (sürüm) + 32 (random) + 33
+        (session_id) + cipher bloğu + 2 (compression) + 2 (ext uzunluğu) +
+        extension'lar.
         """
-        # _build_cipher_suites() zaten kendi 2 byte'lık uzunluk prefix'ini
-        # içeriyor; ayrıca 2 eklemek toplamı 2 byte şişirip hedefi kaydırıyordu.
         cipher_len = len(self._build_cipher_suites())
-        fixed = 5 + 4 + 2 + 32 + 33 + cipher_len + 2 + 2
-        current_total = fixed + ext_body_len + tail_len + 4
-        target = ((current_total + 511) // 512) * 512
-        pad_data_len = target - current_total
-        if pad_data_len < 0:
-            pad_data_len = 0
-        return self._ext(0x0015, bytes(pad_data_len))
+        msg_len = 4 + 2 + 32 + 33 + cipher_len + 2 + 2 + ext_body_len + tail_len
+        if 0xFF < msg_len < 0x200:
+            pad = 0x200 - msg_len - 4
+            return self._ext(0x0015, bytes(max(pad, 1)))
+        return b""
 
     _EXT_BUILDERS = {
         "GREASE":                    "_pack_grease_ext",
@@ -296,10 +378,32 @@ class TLSImpersonator:
         "compress_certificate":      "_pack_compress_certificate",
         "delegated_credentials":     "_pack_delegated_credentials",
         "record_size_limit":         "_pack_record_size_limit",
+        "alps":                      "_pack_alps",
+        "ech_grease":                "_pack_ech_grease",
     }
 
+    @property
+    def alps_advertised(self) -> bool:
+        return "alps" in self.profile.get("extensions_order", [])
+
+    def _effective_order(self) -> list[str]:
+        """Profil sırası; ``shuffle_extensions`` ise (Chrome) baştaki/sondaki
+        GREASE hariç ortası bağlantı başına BİR KEZ karıştırılır ve HRR
+        sonrası 2. ClientHello'da AYNEN korunur."""
+        if self._ext_order is not None:
+            return self._ext_order
+        order = list(self.profile.get("extensions_order", []))
+        if self.profile.get("shuffle_extensions"):
+            lo = 1 if order and order[0] == "GREASE" else 0
+            hi = len(order) - 1 if order and order[-1] == "GREASE" else len(order)
+            mid = order[lo:hi]
+            _SYS_RANDOM.shuffle(mid)
+            order = order[:lo] + mid + order[hi:]
+        self._ext_order = order
+        return order
+
     def _build_extensions(self, extra_tail_extensions: bytes | None = None) -> bytes:
-        order = self.profile.get("extensions_order", [])
+        order = self._effective_order()
         tail = extra_tail_extensions or b""
         self._grease_ext_idx = 0
         parts = []
@@ -341,6 +445,8 @@ class TLSImpersonator:
         self._client_random = os.urandom(32)
         self._session_id = os.urandom(32)
         self._cookie = None
+        self._is_retry = False
+        self._ext_order = None
         return self._assemble(extra_tail_extensions), self.private_key, self._client_random
 
     def build_retry_client_hello(
@@ -362,6 +468,7 @@ class TLSImpersonator:
             raise ValueError(f"HRR grubu desteklenmiyor: {group_name(group)}")
         self.key_shares = KeyShareSet([group])
         self._cookie = cookie
+        self._is_retry = True
         return self._assemble(extra_tail_extensions)
 
     def _assemble(self, extra_tail_extensions: bytes | None) -> bytes:

@@ -101,7 +101,7 @@ def test_client_hello_profil_parmak_izini_tasir(pki, trust):
     ch = parse_client_hello(rec[5:])
     ref = parse_client_hello(TLSImpersonator(HOST, "chrome_131").build_client_hello()[0][5:])
     grease = lambda xs: [x for x in xs if (x & 0x0F0F) != 0x0A0A]
-    assert grease(ch["order"]) == grease(ref["order"])
+    assert sorted(grease(ch["order"])) == sorted(grease(ref["order"]))   # Chrome sırayı karıştırır
     assert grease(ch["suites"]) == grease(ref["suites"])
     assert ch["alpn"] == ["h2", "http/1.1"]
 

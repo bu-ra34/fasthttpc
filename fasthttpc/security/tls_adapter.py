@@ -28,7 +28,9 @@ from ..crypto_math import (
     FastChaCha20Poly1305 as PureChaCha20Poly1305,
     FastAESGCM as PureAESGCM,
 )
-from ..tls_crafter import TLSImpersonator
+from ..tls_crafter import (
+    TLSImpersonator, alps_accepted, build_client_encrypted_extensions,
+)
 from .._log import get_logger
 from .alerts import describe_alert
 from .keyshare import (
@@ -914,6 +916,7 @@ class TLSAdapter:
         # EE -> (Certificate | CompressedCertificate) -> CertificateVerify -> Finished
         handshake_buffer = b""
         leaf_cert = None
+        send_client_ee = False
 
         while not order.done:
             msg, m_type = esock.recv_record()
@@ -944,6 +947,8 @@ class TLSAdapter:
 
                 if hs_type == _HS_ENCRYPTED_EXTENSIONS:
                     state["alpn"] = _parse_alpn_from_encrypted_extensions(hs_payload)
+                    send_client_ee = alps_accepted(
+                        impersonator.alps_advertised, hs_payload, state["alpn"])
 
                 elif hs_type in (_HS_CERTIFICATE, _HS_COMPRESSED_CERTIFICATE, _HS_CERTIFICATE_VERIFY) \
                         and psk_accepted:
@@ -996,13 +1001,20 @@ class TLSAdapter:
                 # Finished anahtar değişiminden önce record sınırında bitmeli (§5.1).
                 raise _unexpected("Finished sonrasında aynı record'da ek handshake verisi.")
 
-        # ---- Client Finished --------------------------------------------------
+        # ---- Client EncryptedExtensions (ALPS) + Client Finished ----------------
         hash_len = hash_func().digest_size
+        # Application secret'lar transcript'i SERVER Finished'a kadar kapsar.
         t_hash = hash_func(state["handshake_messages"]).digest()
+        if send_client_ee:
+            # Sunucu ALPS'i kabul etti: istemci EE'yi Finished'tan önce yollar
+            # (transcript'e girer; Finished MAC'i onu da kapsar).
+            client_ee = build_client_encrypted_extensions()
+            esock.send_record(client_ee, content_type=0x16, use_app_keys=False)
+            state["handshake_messages"] += client_ee
         f_key = PureCryptoEngine.tls13_hkdf_expand_label(
             state["client_hts"], "finished", b"", hash_len, hash_alg=hash_func
         )
-        mac = hmac.new(f_key, t_hash, hash_func).digest()
+        mac = hmac.new(f_key, hash_func(state["handshake_messages"]).digest(), hash_func).digest()
         finished_msg = b"\x14" + struct.pack("!I", len(mac))[1:] + mac
 
         esock.send_record(finished_msg, content_type=0x16, use_app_keys=False)
