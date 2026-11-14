@@ -36,6 +36,7 @@ from .tls13 import AsyncTLSStream
 from .protocol.async_h2 import AsyncHttp2Connection, H2StreamRefused
 from .protocol.http2_parser import Http2ConnectionError, Http2StreamError
 from .transport.proxy import ProxyConfig, async_connect_via_proxy, parse_proxy_url, resolve_proxy
+from .transport.happy_eyeballs import CONNECTION_ATTEMPT_DELAY
 
 
                                                                                
