@@ -383,3 +383,30 @@ def test_multi_address_all_dead_fails_within_timeout(pki, monkeypatch):
         assert time.monotonic() - t < 2.5
     finally:
         s1.close()
+
+
+@pytest.mark.parametrize("exc", [ConnectionRefusedError, ConnectionResetError])
+def test_sync_udp_icmp_reddi_http3error_olur(exc):
+    """Linux ECONNREFUSED / Windows WSAECONNRESET (10054) aynı: Http3Error (-> sonraki adres)."""
+    from fasthttpc.http3.core import Http3Error
+    from fasthttpc.http3.sync_client import SyncH3Connection
+    a, b = socket.socketpair()
+    b.send(b"x")                                   # select: okunabilir
+
+    class Sock:
+        def fileno(self): return a.fileno()
+        def send(self, d): pass
+        def recv(self, n): raise exc()
+
+    class Core:
+        def transmit(self): return []
+        def timer(self): return None
+        def handle_timer(self): pass
+
+    c = object.__new__(SyncH3Connection)
+    c._sock, c.core, c._target = Sock(), Core(), ("::1", 1)
+    try:
+        with pytest.raises(Http3Error, match="reddedildi"):
+            c._run(lambda: False, time.monotonic() + 5, "el sıkışma")
+    finally:
+        a.close(); b.close()
