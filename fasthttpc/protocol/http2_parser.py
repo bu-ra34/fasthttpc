@@ -770,6 +770,82 @@ class HpackEncoder:
                              
                                                                                
 
+# ---------------------------------------------------------------------------
+# Profil bazlı HTTP/2 parmak izi: önsöz/SETTINGS/WINDOW_UPDATE/PRIORITY,
+# HEADERS (PRIORITY alanı), pseudo-header ve başlık sırası. Değerler
+# fingerprint.PROFILES[...]["h2"]'den gelir; senkron ve async bağlantı AYNI
+# fonksiyonları kullanır.
+# ---------------------------------------------------------------------------
+
+def _frame_bytes(ftype: int, flags: int, stream_id: int, payload: bytes) -> bytes:
+    return HTTP2Frame(len(payload), ftype, flags, stream_id, payload).serialize()
+
+
+def _priority_payload(dep: int, exclusive: bool, weight: int) -> bytes:
+    """5 baytlık PRIORITY alanı: E+bağımlılık (4) ve ağırlık-1 (1). ``weight`` 1..256."""
+    return struct.pack("!IB", (dep & 0x7FFFFFFF) | (0x80000000 if exclusive else 0), weight - 1)
+
+
+def h2_for_profile(profile) -> dict:
+    """Profil adı / profil sözlüğü / None -> h2 parmak izi sözlüğü."""
+    from ..fingerprint import get_profile
+    if isinstance(profile, dict) and "h2" in profile:
+        return profile["h2"]
+    return get_profile(profile)["h2"]
+
+
+def build_client_preface(h2: dict) -> bytes:
+    """Bağlantı ön eki + SETTINGS + (varsa) WINDOW_UPDATE + PRIORITY frame'leri.
+
+    Chrome/Firefox/Safari bunu TEK yazımda gönderir; sıra: PRI preface,
+    SETTINGS, bağlantı WINDOW_UPDATE'i, PRIORITY frame'leri.
+    """
+    payload = b"".join(struct.pack("!HI", i, v) for i, v in h2["settings"])
+    out = HTTP2Detector.H2_PREFACE + _frame_bytes(FrameType.SETTINGS, 0, 0, payload)
+    if h2.get("window_update"):
+        out += _frame_bytes(FrameType.WINDOW_UPDATE, 0, 0, struct.pack("!I", h2["window_update"]))
+    for sid, dep, excl, weight in h2.get("priority_frames", ()):
+        out += _frame_bytes(FrameType.PRIORITY, 0, sid, _priority_payload(dep, excl, weight))
+    return out
+
+
+def h2_setting(h2: dict, ident: int, default: int) -> int:
+    """Profilin ilan ettiği SETTINGS değeri (ilan etmiyorsa RFC varsayılanı)."""
+    for i, v in h2["settings"]:
+        if i == ident:
+            return v
+    return default
+
+
+def h2_request_headers(h2: dict, method: str, authority: str, scheme: str, path: str,
+                       headers: "list[tuple[str, str]]") -> "list[tuple[str, str]]":
+    """Pseudo-header'lar profil sırasında, ardından başlıklar profil sırasında.
+
+    Profildeki ``header_order``'da olan başlıklar o sırada gelir; olmayanlar
+    orijinal göreli sıralarıyla SONA eklenir. Pseudo'lar her zaman öne
+    (RFC 7540 §8.1.2.1).
+    """
+    values = {":method": method.upper(), ":authority": authority,
+              ":scheme": scheme, ":path": path}
+    pseudo = [(k, values[k]) for k in h2["pseudo_header_order"]]
+    rest = [(k, v) for k, v in headers if not k.startswith(":")]
+    order = h2.get("header_order") or []
+    if order:
+        rank = {name: i for i, name in enumerate(order)}
+        indexed = list(enumerate(rest))
+        indexed.sort(key=lambda t: (rank.get(t[1][0].lower(), len(rank)),
+                                    t[0] if t[1][0].lower() not in rank else 0))
+        rest = [kv for _, kv in indexed]
+    return pseudo + rest
+
+
+def h2_headers_priority_field(h2: dict) -> bytes:
+    """HEADERS frame'inin 5 baytlık PRIORITY alanı (yoksa b"")."""
+    hp = h2.get("headers_priority")
+    return _priority_payload(*hp) if hp else b""
+
+
+
 class Http2StreamError(Exception):
     """Tek bir HTTP/2 stream seviyesinde hata (RST_STREAM vb.)."""
     pass
@@ -804,11 +880,17 @@ class Http2Connection:
 
     DEFAULT_WINDOW = 65535
 
-    def __init__(self, encrypted_socket, initial_settings: Optional[dict] = None, debug: bool = False):
+    def __init__(self, encrypted_socket, initial_settings: Optional[dict] = None, debug: bool = False,
+                 profile=None):
+        """``profile``: TLS/HTTP2 profil adı (ör. "chrome_131") veya profil sözlüğü;
+        SETTINGS/WINDOW_UPDATE/PRIORITY/pseudo-header sırası ondan gelir.
+        None -> ``default`` profili (eski sabit davranış)."""
         self.sock = encrypted_socket
+        self._h2 = h2_for_profile(profile)
         self._next_stream_id = 1
-        # SETTINGS'te HEADER_TABLE_SIZE=65536 ve MAX_HEADER_LIST_SIZE=256KB ilan ediliyor.
-        self._decoder = HpackDecoder(max_table_size=65536,
+        # Dinamik tablo üst sınırı = ilan ettiğimiz SETTINGS_HEADER_TABLE_SIZE
+        # (ilan edilmediyse RFC varsayılanı 4096).
+        self._decoder = HpackDecoder(max_table_size=h2_setting(self._h2, 0x1, HPACK_DEFAULT_TABLE_SIZE),
                                      max_header_list_size=HPACK_MAX_HEADER_LIST_SIZE)
         self._encoder = HpackEncoder()
         self._recv_buf = bytearray()
@@ -833,16 +915,13 @@ class Http2Connection:
         "h2 fingerprint") ilk bileşenidir. ENABLE_PUSH=0 ayrıca gerekli:
         bu istemci PUSH_PROMISE işlemiyor, açık bırakmak sunucunun bize
         işleyemeyeceğimiz stream'ler açmasına yol açar.
+
+        İçerik profilden gelir (``fingerprint.PROFILES[ad]["h2"]``): SETTINGS
+        sırası/değerleri, bağlantı WINDOW_UPDATE'i ve PRIORITY frame'leri.
+        Büyük INITIAL_WINDOW_SIZE ilan etmek güvenlidir: alım tarafı her DATA
+        için hemen WINDOW_UPDATE döner, yani pencere hiç daralmaz.
         """
-        self.sock.send_record(HTTP2Detector.H2_PREFACE, content_type=0x17)
-        settings_payload = (
-            struct.pack("!HI", 0x1, 65536)                  # HEADER_TABLE_SIZE
-            + struct.pack("!HI", 0x2, 0)                    # ENABLE_PUSH = kapalı
-            + struct.pack("!HI", 0x4, self.DEFAULT_WINDOW)  # INITIAL_WINDOW_SIZE
-            + struct.pack("!HI", 0x6, 262144)               # MAX_HEADER_LIST_SIZE
-        )
-        frame = HTTP2Frame(len(settings_payload), FrameType.SETTINGS, 0, 0, settings_payload)
-        self.sock.send_record(frame.serialize())
+        self.sock.send_record(build_client_preface(self._h2), content_type=0x17)
 
     def _send_goaway(self, error_code: int) -> None:
         """En iyi çabayla GOAWAY gönderir (bağlantı zaten bozuksa hata yutulur)."""
@@ -916,10 +995,13 @@ class Http2Connection:
     def _send_headers(self, stream_id: int, headers: list[tuple[str, str]], end_stream: bool) -> None:
         block = self._encoder.encode(headers)
         max_frame = self._peer_settings.get("max_frame_size", 16384)
+        prio = h2_headers_priority_field(self._h2)
         first = True
         offset = 0
         while offset < len(block) or first:
-            chunk = block[offset: offset + max_frame]
+            # İlk HEADERS'ta PRIORITY alanı (5 bayt) frame yükünün parçasıdır.
+            room = max_frame - (len(prio) if first else 0)
+            chunk = block[offset: offset + room]
             offset += len(chunk)
             is_last = offset >= len(block)
             flags = 0
@@ -927,8 +1009,11 @@ class Http2Connection:
                 flags |= FrameFlags.END_STREAM
             if is_last:
                 flags |= FrameFlags.END_HEADERS
+            if first and prio:
+                flags |= FrameFlags.PRIORITY
             ftype = FrameType.HEADERS if first else FrameType.CONTINUATION
-            frame = HTTP2Frame(len(chunk), ftype, flags, stream_id, chunk)
+            payload = (prio + chunk) if first else chunk
+            frame = HTTP2Frame(len(payload), ftype, flags, stream_id, payload)
             self.sock.send_record(frame.serialize())
             first = False
             if not block:
@@ -998,19 +1083,9 @@ class Http2Connection:
             stream_id = self._next_id()
             self._dbg(f"--- REQUEST stream_id={stream_id} {method} {path} ---")
 
-            # Pseudo-header SIRASI bir parmak izidir. Chrome/Edge :method,
-            # :authority, :scheme, :path sırasını kullanır; Firefox :method,
-            # :path, :authority, :scheme. Alfabetik veya keyfi bir sıra
-            # "bu bir tarayıcı değil" sinyali verir.
-            pseudo = [
-                (":method", method.upper()),
-                (":authority", authority),
-                (":scheme", scheme),
-                (":path", path),
-            ]
-            # Pseudo-header'lar diğerlerinden önce gelmeli (RFC 7540 §8.1.2.1)
-            filtered = [(k, v) for k, v in headers if not k.startswith(":")]
-            full_headers = pseudo + filtered
+            # Pseudo-header ve başlık SIRASI birer parmak izidir; profilden gelir
+            # (Chrome m,a,s,p; Firefox m,p,a,s; Safari m,s,a,p).
+            full_headers = h2_request_headers(self._h2, method, authority, scheme, path, headers)
             self._dbg(f"giden headers: {full_headers}")
 
             self._send_headers(stream_id, full_headers, end_stream=(len(body) == 0))

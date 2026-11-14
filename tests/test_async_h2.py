@@ -137,6 +137,10 @@ def test_h2_parmak_izi_senkronla_ayni(pki, ca):
     rec = Rec()
     Http2Connection(rec).send_preface_and_settings()
     assert client_preface_bytes() == b"".join(rec.out)
+    for ad in ("chrome_131", "firefox_133", "safari_18"):
+        rec = Rec()
+        Http2Connection(rec, profile=ad).send_preface_and_settings()
+        assert client_preface_bytes(ad) == b"".join(rec.out)
 
     async def main():
         srv, port, conns = await start_h2(pki, echo)
@@ -144,7 +148,7 @@ def test_h2_parmak_izi_senkronla_ayni(pki, ca):
             s = sess(ca)
             await s.get(f"https://localhost:{port}/")
             c = conns[0]
-            assert c.raw_in.startswith(client_preface_bytes())      # telde de aynı
+            assert c.raw_in.startswith(client_preface_bytes("chrome_131"))      # telde de aynı (profil: chrome_131)
             await s.close()
     run(main())
 

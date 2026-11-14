@@ -205,7 +205,8 @@ class FakeTLS13Server:
                     pass
                 return
 
-        group = self.group if self.group is not None else next(iter(ch["key_shares"]))
+        group = self.group if self.group is not None else next(
+            g for g in ch["key_shares"] if g in (0x001D, 0x0017, 0x0018))   # GREASE/PQ girdilerini atla
         peer = ch["key_shares"][group]
         priv, pub = generate_key_share(group)
         shared = compute_shared_secret(group, priv, peer)

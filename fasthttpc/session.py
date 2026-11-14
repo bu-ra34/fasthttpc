@@ -458,7 +458,7 @@ class Session:
                     alpn = conn.socket.state.get("alpn", "")
                     if alpn == "h2":
                         logger.debug("TLS 1.3 kuruldu (ALPN: h2)")
-                        conn.h2_conn = Http2Connection(conn.socket)
+                        conn.h2_conn = Http2Connection(conn.socket, profile=self.impersonate)
                         conn.h2_conn.send_preface_and_settings()
                     else:
                         logger.debug("TLS 1.3 kuruldu (ALPN: http/1.1)")
