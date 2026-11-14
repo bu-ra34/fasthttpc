@@ -214,6 +214,18 @@ class _Opened:
     writer:  Any
     alpn:    str
     release: Callable[[], None]
+    key:     tuple = ()
+    reused:  bool = False          # havuzdan gelen (bayat olabilir) bağlantı
+    last_used: float = 0.0
+    loop:    Any = None
+
+
+class _StaleConn(Exception):
+    """Yeniden kullanılan bağlantı, yanıttan tek bayt gelmeden koptu (güvenle yeniden denenir)."""
+
+    def __init__(self, cause: BaseException):
+        super().__init__(str(cause))
+        self.cause = cause
 
 
 class AsyncSession:
@@ -277,6 +289,9 @@ class AsyncSession:
         self._origin_proto: dict[tuple, str] = {}
         self._origin_locks: dict[tuple, asyncio.Lock] = {}
         self._bg_tasks:     set[asyncio.Task] = set()
+        # HTTP/1.1 keep-alive havuzu: (host, port, proxy, impersonate-mi) -> boşta bağlantılar.
+        # Boştaki bağlantı semaphore slotu TUTMAZ (slot yalnızca kullanımdayken).
+        self._idle: dict[tuple, list[_Opened]] = {}
 
         if isinstance(cache, ResponseCache):
             self._cache: Optional[ResponseCache] = cache
@@ -397,14 +412,7 @@ class AsyncSession:
 
         return await asyncio.wait_for(_go(), connect_to)
 
-    async def _open(self, u: URL, proxy: Optional[ProxyConfig], metrics) -> "_Opened":
-        """Havuz slotu alır, bağlanır. Slot ``release()`` ile geri verilir."""
-        try:
-            await asyncio.wait_for(self._sem.acquire(), self.timeout.pool)
-        except asyncio.TimeoutError:
-            raise asyncio.TimeoutError(
-                f"Bağlantı havuzu {self.timeout.pool} sn içinde boşalmadı "
-                f"(max_connections={self.limits.max_connections}).") from None
+    def _slot_releaser(self) -> "Callable[[], None]":
         released = False
 
         def release() -> None:
@@ -412,8 +420,90 @@ class AsyncSession:
             if not released:
                 released = True
                 self._sem.release()
+        return release
+
+    def _h1_key(self, u: URL, proxy: Optional[ProxyConfig]) -> tuple:
+        return (u.host, u.port, proxy, self.impersonate is not None)
+
+    @staticmethod
+    def _conn_dead(o: "_Opened") -> bool:
+        """Boştaki bağlantı kapanmış mı (EOF görüldü / transport kapanıyor)?"""
+        try:
+            if o.reader.at_eof():
+                return True
+            inner = getattr(o.writer, "writer", o.writer)   # AsyncTLSStream -> StreamWriter
+            return bool(inner.is_closing())
+        except (AttributeError, RuntimeError):
+            return True
+
+    @staticmethod
+    def _drop_conn(o: "_Opened") -> None:
+        """Bağlantıyı eşzamanlı kapatır (wait_closed beklenmez)."""
+        try:
+            o.writer.close()
+        except (OSError, RuntimeError) as e:   # kapalı event loop vb.
+            logger.debug("boştaki bağlantı kapatılamadı: %s", e)
+
+    def _idle_expired(self, o: "_Opened", now: float) -> bool:
+        exp = self.limits.keepalive_expiry
+        return exp is not None and now - o.last_used >= exp
+
+    def _idle_purge(self) -> None:
+        """Süresi dolan boşta bağlantıları kapatır."""
+        now = time.monotonic()
+        for key in list(self._idle):
+            keep = []
+            for o in self._idle[key]:
+                if self._idle_expired(o, now) or self._conn_dead(o):
+                    self._drop_conn(o)
+                else:
+                    keep.append(o)
+            if keep:
+                self._idle[key] = keep
+            else:
+                del self._idle[key]
+
+    def _idle_count(self) -> int:
+        return sum(len(v) for v in self._idle.values())
+
+    def _idle_pop(self, key: tuple) -> "Optional[_Opened]":
+        self._idle_purge()
+        lst = self._idle.get(key)
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return None
+        while lst:
+            o = lst.pop()               # en son kullanılan (LIFO) en taze olandır
+            if not lst:
+                del self._idle[key]
+            if o.loop is loop:
+                return o
+            self._drop_conn(o)
+        return None
+
+    async def _open(self, u: URL, proxy: Optional[ProxyConfig], metrics,
+                    reuse: bool = True) -> "_Opened":
+        """Havuz slotu alır; boşta uygun HTTP/1.1 bağlantısı varsa onu, yoksa yenisini
+        açar. Slot ``release()`` ile geri verilir."""
+        try:
+            await asyncio.wait_for(self._sem.acquire(), self.timeout.pool)
+        except asyncio.TimeoutError:
+            raise asyncio.TimeoutError(
+                f"Bağlantı havuzu {self.timeout.pool} sn içinde boşalmadı "
+                f"(max_connections={self.limits.max_connections}).") from None
+        release = self._slot_releaser()
+        key = self._h1_key(u, proxy)
 
         try:
+            if reuse:
+                o = self._idle_pop(key)
+                if o is not None:
+                    o.release, o.reused = release, True
+                    if metrics:
+                        metrics.connection_reused = True
+                        metrics.connect_start = metrics.connect_end = time.monotonic()
+                    return o
             if metrics:
                 metrics.connect_start = time.monotonic()
             reader, writer, alpn = await self._connect(u.host, u.port, proxy)
@@ -423,7 +513,29 @@ class AsyncSession:
         if metrics:
             metrics.connect_end = time.monotonic()
             metrics.tls_end     = time.monotonic()
-        return _Opened(reader, writer, alpn, release)
+        return _Opened(reader, writer, alpn, release, key=key,
+                       loop=asyncio.get_running_loop())
+
+    async def _h1_finish(self, o: "_Opened", reusable: bool) -> None:
+        """İstek bitti: bağlantıyı havuza koyar ya da kapatır; slot HER durumda geri verilir."""
+        try:
+            if reusable:
+                self._idle_purge()
+                o.last_used = time.monotonic()
+                cap = self.limits.max_keepalive_connections
+                if cap is None:
+                    cap = self.limits.max_connections
+                exp = self.limits.keepalive_expiry
+                if self._idle_count() < cap and not (exp is not None and exp <= 0):
+                    self._idle.setdefault(o.key, []).append(o)
+                    return
+            o.writer.close()
+            try:
+                await o.writer.wait_closed()
+            except OSError as e:  # ssl kapanış hataları dahil
+                logger.debug("wait_closed hatası yok sayıldı: %s", e)
+        finally:
+            o.release()
 
     def _h2_get(self, key: tuple) -> Optional[AsyncHttp2Connection]:
         """Kaynak için yeniden kullanılabilir canlı HTTP/2 bağlantısı (yoksa None)."""
@@ -502,7 +614,18 @@ class AsyncSession:
                         logger.debug("h2 stream işlenmedi, yeni bağlantıda yeniden: %s", e)
                         continue
                     raise ConnectionError(f"HTTP/2 isteği başarısız: {e}") from e
-            return await self._h1_exchange(opened, method, u, req_headers, raw_body, metrics)
+            try:
+                return await self._h1_exchange(opened, method, u, req_headers, raw_body, metrics)
+            except _StaleConn as st:
+                # Havuzdaki bağlantı sunucu tarafında kapanmıştı ve yanıttan HİÇ bayt
+                # gelmedi: bir kez, taze bağlantıyla yeniden dene (zaman aşımı hariç).
+                logger.debug("Bayat bağlantı, yeniden deneniyor (%s)", st.cause)
+                opened = await self._open(u, proxy, metrics, reuse=False)
+                if opened.alpn == "h2":     # pragma: no cover - h1 olarak bilinen kaynak
+                    opened.release()
+                    opened.writer.close()
+                    raise ConnectionError("Beklenmeyen ALPN h2 (kaynak h1 olarak biliniyordu).") from st
+                return await self._h1_exchange(opened, method, u, req_headers, raw_body, metrics)
         raise ConnectionError("Tüm bağlantı denemeleri başarısız oldu.")  # pragma: no cover
 
     # RFC 7540 §8.1.2.2: bağlantıya özgü başlıklar h2'de yasaktır; Host -> :authority.
@@ -533,17 +656,33 @@ class AsyncSession:
         return r.status, headers, r.body, send_time, "HTTP/2"
 
     @staticmethod
+    def _h1_framing(method: str, status: int, headers: Headers) -> str:
+        """"none" | "chunked" | "length" | "eof" (RFC 9112 §6.3)."""
+        if method.upper() == "HEAD" or status in (204, 304) or 100 <= status < 200:
+            return "none"
+        if "chunked" in headers.get("transfer-encoding", "").lower():
+            return "chunked"
+        if headers.get("content-length", "").strip().isdigit():
+            return "length"
+        return "eof"
+
+    @staticmethod
     async def _h1_read_body(reader, method: str, status: int, headers: Headers,
-                            first: bytes, read_to: Optional[float]) -> bytes:
-        """HTTP/1.1 gövdesi (RFC 9112 §6.3). Eksik gövde ConnectionResetError'dır."""
+                            first: bytes, read_to: Optional[float]) -> "tuple[bytes, int]":
+        """HTTP/1.1 gövdesi (RFC 9112 §6.3): ``(gövde, artakalan_bayt)``.
+
+        Eksik gövde ConnectionResetError'dır. ``artakalan_bayt`` > 0 ise bağlantıda
+        yanıta ait olmayan veri var demektir (bağlantı yeniden kullanılmamalı).
+        """
         async def more() -> bytes:
             return await asyncio.wait_for(reader.read(4096), timeout=read_to)
 
-        if method.upper() == "HEAD" or status in (204, 304) or 100 <= status < 200:
-            return b""          # gövde YOK: bağlantıdan veri beklenmez
+        framing = AsyncSession._h1_framing(method, status, headers)
+        if framing == "none":
+            return b"", len(first)      # gövde YOK: bağlantıdan veri beklenmez
 
         buf = bytearray(first)
-        if "chunked" in headers.get("transfer-encoding", "").lower():
+        if framing == "chunked":
             out = bytearray()
             pos = 0
             while True:
@@ -560,7 +699,19 @@ class AsyncSession:
                     raise ConnectionError("Geçersiz chunk boyutu.") from None
                 pos = nl + 2
                 if sz == 0:
-                    return bytes(out)       # trailer'lar yok sayılır
+                    # trailer'lar (varsa) boş satıra kadar tüketilir: bağlantı temiz kalsın
+                    while True:
+                        nl = buf.find(b"\r\n", pos)
+                        while nl == -1:
+                            c = await more()
+                            if not c:
+                                raise ConnectionResetError("Chunked gövde yarıda kesildi.")
+                            buf.extend(c)
+                            nl = buf.find(b"\r\n", pos)
+                        empty = nl == pos
+                        pos = nl + 2
+                        if empty:
+                            return bytes(out), len(buf) - pos
                 while len(buf) < pos + sz + 2:
                     c = await more()
                     if not c:
@@ -572,16 +723,15 @@ class AsyncSession:
                     del buf[:pos]
                     pos = 0
 
-        cl = headers.get("content-length", "").strip()
-        if cl.isdigit():
-            n = int(cl)
+        if framing == "length":
+            n = int(headers.get("content-length", "").strip())
             while len(buf) < n:
                 c = await more()
                 if not c:
                     raise ConnectionResetError(
                         f"Yanıt gövdesi eksik: {len(buf)}/{n} bayt alındı.")
                 buf.extend(c)
-            return bytes(buf[:n])
+            return bytes(buf[:n]), len(buf) - n
 
         while True:                          # bağlantı kapanana kadar (HTTP/1.0)
             try:
@@ -591,13 +741,18 @@ class AsyncSession:
             if not c:
                 break
             buf.extend(c)
-        return bytes(buf)
+        return bytes(buf), 0
 
     async def _h1_exchange(self, opened: "_Opened", method: str, u: URL,
                            req_headers: dict, raw_body: bytes, metrics):
-        """Tek bağlantıda tek HTTP/1.1 isteği; bağlantı sonunda kapatılır."""
+        """Bağlantıda tek HTTP/1.1 isteği. Bağlantı yeniden kullanılabilirse havuza
+        döner; aksi halde (Connection: close, HTTP/1.0, eof çerçeveli gövde, hata,
+        iptal) kapatılır. Slot her durumda serbest bırakılır."""
         reader, writer = opened.reader, opened.writer
         read_to = self.timeout.read
+        reusable = False
+        finished = False
+        got_bytes = False        # yanıttan en az 1 bayt geldi mi (yeniden deneme güvenliği)
         try:
             req_line = f"{method} {u.raw_path.decode()} HTTP/1.1\r\n"
             for k, v in req_headers.items():
@@ -616,7 +771,8 @@ class AsyncSession:
             while True:
                 chunk = await asyncio.wait_for(reader.read(4096), timeout=read_to)
                 if not chunk: break
-                if not hdr_acc and metrics:
+                got_bytes = True
+                if len(hdr_acc) == 0 and metrics:
                     metrics.first_byte_time = time.monotonic()
                 search_from = max(0, len(hdr_acc) - 3)
                 hdr_acc += chunk
@@ -643,17 +799,32 @@ class AsyncSession:
                 k, _, v = line.partition(b":")
                 resp_headers._list.append((k.strip(), k.strip().lower(), v.strip()))
 
-            body_raw = await self._h1_read_body(reader, method, status_code, resp_headers,
-                                                first_body_chunk, read_to)
+            body_raw, extra = await self._h1_read_body(
+                reader, method, status_code, resp_headers, first_body_chunk, read_to)
 
+            conn_tokens = {t.strip() for t in resp_headers.get("connection", "").lower().split(",")}
+            http10 = lines[0].upper().startswith(b"HTTP/1.0")
+            req_close = any(k.lower() == "connection" and "close" in str(v).lower()
+                            for k, v in req_headers.items())
+            reusable = (
+                status_code != 101 and extra == 0 and not req_close
+                and "close" not in conn_tokens
+                and (not http10 or "keep-alive" in conn_tokens)
+                and self._h1_framing(method, status_code, resp_headers) != "eof"
+            )
             return status_code, resp_headers, bytes(body_raw), send_time, "HTTP/1.1"
+        except BaseException as e:
+            if (opened.reused and not got_bytes
+                    and isinstance(e, (ConnectionError, OSError))
+                    and not isinstance(e, (TimeoutError, asyncio.TimeoutError))):
+                # Çağıran yeniden dener; bu bağlantı kapatılır, slot bırakılır.
+                finished = True
+                await self._h1_finish(opened, False)
+                raise _StaleConn(e) from e
+            raise
         finally:
-            writer.close()
-            try:
-                await writer.wait_closed()
-            except OSError as e:  # ssl kapanış hataları dahil
-                logger.debug("wait_closed hatası yok sayıldı: %s", e)
-            opened.release()
+            if not finished:
+                await self._h1_finish(opened, reusable)
 
     async def _raw_request(
         self,
@@ -927,6 +1098,15 @@ class AsyncSession:
             running = asyncio.get_running_loop()
         except RuntimeError:
             running = None
+        idle = [o for lst in self._idle.values() for o in lst]
+        self._idle = {}
+        for o in idle:
+            self._drop_conn(o)
+            if o.loop is running:
+                try:
+                    await o.writer.wait_closed()
+                except OSError as e:
+                    logger.debug("wait_closed hatası yok sayıldı: %s", e)
         for c in conns:
             if c.loop is running:
                 await c.close()

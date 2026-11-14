@@ -187,7 +187,7 @@ def test_h2_http11_secilirse_eski_yol(pki, ca):
                 assert r.body == b"h1 yolu"
             assert s._origin_proto
             assert not s._h2
-            assert len(servers) == 3                       # h1: istek başına bağlantı
+            assert len(servers) == 1                       # h1: keep-alive, tek bağlantı yeniden kullanılır
             assert servers[0].requests[0].startswith(b"GET / HTTP/1.1\r\n")
             await s.close()
     run(main())
