@@ -35,9 +35,13 @@ class Timeout:
         read:    Sunucudan veri okuma süresi.
         write:   Sunucuya veri yazma süresi.
         pool:    Havuzdan boş bağlantı bekleme süresi.
+        total:   Tek bir HTTP isteğinin (yanıt gövdesi dahil) toplam süre sınırı.
+                 ``read`` her okuma çağrısı için ayrı işlediğinden, damla damla
+                 veri yollayan (slow-loris) sunucu onu hiç tetiklemez; ``total``
+                 tetikler. Varsayılan ``None`` (sınırsız).
     """
 
-    __slots__ = ("default", "connect", "read", "write", "pool")
+    __slots__ = ("default", "connect", "read", "write", "pool", "total")
 
     def __init__(
         self,
@@ -48,6 +52,7 @@ class Timeout:
         write:   object = _UNSET,
         pool:    object = _UNSET,
         default: object = _UNSET,
+        total:   object = _UNSET,
     ) -> None:
         if default is not _UNSET:  # eski timeout.Timeout(default=...) imzası
             if timeout is not None:
@@ -56,10 +61,12 @@ class Timeout:
         if isinstance(timeout, Timeout):
             base = timeout
             self.default = base.default
+            total_val = base.total
             vals = {"connect": base.connect, "read": base.read,
                     "write": base.write, "pool": base.pool}
         else:
             self.default = float(timeout) if timeout is not None else None
+            total_val = None
             vals = dict.fromkeys(("connect", "read", "write", "pool"), self.default)
         for name, given in (("connect", connect), ("read", read),
                             ("write", write), ("pool", pool)):
@@ -67,6 +74,11 @@ class Timeout:
                 vals[name] = None if given is None else float(given)  # type: ignore[arg-type]
             if vals[name] is not None and vals[name] < 0:
                 raise ValueError(f"Timeout.{name} negatif olamaz: {vals[name]}")
+        if total is not _UNSET:
+            total_val = None if total is None else float(total)  # type: ignore[arg-type]
+        if total_val is not None and total_val <= 0:
+            raise ValueError(f"Timeout.total pozitif olmalı: {total_val}")
+        self.total: Optional[float] = total_val
         self.connect: Optional[float] = vals["connect"]
         self.read:    Optional[float] = vals["read"]
         self.write:   Optional[float] = vals["write"]
@@ -107,11 +119,12 @@ class Timeout:
                 "write": self.write, "pool": self.pool}
 
     def __eq__(self, other: object) -> bool:
-        return isinstance(other, Timeout) and self.as_dict() == other.as_dict()
+        return (isinstance(other, Timeout) and self.as_dict() == other.as_dict()
+                and self.total == other.total)
 
     def __repr__(self) -> str:
         return (f"Timeout(connect={self.connect}, read={self.read}, "
-                f"write={self.write}, pool={self.pool})")
+                f"write={self.write}, pool={self.pool}, total={self.total})")
 
 
 class Limits:
