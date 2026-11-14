@@ -28,6 +28,11 @@ class SyncTLSSocket:
         **conn_kwargs,
     ) -> "SyncTLSSocket":
         """TLSAdapter.negotiate ile aynı imza (+ çekirdek kwargs: alpn, ca_path)."""
+        if conn_kwargs.get("port") is None:
+            try:
+                conn_kwargs["port"] = raw_socket.getpeername()[1]
+            except (OSError, IndexError, TypeError):
+                pass
         conn = TLSClientConnection(host, profile_name, **conn_kwargs)
         self = cls(raw_socket, conn)
         raw_socket.sendall(conn.initiate())
