@@ -324,7 +324,7 @@ class FakeTLS13Server:
             ee_ext += ext(17513, b"\x00\x00")          # ALPS kabul (sunucu ayarları boş)
         msgs.append(hs(8, struct.pack("!H", len(ee_ext)) + ee_ext))
         if "cert_request" in self.tamper:
-            msgs.append(hs(13, b"\x00\x00\x00"))
+            msgs.append(hs(13, getattr(self, "cr_body", None) or b"\x00\x00\x00"))
         for m in msgs:
             self.transcript += m
         send_cert = psk is None or "psk_with_cert" in self.tamper

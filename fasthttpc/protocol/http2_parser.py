@@ -1561,8 +1561,10 @@ class WebSocketConnection:
             if use_tls:
                 if not conn.tls_established:
                     from ..security.tls_adapter import TLSAdapter
-                    conn.socket = TLSAdapter.negotiate(conn.socket, u.host, session.impersonate)
-                    conn.socket.raw_socket.settimeout(session.timeout)
+                    conn.socket = TLSAdapter.negotiate(conn.socket, u.host, session.impersonate,
+                                                      **_tls_kw(session, u.port))
+                    tmo = session.timeout
+                    conn.socket.raw_socket.settimeout(getattr(tmo, "read_timeout", tmo))
                     conn.tls_established = True
                 wire = conn.socket
             else:
@@ -1716,6 +1718,19 @@ class StreamingDecompressor:
                 logger.warning("Akış flush hatası (%s): %s", self._enc, e)
                 return b""
         return b""
+
+
+def _tls_kw(session, port) -> dict:
+    """Oturumun TLS ayarlarını (özel CA, hedef port, legacy_tls, istemci sertifikası)
+    doğrudan TLSAdapter.negotiate çağıran yollara taşır. Eskiden WebSocket yolu
+    ``verify="ca.pem"``'i YOK SAYIYORDU (varsayılan güven deposu kullanılıyordu)."""
+    kw = {"ca_path": getattr(session, "_ca_path", None), "port": port}
+    if getattr(session, "legacy_tls", False):
+        kw["legacy_tls"] = True
+    cc = getattr(session, "client_cert", None)
+    if cc is not None:
+        kw["client_cert"] = cc
+    return kw
 
 
 def iter_content(

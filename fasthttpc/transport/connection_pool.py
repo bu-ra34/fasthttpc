@@ -183,8 +183,11 @@ class ConnectionPool:
 
     def __init__(self, max_connections: int = 10, timeout: float = 30.0,
                  idle_timeout: float = DEFAULT_IDLE_TIMEOUT, resolver=None,
-                 proxy=None):
+                 proxy=None, tls_scope=None):
         self.max_connections = max_connections
+        # mTLS: istemci sertifikası kimliği; havuz anahtarına girer, böylece farklı
+        # sertifikalı oturumlar (başka havuz örnekleri dahil) bağlantı paylaşmaz.
+        self.tls_scope       = tls_scope
         # proxy: None | URL str | ProxyConfig | {"https": url, "all": url}
         self.proxy           = proxy
         self.timeout         = timeout
@@ -195,6 +198,12 @@ class ConnectionPool:
         self._lock = threading.Lock()
 
                                                                                
+
+    def _key(self, origin: tuple, proxy=None) -> tuple:
+        key = origin if proxy is None else origin + (proxy,)
+        if self.tls_scope:
+            key += (("mtls", self.tls_scope),)
+        return key
 
     def _get_semaphore(self, origin: tuple) -> threading.Semaphore:
         with self._lock:
@@ -215,7 +224,7 @@ class ConnectionPool:
         geçersiz kılar; bağlantılar proxy başına ayrı havuzlanır).
         """
         origin = (url.scheme, url.host, url.port)
-        key = origin if proxy is None else origin + (proxy,)
+        key = self._key(origin, proxy)
         sem = self._get_semaphore(key)
 
                                                                 
@@ -311,8 +320,10 @@ class ConnectionPool:
                 with self._lock:
                     # Havuz sınırını prewarm de aşamamalı; aksi hâlde
                     # max_connections sessizce anlamsızlaşır.
-                    if len(self._pools[origin]) < self.max_connections:
-                        self._pools[origin].append(conn)
+                    pkey = self._key(origin)
+                    conn.pool_key = pkey
+                    if len(self._pools[pkey]) < self.max_connections:
+                        self._pools[pkey].append(conn)
                     else:
                         conn.close()
                         return host, False

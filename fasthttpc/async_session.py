@@ -326,6 +326,8 @@ class AsyncSession:
         event_hooks:     "dict | None" = None,
         trust_env:       bool          = True,
         params                        = None,
+        *,
+        cert                          = None,
     ):
         # Eski sunucu uyumluluk modu (bkz. Session ve security/tls12_legacy.py); varsayılan False.
         from .security.tls12_legacy import normalize_legacy
@@ -343,6 +345,13 @@ class AsyncSession:
         self.event_hooks   = _api.normalize_event_hooks(event_hooks)
         self.trust_env     = trust_env
         self.params        = params
+        # mTLS (oturum düzeyi): yol | (cert, key) | (cert, key, parola) | ClientCert
+        from .security.client_cert import ClientCert
+        self.client_cert   = ClientCert.coerce(cert)
+        self._owns_cert    = self.client_cert is not None and not isinstance(cert, ClientCert)
+        if self.client_cert is not None and impersonate is None:
+            # impersonate=None yolu stdlib ssl kullanır; sertifikayı SESSİZCE yok saymak yerine reddet.
+            raise ValueError("cert= (mTLS) için impersonate verilmelidir (impersonate=None desteklemez).")
         # Oturum düzeyi varsayılan başlıklar (mutable; Session ile aynı öncelik:
         # profil başlıkları < headers < istek başlıkları; None değer kaldırır).
         self.headers       = Headers(headers)
@@ -371,6 +380,12 @@ class AsyncSession:
         self._h3 = None
         from .http3.options import Http3Options
         _h3opts = Http3Options.from_value(http3)
+        if _h3opts is not None and self.client_cert is not None:
+            # HTTP/3 yolu istemci sertifikası (mTLS) göndermez: cert= varken h3 KULLANILMAZ
+            # (aksi halde istek sertifikasız bir QUIC bağlantısıyla gidebilirdi).
+            if _h3opts.mode == "force":
+                raise ValueError("http3='force' ile cert= (mTLS) birlikte kullanılamaz.")
+            _h3opts = None
         if _h3opts is not None:
             from .http3.manager import AsyncHttp3
             self._h3 = AsyncHttp3(_h3opts, self._ca_path, impersonate)
@@ -383,6 +398,11 @@ class AsyncSession:
             self._cache = None
 
                                                                                
+
+    def _origin_key(self, u: URL, proxy) -> tuple:
+        """h2/protokol önbelleği anahtarı; mTLS'de sertifika kimliği anahtara girer."""
+        k = (u.host, u.port, proxy)
+        return k + (self.client_cert.identity,) if self.client_cert is not None else k
 
     @property
     def cookies(self) -> dict[str, str]:
@@ -468,7 +488,7 @@ class AsyncSession:
             o = _Opened(reader, writer, alpn, lambda: None, key=self._h1_key(u, proxy_cfg),
                         loop=asyncio.get_running_loop())
             try:
-                key = (u.host, u.port, proxy_cfg)
+                key = self._origin_key(u, proxy_cfg)
                 if alpn == "h2":
                     if self._h2_get(key) is None:
                         await self._start_h2(key, o)
@@ -532,13 +552,13 @@ class AsyncSession:
                 if proxy is None:
                     stream = await AsyncTLSStream.connect(
                         host, port, self.impersonate, server_hostname=sni,
-                        ca_path=self._ca_path, **kw)
+                        ca_path=self._ca_path, client_cert=self.client_cert, **kw)
                 else:
                     reader, writer = await async_connect_via_proxy(proxy, host, port, timeout=connect_to)
                     try:
                         stream = await AsyncTLSStream.negotiate(
                             reader, writer, sni, self.impersonate, ca_path=self._ca_path,
-                            port=port, **kw)   # bilet anahtarı: proxy'nin değil hedefin portu
+                            port=port, client_cert=self.client_cert, **kw)   # bilet anahtarı: proxy'nin değil hedefin portu
                     except BaseException:
                         writer.close()
                         raise
@@ -588,7 +608,8 @@ class AsyncSession:
         return release
 
     def _h1_key(self, u: URL, proxy: Optional[ProxyConfig]) -> tuple:
-        return (u.host, u.port, proxy, self.impersonate is not None)
+        k = (u.host, u.port, proxy, self.impersonate is not None)
+        return k + (self.client_cert.identity,) if self.client_cert is not None else k
 
     @staticmethod
     def _conn_dead(o: "_Opened") -> bool:
@@ -764,7 +785,7 @@ class AsyncSession:
                         metrics.bytes_sent = len(raw_body)
                         metrics.first_byte_time = time.monotonic()
                     return r3[0], r3[1], r3[2], time.monotonic(), "HTTP/3"
-        key = (u.host, u.port, proxy)
+        key = self._origin_key(u, proxy)
         for attempt in (0, 1):
             conn = self._h2_get(key)
             opened = None
@@ -1529,7 +1550,9 @@ class AsyncSession:
         if self._h3 is not None:
             await self._h3.close()
         if self.transport is not None:
-            self.transport.close()                                         
+            self.transport.close()
+        if self.client_cert is not None and self._owns_cert:
+            self.client_cert.close()          # özel anahtar referansını bırak
 
     async def __aenter__(self):
         return self
