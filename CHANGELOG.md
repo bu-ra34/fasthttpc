@@ -1,7 +1,34 @@
 # Changelog
 
-## [Yayınlanmamış]
+## [0.5.0] — 2026-11-14
 
+Dört eksik kapatıldı: profil başına HTTP/2 parmak izi, güvenli TLS 1.2, async
+eşitliği ve bağımsız TLS sunucularına karşı uyumluluk testleri. 785 → 953 test;
+Python 3.10–3.13.
+
+### Parmak izi
+- **Profil başına HTTP/2 parmak izi:** SETTINGS (sıralı), WINDOW_UPDATE,
+  HEADERS PRIORITY ve pseudo-header sırası profilden üretiliyor (sync + async).
+  Akamai h2 string'leri yayımlanmış gerçek Chrome 131 / Firefox 133 / Safari 18
+  değerleriyle birebir (tls.peet.ws'te canlı doğrulandı). Önceden üç profil
+  aynı hash'i veriyordu.
+- **ClientHello gerçek tarayıcıyla hizalandı:** ALPS (17513; sunucu kabul
+  ederse istemci EncryptedExtensions), ECH GREASE (yalnızca GREASE), Chrome
+  extension karıştırması, BoringSSL padding kuralı, profil suite listeleri.
+  Chrome 131 JA4 yayımlanmış değerle (`t13d1516h2_8daaf6152771_02713d6af862`) eşleşiyor.
+  `FASTHTTPC_NO_ECH_GREASE=1` ECH GREASE'i kapatır (TLS'i sonlandıran
+  proxy'ler için).
+- **X25519MLKEM768** (hibrit post-kuantum) key_share — `cryptography` ML-KEM
+  destekliyorsa; Cloudflare/Google/Reddit'te canlı çalıştı.
+
+### TLS 1.2 (güvenli alt küme)
+- Yalnızca ECDHE (x25519, P-256, P-384) + AEAD (AES-GCM, ChaCha20-Poly1305).
+  Extended Master Secret ve renegotiation_info ZORUNLU; DOWNGRD sentinel'i,
+  CBC, statik RSA, SHA-1/MD5 imzaları, renegotiation, CertificateRequest
+  açık hatayla reddedilir. Senkron ve async yol. nginx.org gibi TLS 1.2-only
+  sunuculara artık bağlanılıyor.
+
+### Async ve API
 - **Profil başına tarayıcı başlıkları:** `Session`/`AsyncSession` artık profilin
   `user_agent`'ını ve gerçek tarayıcının varsayılan gezinme başlıklarını
   gönderir (Chrome: sec-ch-ua*, sec-fetch-*, priority...; Firefox/Safari kendi
@@ -16,6 +43,31 @@
   renegotiation_info, 0x0303, AEAD suite'leri).
 - Senkron `Session`: `options()`, `set_proxies()`, `resolver` niteliği;
   `Limits(keepalive_expiry=0)` artık senkronda da keep-alive'ı kapatır.
+
+- **Async HTTP/1.1 keep-alive havuzu** (Limits, keepalive_expiry, bayat
+  bağlantıda güvenli tek yeniden deneme; POST çift gönderilmez).
+- Async WebSocket ve `pre_warm`: proxy + tarayıcı TLS taklidi.
+- **Async TLS 1.3 PSK resumption** (senkronla aynı saf fonksiyonlar, aynı bilet önbelleği).
+- `Response.text` artık property (requests gibi); `r.text()` geriye uyumlu.
+  `encoding`, `ok`, `reason`, `url`, `elapsed.total_seconds()`.
+- Async çerezler artık CookieJar (domain/path/Secure) — önceden her host'a
+  gönderiliyordu (güvenlik düzeltmesi).
+
+### Uyumluluk testleri (`interop/`, `tests/test_interop_*.py`)
+- `openssl s_server` ve tlslite-ng'ye karşı matris: TLS 1.3 suite × grup ×
+  sertifika türü, HRR, KeyUpdate, büyük yanıt, resumption; TLS 1.2 suite
+  matrisi; reddedilmesi gerekenler (süresi dolmuş, yanlış host, güvenilmeyen
+  CA, eksik ara sertifika, mTLS isteği, TLS 1.0/1.1, EMS'siz sunucu, DOWNGRD
+  aracısı); kayıt düzeyinde hata enjeksiyonu.
+
+### Güvenlik ve hata düzeltmeleri
+- CertificateVerify: ECDSA şeması sertifikanın eğrisine bağlanmıyordu
+  (P-384 anahtar + ecdsa_secp256r1_sha256 kabul ediliyordu) ve ClientHello'da
+  teklif edilmeyen imza şeması kabul ediliyordu — ikisi de reddediliyor.
+- Sunucunun `record_size_limit`'ine (RFC 8449) uyulmuyordu (Firefox profili).
+- Proxy tünelinde PSK bilet anahtarı hedef yerine proxy portunu kullanıyordu.
+- Alert mesajları ham hex yerine adlandırılmış; bozuk CCS reddi.
+- HelloRequest seli testi deterministik hale getirildi (RST yarışı).
 
 ## [0.4.0] — 2026-11-14
 
