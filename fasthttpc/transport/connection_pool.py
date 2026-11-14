@@ -205,7 +205,8 @@ class ConnectionPool:
                                                                               
 
     def acquire(self, url: URL, block: bool = True, timeout: Optional[float] = None,
-                proxy: Optional[str] = None) -> HTTPConnection:
+                proxy: Optional[str] = None,
+                connect_timeout: Optional[float] = None) -> HTTPConnection:
         """
         URL için en hızlı canlı bağlantıyı döner.
         Yoksa yeni bağlantı kurar. Concurrency limiti Semaphore ile korunur.
@@ -243,7 +244,7 @@ class ConnectionPool:
         conn = HTTPConnection(origin)
         conn.pool_key = key
         try:
-            conn.connect(timeout=self.timeout, resolver=self.resolver,
+            conn.connect(timeout=connect_timeout or self.timeout, resolver=self.resolver,
                          proxy=resolve_proxy(self.proxy if proxy is None else proxy,
                                              url.scheme))
         except Exception:

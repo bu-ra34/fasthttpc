@@ -24,9 +24,9 @@ def test_http_metotlari_ayni_parametreler(name):
     assert inspect.iscoroutinefunction(getattr(AsyncSession, name))
 
 
-# Bilinçli, belgelenmiş farklar: ``use`` (Plugin kancaları coroutine), ``gather``
-# (asyncio.gather), ``ws_connect`` (``websocket`` takma adı) yalnızca async'te.
-ASYNC_ONLY = {"use", "gather", "ws_connect"}
+# Bilinçli, belgelenmiş farklar: ``gather`` (asyncio.gather), ``ws_connect``
+# (``websocket`` takma adı) yalnızca async'te. ``use`` artık İKİ tarafta da var.
+ASYNC_ONLY = {"gather", "ws_connect"}
 SYNC_ONLY: set = set()
 
 
@@ -38,7 +38,7 @@ def test_public_yuzey_iki_yonlu_esit():
     sync_pub, async_pub = _public(Session), _public(AsyncSession)
     assert sync_pub - async_pub == SYNC_ONLY, sync_pub - async_pub
     assert async_pub - sync_pub == ASYNC_ONLY, async_pub - sync_pub
-    assert "options" in sync_pub and "set_proxies" in sync_pub
+    assert "options" in sync_pub and "set_proxies" in sync_pub and "use" in sync_pub & async_pub
 
 
 def test_ortak_metot_imzalari_ayni():
