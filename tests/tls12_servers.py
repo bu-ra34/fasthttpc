@@ -541,7 +541,10 @@ class Fake12Server:
 
         rseq = 1
         if "hello_request" in T or "hello_request_flood" in T:
-            n = 6 if "hello_request_flood" in T else 1
+            # Sel: tam olarak eşik+1 HelloRequest — istemci sonuncusunda kapatır ve alım
+            # tamponunda okunmamış veri kalmaz (kalırsa close() RST üretir ve RST,
+            # sunucunun henüz okumadığı alert'leri siler: testte yarış).
+            n = 4 if "hello_request_flood" in T else 1   # istemci eşiği (3) + 1
             for _ in range(n):
                 sock.sendall(rec(22, self._seal(skey, siv, wseq, 22, hs(0, b""))))
                 wseq += 1
