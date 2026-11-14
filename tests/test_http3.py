@@ -318,8 +318,17 @@ def test_core_imports_without_aioquic():
 
 # --- Çok adresli çözümleme (localhost -> ::1 kapalı, 127.0.0.1 açık) regresyonu ---------------
 
+def _free_udp_port():
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    s.bind(("127.0.0.1", 0))
+    p = s.getsockname()[1]
+    s.close()
+    return p
+
+
 def _patch_addrs(monkeypatch, first, port):
-    """getaddrinfo: önce ``first`` (dinleyen yok / sessiz), sonra 127.0.0.1 (sunucu)."""
+    """getaddrinfo: önce ``first`` (dinleyen yok / sessiz), sonra 127.0.0.1:port (sunucu).
+    Yalnızca 127.0.0.1 ve FARKLI PORTLAR kullanılır (macOS lo0'da 127.0.0.2/3 yoktur)."""
     real = socket.getaddrinfo
     udp = socket.SOCK_DGRAM
 
@@ -338,11 +347,11 @@ def test_multi_address_fallthrough(pki, h3, monkeypatch, kind):
     if kind == "ipv6_dead":      # ::1'de dinleyen yok (ya da IPv6 hiç yok)
         first = [(socket.AF_INET6, ("::1", h3.port, 0, 0))]
     elif kind == "icmp_refused":
-        first = [(socket.AF_INET, ("127.0.0.3", h3.port))]
+        first = [(socket.AF_INET, ("127.0.0.1", _free_udp_port()))]   # kapalı port -> ICMP reddi
     else:
         silent = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        silent.bind(("127.0.0.2", h3.port))      # dinler ama yanıt vermez
-        first = [(socket.AF_INET, ("127.0.0.2", h3.port))]
+        silent.bind(("127.0.0.1", 0))            # dinler ama yanıt vermez
+        first = [(socket.AF_INET, ("127.0.0.1", silent.getsockname()[1]))]
     _patch_addrs(monkeypatch, first, h3.port)
     opts = Http3Options(mode="force", connect_timeout=4.0)
     try:
@@ -362,9 +371,9 @@ def test_multi_address_fallthrough(pki, h3, monkeypatch, kind):
 
 
 def test_multi_address_all_dead_fails_within_timeout(pki, monkeypatch):
-    s1 = socket.socket(socket.AF_INET, socket.SOCK_DGRAM); s1.bind(("127.0.0.2", 0))
-    port = s1.getsockname()[1]
-    _patch_addrs(monkeypatch, [(socket.AF_INET, ("127.0.0.2", port))], port + 1)
+    s1 = socket.socket(socket.AF_INET, socket.SOCK_DGRAM); s1.bind(("127.0.0.1", 0))
+    port = s1.getsockname()[1]            # sessiz adres; ikinci adres: kapalı port
+    _patch_addrs(monkeypatch, [(socket.AF_INET, ("127.0.0.1", port))], _free_udp_port())
     try:
         opts = Http3Options(mode="force", connect_timeout=1.0)
         t = time.monotonic()
