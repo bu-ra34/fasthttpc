@@ -83,7 +83,11 @@ _NEEDS_SUPPORT = frozenset({0x11EC, 0x6399})
 
 
 class TLSImpersonator:
-    def __init__(self, target_host, profile=None):
+    def __init__(self, target_host, profile=None, legacy_tls=False):
+        # Eski sunucu uyumluluk modu: ClientHello'ya eski suite'ler/SHA-1 sigalg/EtM eklenir
+        # (yalnızca True iken; False iken ClientHello bayt bayt aynıdır). Bkz. security/tls12_legacy.py.
+        from .security.tls12_legacy import normalize_legacy
+        self.legacy_tls = normalize_legacy(legacy_tls)
         self.target_host = target_host.encode("utf-8")
         self.host_str = target_host
         self.profile = get_profile(profile)
@@ -174,6 +178,10 @@ class TLSImpersonator:
                 f"'{self.profile.get('_name', '?')}' profili hiç TLS 1.3 cipher suite "
                 f"içermiyor; bu istemci yalnızca TLS 1.3 destekler."
             )
+        if self.legacy_tls:
+            # Profilde olmayan eski suite'ler SONA eklenir; olanlar yerinde kalır (parmak izi).
+            from .security.tls12_legacy import LEGACY_OFFER_ORDER
+            suites += [c for c in LEGACY_OFFER_ORDER if c not in suites]
         return suites
 
     def _build_cipher_suites(self) -> bytes:
@@ -256,7 +264,10 @@ class TLSImpersonator:
         return self._ext(0x0005, payload)
 
     def _pack_signature_algorithms(self) -> bytes:
-        algs = self.profile.get("signature_algorithms", [0x0403, 0x0804])
+        algs = list(self.profile.get("signature_algorithms", [0x0403, 0x0804]))
+        if self.legacy_tls:
+            from .security.tls12_legacy import LEGACY_SIGALGS
+            algs += [a for a in LEGACY_SIGALGS if a not in algs]
         raw = b"".join(struct.pack("!H", a) for a in algs)
         payload = struct.pack(f"!H{len(raw)}s", len(raw), raw)
         return self._ext(0x000D, payload)
@@ -297,6 +308,8 @@ class TLSImpersonator:
                 versions.append(self._grease_version)
             elif isinstance(v, int):
                 versions.append(v)
+        if self.legacy_tls and 0x0303 not in versions:
+            versions.append(0x0303)       # legacy: TLS 1.2 sunucularına bağlanabilmek için ilan şart
         if 0x0304 not in versions:
             raise ValueError("Profilin supported_versions listesi 0x0304 (TLS 1.3) içermeli.")
         raw = b"".join(struct.pack("!H", v) for v in versions)
@@ -380,7 +393,12 @@ class TLSImpersonator:
         "record_size_limit":         "_pack_record_size_limit",
         "alps":                      "_pack_alps",
         "ech_grease":                "_pack_ech_grease",
+        "encrypt_then_mac":          "_pack_encrypt_then_mac",
     }
+
+    def _pack_encrypt_then_mac(self) -> bytes:
+        """RFC 7366 — yalnızca legacy_tls: sunucu CBC seçerse EtM kullanmayı teklif eder."""
+        return self._ext(0x0016, b"")
 
     @property
     def alps_advertised(self) -> bool:
@@ -393,6 +411,9 @@ class TLSImpersonator:
         if self._ext_order is not None:
             return self._ext_order
         order = list(self.profile.get("extensions_order", []))
+        if self.legacy_tls and "encrypt_then_mac" not in order:
+            at = len(order) - 1 if order and order[-1] == "GREASE" else len(order)
+            order.insert(at, "encrypt_then_mac")
         if os.environ.get("FASTHTTPC_NO_ECH_GREASE") == "1":
             # ECH GREASE'i tanıyıp TLS'i kendisi sonlandıran ara proxy'ler için
             # (ör. kurumsal/sandbox egress proxy'leri) kaçış kapısı. JA4'te
