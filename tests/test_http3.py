@@ -314,3 +314,63 @@ def test_core_imports_without_aioquic():
             "try:\n Session(http3=True)\nexcept ImportError as e: print('OK', e)")
     out = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True)
     assert "OK" in out.stdout, out.stderr
+
+
+# --- Çok adresli çözümleme (localhost -> ::1 kapalı, 127.0.0.1 açık) regresyonu ---------------
+
+def _patch_addrs(monkeypatch, first, port):
+    """getaddrinfo: önce ``first`` (dinleyen yok / sessiz), sonra 127.0.0.1 (sunucu)."""
+    real = socket.getaddrinfo
+    udp = socket.SOCK_DGRAM
+
+    def fake(host, p, *a, **kw):
+        if host == "localhost":
+            out = [(f, udp, 17, "", ad) for f, ad in first]
+            out.append((socket.AF_INET, udp, 17, "", ("127.0.0.1", port)))
+            return out
+        return real(host, p, *a, **kw)
+    monkeypatch.setattr(socket, "getaddrinfo", fake)
+
+
+@pytest.mark.parametrize("kind", ["ipv6_dead", "icmp_refused", "silent"])
+def test_multi_address_fallthrough(pki, h3, monkeypatch, kind):
+    silent = None
+    if kind == "ipv6_dead":      # ::1'de dinleyen yok (ya da IPv6 hiç yok)
+        first = [(socket.AF_INET6, ("::1", h3.port, 0, 0))]
+    elif kind == "icmp_refused":
+        first = [(socket.AF_INET, ("127.0.0.3", h3.port))]
+    else:
+        silent = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        silent.bind(("127.0.0.2", h3.port))      # dinler ama yanıt vermez
+        first = [(socket.AF_INET, ("127.0.0.2", h3.port))]
+    _patch_addrs(monkeypatch, first, h3.port)
+    opts = Http3Options(mode="force", connect_timeout=4.0)
+    try:
+        t = time.monotonic()
+        with Session(http3=opts, verify=pki["ca"]) as s:
+            assert s.get(url(h3)).http_version == "HTTP/3"
+        sync_t = time.monotonic() - t
+        assert sync_t < 4.5
+
+        async def go():
+            async with AsyncSession(http3=opts, verify=pki["ca"]) as a:
+                assert (await a.get(url(h3))).http_version == "HTTP/3"
+        asyncio.run(go())
+    finally:
+        if silent:
+            silent.close()
+
+
+def test_multi_address_all_dead_fails_within_timeout(pki, monkeypatch):
+    s1 = socket.socket(socket.AF_INET, socket.SOCK_DGRAM); s1.bind(("127.0.0.2", 0))
+    port = s1.getsockname()[1]
+    _patch_addrs(monkeypatch, [(socket.AF_INET, ("127.0.0.2", port))], port + 1)
+    try:
+        opts = Http3Options(mode="force", connect_timeout=1.0)
+        t = time.monotonic()
+        with Session(http3=opts, verify=pki["ca"]) as s:
+            with pytest.raises(ConnectionError):
+                s.get(f"https://localhost:{port}/")
+        assert time.monotonic() - t < 2.5
+    finally:
+        s1.close()
