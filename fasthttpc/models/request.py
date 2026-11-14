@@ -64,6 +64,7 @@ class Request:
         self.url = url if isinstance(url, URL) else URL(url)
         self.headers = headers if isinstance(headers, Headers) else Headers(headers)
         self.body = b""
+        self.timeout = None   # gönderim sırasında etkin Timeout (transport/hook'lar okuyabilir)
 
         if files is not None:
                                                                   
@@ -89,6 +90,11 @@ class Request:
 
         if self.body:
             self.headers["Content-Length"] = str(len(self.body))
+
+    @property
+    def content(self) -> bytes:
+        """Gövde (httpx uyumu: ``request.content``)."""
+        return self.body
 
     def __repr__(self) -> str:
         return f"<Request [{self.method}] url={self.url}>"
