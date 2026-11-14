@@ -275,7 +275,12 @@ class AsyncSession:
         resolver                      = None,
         headers                       = None,
         http3:           "bool | str | object" = False,
+        legacy_tls:      bool         = False,
     ):
+        # Eski sunucu uyumluluk modu (bkz. Session ve security/tls12_legacy.py); varsayılan False.
+        from .security.tls12_legacy import normalize_legacy
+        self.legacy_tls    = normalize_legacy(legacy_tls)
+        self._tls_infos: dict = {}      # (host, port, proxy) -> son el sıkışmanın tls_info'su
         # impersonate verilirse TLS, fasthttpc.tls13 çekirdeğiyle (tarayıcı
         # ClientHello'su) kurulur ve profilin ALPN'i (h2, http/1.1) kullanılır;
         # sunucu h2 seçerse HTTP/2 (multiplexing) konuşulur.
@@ -461,6 +466,8 @@ class AsyncSession:
                 return reader, writer, ""
             if self.impersonate is not None:
                 kw = {"alpn": list(alpn)} if alpn is not None else {}
+                if self.legacy_tls:
+                    kw["legacy_tls"] = True
                 if proxy is None:
                     stream = await AsyncTLSStream.connect(
                         host, port, self.impersonate, server_hostname=sni,
@@ -474,6 +481,8 @@ class AsyncSession:
                     except BaseException:
                         writer.close()
                         raise
+                from .security.tls12_legacy import tls_info as _tls_info
+                self._tls_infos[(sni, port, proxy)] = _tls_info(stream.conn.crypto_state())
                 return stream, stream, stream.conn.alpn
             ctx = ssl.create_default_context(cafile=self._ca_path)
             ctx.set_alpn_protocols(["http/1.1"])
@@ -996,6 +1005,7 @@ class AsyncSession:
 
             resp = Response(status_code=status_code, headers=resp_headers, body=body_final)
             resp.http_version = http_version
+            resp.tls_info = self._tls_infos.get((u.host, u.port, proxy_cfg))
             resp.url = str(url)
             if metrics and metrics.request_start:
                 resp.elapsed = time.monotonic() - metrics.request_start

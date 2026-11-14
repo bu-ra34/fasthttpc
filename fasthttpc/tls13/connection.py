@@ -181,13 +181,15 @@ class TLSClientConnection:
         cert_validator: Optional[Callable] = None,
         impersonator: Optional[TLSImpersonator] = None,
         port: Optional[int] = None,
+        legacy_tls: bool = False,
     ):
         self.host = host
+        self._legacy_tls = legacy_tls
         self.port = port
         self.profile = profile
         self.ca_path = ca_path
         self._cert_validator = cert_validator
-        self._imp = impersonator or TLSImpersonator(host, profile=profile)
+        self._imp = impersonator or TLSImpersonator(host, profile=profile, legacy_tls=legacy_tls)
         if alpn is not None:
             self._imp.profile = dict(self._imp.profile, alpn=list(alpn))
 
@@ -487,6 +489,7 @@ class TLSClientConnection:
         try:
             self._t12 = _t12mod.TLS12ClientConnection(
                 self.host, self._ch1, ca_path=self.ca_path, cert_validator=self._cert_validator,
+                legacy_tls=self._legacy_tls,
             )
         except _t12mod.TLS12Error as e:
             raise TLSError(str(e)) from e

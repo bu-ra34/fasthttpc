@@ -127,7 +127,13 @@ class Session:
         proxy                                         = None,
         headers                                       = None,
         http3:           "bool | str | object"        = False,
+        legacy_tls:      bool                         = False,
     ):
+        # Eski sunucu uyumluluk modu: YALNIZCA açıkça True verilirse TLS 1.2 CBC/statik RSA/EMS'siz
+        # sunucular kabul edilir (sertifika doğrulaması ve DOWNGRD kontrolü AYNEN sürer).
+        # Bkz. security/tls12_legacy.py ve README "Legacy TLS".
+        from .security.tls12_legacy import normalize_legacy
+        self.legacy_tls    = normalize_legacy(legacy_tls)
         self.impersonate   = impersonate
         # Oturum düzeyi varsayılan başlıklar (requests gibi mutable): profilin
         # tarayıcı başlıklarını geçersiz kılar, istek başlıkları bunları.
@@ -176,6 +182,17 @@ class Session:
         "connection", "keep-alive", "proxy-connection",
         "transfer-encoding", "upgrade",
     })
+
+    def _legacy_kw(self) -> dict:
+        """legacy_tls kapalıyken HİÇ kwarg geçirilmez (varsayılan çağrılar bit bit aynı kalır)."""
+        return {"legacy_tls": True} if self.legacy_tls else {}
+
+    @staticmethod
+    def _tls_info(conn) -> "dict | None":
+        from .security.tls12_legacy import tls_info
+        sock = getattr(conn, "socket", None)
+        state = getattr(sock, "state", None)
+        return tls_info(state) if isinstance(state, dict) else None
 
     def _send_h2_request(self, conn, req, metrics, cache_entry, method, url) -> Response:
         """HTTP/2 üzerinden tek bir isteği gönderir ve Response nesnesi döner."""
@@ -227,6 +244,7 @@ class Session:
         resp         = Response(status_code=status_code, headers=resp_headers, body=body_raw)
         resp.request = req
         resp.http_version = "HTTP/2"
+        resp.tls_info = self._tls_info(conn)
         if metrics:
             metrics.total_end = time.monotonic()
             resp.metrics = metrics
@@ -521,6 +539,7 @@ class Session:
                     conn.socket = TLSAdapter.negotiate(
                         conn.socket, req.url.host, self.impersonate,
                         ca_path=self._ca_path, port=req.url.port,
+                        **self._legacy_kw(),
                     )
                     conn.socket.raw_socket.settimeout(self.timeout.read_timeout)
                     conn.tls_established = True
@@ -632,6 +651,7 @@ class Session:
 
                 resp         = Response(status_code=status_code, headers=resp_headers, body=body_raw)
                 resp.request = req
+                resp.tls_info = self._tls_info(conn)
 
                 if metrics:
                     metrics.total_end = time.monotonic()
@@ -876,7 +896,8 @@ class Session:
     def pre_warm(self, hosts: list[str], count: int = 2) -> dict[str, int]:
         return self.pool.prewarm(
             hosts, count=count,
-            tls_negotiate_fn=functools.partial(TLSAdapter.negotiate, ca_path=self._ca_path),
+            tls_negotiate_fn=functools.partial(TLSAdapter.negotiate, ca_path=self._ca_path,
+                                               **self._legacy_kw()),
             impersonate=self.impersonate,
         )
 

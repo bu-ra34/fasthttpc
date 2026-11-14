@@ -87,6 +87,9 @@ class Response:
         self._url: Optional[str]           = None
         self._encoding: Optional[str]      = None
         self.http_version: str             = "HTTP/1.1"   # "HTTP/2" ise h2 üzerinden geldi
+        # TLS el sıkışması özeti (sürüm, suite, EMS/EtM/güvenli renegotiation görünürlüğü); düz
+        # HTTP/mock taşıma ise None. Bkz. security/tls12_legacy.tls_info.
+        self.tls_info: Optional[dict]      = None
 
                                                                               
 
