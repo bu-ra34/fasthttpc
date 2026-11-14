@@ -386,11 +386,10 @@ class AsyncSession:
             else:
                 reader, writer = await async_connect_via_proxy(proxy, host, port, timeout=connect_to)
                 try:
-                    if not hasattr(writer, "start_tls"):   # Python < 3.11
-                        raise NotImplementedError(
-                            "Proxy üzerinden stdlib ssl (impersonate=None) Python 3.11+ "
-                            "gerektirir; impersonate=... kullanın.")
-                    await writer.start_tls(ctx, server_hostname=host)
+                    if hasattr(writer, "start_tls"):   # Python 3.11+
+                        await writer.start_tls(ctx, server_hostname=host)
+                    else:
+                        writer = await _start_tls_py310(reader, writer, ctx, host)
                 except BaseException:
                     writer.close()
                     raise
@@ -1016,3 +1015,23 @@ class AsyncWebSocket:
 
     async def __aenter__(self): return self
     async def __aexit__(self, *a): await self.close()
+
+
+async def _start_tls_py310(reader, writer, ctx, host):
+    """Python 3.10 için ``StreamWriter.start_tls`` karşılığı (3.11'de eklendi).
+
+    Var olan (proxy tüneli) transport'u ``loop.start_tls`` ile TLS'e yükseltir ve
+    aynı StreamReader'ı besleyen protokolü yeni transport'a bağlar; 3.11'deki
+    ``StreamWriter.start_tls`` gövdesiyle aynı adımlar.
+    """
+    loop = asyncio.get_running_loop()
+    protocol = writer.transport.get_protocol()
+    await writer.drain()
+    new_transport = await loop.start_tls(
+        writer.transport, protocol, ctx, server_hostname=host)
+    # StreamReaderProtocol yeni transport'u bilmeli (3.11: _replace_writer).
+    protocol._transport = new_transport
+    protocol._over_ssl = True
+    new_writer = asyncio.StreamWriter(new_transport, protocol, reader, loop)
+    protocol._stream_writer = new_writer
+    return new_writer
