@@ -83,6 +83,23 @@ async def main():
 asyncio.run(main())
 ```
 
+### requests / httpx'ten geçiş
+
+`Response` requests/httpx alanlarını sunar: `r.status_code`, `r.headers`,
+`r.url`, `r.ok`, `r.reason`, `r.encoding`, `r.content` (bytes), `r.json()`,
+`r.raise_for_status()`, `r.history`, `r.elapsed` (saniye; `r.elapsed.total_seconds()`
+de çalışır).
+
+- `r.text` bir **property**'dir (`str`), requests'teki gibi; kodlama
+  Content-Type `charset`'inden gelir (yoksa `utf-8`, hatalı byte'lar `replace`),
+  `r.encoding = "latin-1"` ile değiştirilebilir. Geriye uyumluluk: dönen değer
+  çağrılabilir olduğundan eski `r.text()` ve `r.text(encoding="latin-1")` aynen
+  çalışır.
+- `r.json` requests'te olduğu gibi **metottur** (`r.json()`).
+- `requests.get(...)` yerine `Session`/`AsyncSession` kullanın; `verify=False`
+  desteklenmez (bkz. Güvenlik modeli), `proxies={...}` sözlüğü ve `timeout=`
+  (sayı veya `Timeout`) requests ile aynı biçimdedir.
+
 ### Timeout ve Limits
 
 httpx'e benzer `Timeout` ve `Limits` (`fasthttpc.config`):
@@ -256,9 +273,17 @@ verir veya belgelenmiştir:
   stream'ler yeni bağlantıda yeniden denenir), RST_STREAM, PING ack. SETTINGS
   kümesi/sırası senkron taraftan türetilir; pseudo-header sırası ve HPACK
   kodlaması aynıdır. Sunucu `http/1.1` seçerse (veya `impersonate=None`, stdlib
-  `ssl`) istek başına bir bağlantıyla HTTP/1.1 kullanılır; async HTTP/1.1'de
-  bağlantı havuzlama (keep-alive) yoktur. `AsyncSession.pre_warm` ve async
-  WebSocket hâlâ stdlib `ssl` kullanır ve proxy desteklemez.
+  `ssl`) HTTP/1.1 kullanılır. Async HTTP/1.1'de keep-alive havuzu vardır:
+  `(host, port, proxy, TLS yolu)` anahtarlı; `Connection: close`, HTTP/1.0,
+  EOF çerçeveli gövde, hata/iptal sonrası bağlantı havuza dönmez (slot yine de
+  serbest kalır). Havuzdan alınan bağlantı yanıttan hiç bayt gelmeden koparsa
+  (ve hata zaman aşımı değilse) istek bir kez taze bağlantıyla yeniden denenir;
+  zaman aşımı veya yarım yanıtta yeniden denenmez (POST çift gönderilmez).
+  `AsyncSession.pre_warm` ve `ws_connect` aynı bağlantı yolunu kullanır:
+  `impersonate` ile tarayıcı ClientHello'su (WebSocket'te ALPN yalnızca
+  `http/1.1`), `proxy=` / `proxies=` / rotasyon ile tünel üzerinden; `ws://` ve
+  `wss://` desteklenir. `pre_warm` ısıttığı HTTP/1.1 bağlantılarını keep-alive
+  havuzuna, h2 bağlantısını h2 önbelleğine koyar.
 - **AsyncSession proxy:** `proxy=` / `proxies=` senkron `Session` ile aynı
   anlamdadır (HTTP CONNECT + Basic, SOCKS5 / RFC 1929; `https://` proxy yok).
   Tünelin içinde hem `impersonate` (kendi TLS 1.3 yığını) hem stdlib `ssl`
@@ -266,8 +291,10 @@ verir veya belgelenmiştir:
   rotasyonu artık proxy'yi gerçekten kullanır ve `proxy=`'yi geçersiz kılar.
   `AsyncSession` ayrıca `Timeout` (connect/read/write/pool; read, hareketsizlik
   süresidir) ve `Limits` (`max_connections` = toplam eşzamanlı bağlantı,
-  `keepalive_expiry` h2 bağlantıları için) kabul eder. `max_keepalive_connections`
-  async tarafta uygulanmaz.
+  `max_keepalive_connections`, `keepalive_expiry`) kabul eder. `max_connections`
+  kullanımdaki bağlantıları sınırlar; boştaki keep-alive bağlantılar slot
+  tutmaz ve `max_keepalive_connections` (varsayılan `max_connections`) ile
+  sınırlıdır. Async'te `keepalive_expiry=0` keep-alive'ı kapatır.
 - Async HTTP/2'de sunucu PUSH_PROMISE'i protokol hatasıdır (ENABLE_PUSH=0 ilan
   edilir); öncelik (PRIORITY) gönderilmez, yok sayılır.
 - **TLS 1.2: yalnızca güvenli bir alt küme desteklenir** (`fasthttpc/security/tls12.py`,
