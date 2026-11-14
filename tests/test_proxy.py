@@ -288,3 +288,22 @@ def test_psk_bilet_anahtari_proxy_degil_hedef_portu(trust_leaf, monkeypatch):
     assert r.status_code == 200
     srv.close()
     assert anahtarlar == [("example.com", 8443)], anahtarlar
+
+
+def test_async_proxy_connect_zaman_asimi_proxyerror(monkeypatch):
+    """Proxy'ye TCP bağlantısı zaman aşımına uğrarsa (Windows'ta kapalı port ret'i ~2 sn'de bildirilir)
+    sync yolla aynı: ProxyError (ConnectionError), ham TimeoutError değil."""
+    import asyncio
+
+    from fasthttpc import _backend as B
+    from fasthttpc.transport.proxy import ProxyConfig, ProxyError, async_connect_via_proxy
+
+    async def asili(*a, **k):
+        await asyncio.sleep(30)
+    monkeypatch.setattr(B, "open_connection", asili)
+
+    async def main():
+        with pytest.raises(ProxyError, match="bağlanılamadı"):
+            await async_connect_via_proxy(ProxyConfig("http", "127.0.0.1", 9), "example.com", 443,
+                                          timeout=0.2)
+    asyncio.run(main())
