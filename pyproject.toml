@@ -18,8 +18,8 @@ dependencies = [
 [project.optional-dependencies]
 brotli = ["brotli>=1.0"]
 zstd   = ["zstandard>=0.21"]
-dev    = ["pytest>=7.0", "h2>=4"]
-all    = ["brotli>=1.0", "zstandard>=0.21", "pytest>=7.0", "h2>=4"]
+dev    = ["pytest>=7.0", "h2>=4", "tlslite-ng>=0.8", "brotli>=1.0"]
+all    = ["brotli>=1.0", "zstandard>=0.21", "pytest>=7.0", "h2>=4", "tlslite-ng>=0.8"]
 
 [project.urls]
 Repository = "https://github.com/cevpy/fasthttpc"
