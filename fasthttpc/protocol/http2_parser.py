@@ -1459,7 +1459,8 @@ class WebSocketConnection:
             if use_tls:
                 if not conn.tls_established:
                     from ..security.tls_adapter import TLSAdapter
-                    conn.socket = TLSAdapter.negotiate(conn.socket, u.host, session.impersonate)
+                    conn.socket = TLSAdapter.negotiate(conn.socket, u.host, session.impersonate,
+                                                      **_mtls_kw(session))
                     conn.socket.raw_socket.settimeout(session.timeout)
                     conn.tls_established = True
                 wire = conn.socket
@@ -1616,6 +1617,11 @@ class StreamingDecompressor:
         return b""
 
 
+def _mtls_kw(session) -> dict:
+    cc = getattr(session, "client_cert", None)
+    return {"client_cert": cc} if cc is not None else {}
+
+
 def iter_content(
     session,
     method: str,
@@ -1640,7 +1646,8 @@ def iter_content(
 
     conn = session.pool.acquire(u)
     if not conn.tls_established:
-        conn.socket = TLSAdapter.negotiate(conn.socket, u.host, session.impersonate)
+        conn.socket = TLSAdapter.negotiate(conn.socket, u.host, session.impersonate,
+                                                      **_mtls_kw(session))
         conn.socket.raw_socket.settimeout(session.timeout)
         conn.tls_established = True
 
