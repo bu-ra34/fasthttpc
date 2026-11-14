@@ -770,6 +770,82 @@ class HpackEncoder:
                              
                                                                                
 
+# ---------------------------------------------------------------------------
+# Profil bazlı HTTP/2 parmak izi: önsöz/SETTINGS/WINDOW_UPDATE/PRIORITY,
+# HEADERS (PRIORITY alanı), pseudo-header ve başlık sırası. Değerler
+# fingerprint.PROFILES[...]["h2"]'den gelir; senkron ve async bağlantı AYNI
+# fonksiyonları kullanır.
+# ---------------------------------------------------------------------------
+
+def _frame_bytes(ftype: int, flags: int, stream_id: int, payload: bytes) -> bytes:
+    return HTTP2Frame(len(payload), ftype, flags, stream_id, payload).serialize()
+
+
+def _priority_payload(dep: int, exclusive: bool, weight: int) -> bytes:
+    """5 baytlık PRIORITY alanı: E+bağımlılık (4) ve ağırlık-1 (1). ``weight`` 1..256."""
+    return struct.pack("!IB", (dep & 0x7FFFFFFF) | (0x80000000 if exclusive else 0), weight - 1)
+
+
+def h2_for_profile(profile) -> dict:
+    """Profil adı / profil sözlüğü / None -> h2 parmak izi sözlüğü."""
+    from ..fingerprint import get_profile
+    if isinstance(profile, dict) and "h2" in profile:
+        return profile["h2"]
+    return get_profile(profile)["h2"]
+
+
+def build_client_preface(h2: dict) -> bytes:
+    """Bağlantı ön eki + SETTINGS + (varsa) WINDOW_UPDATE + PRIORITY frame'leri.
+
+    Chrome/Firefox/Safari bunu TEK yazımda gönderir; sıra: PRI preface,
+    SETTINGS, bağlantı WINDOW_UPDATE'i, PRIORITY frame'leri.
+    """
+    payload = b"".join(struct.pack("!HI", i, v) for i, v in h2["settings"])
+    out = HTTP2Detector.H2_PREFACE + _frame_bytes(FrameType.SETTINGS, 0, 0, payload)
+    if h2.get("window_update"):
+        out += _frame_bytes(FrameType.WINDOW_UPDATE, 0, 0, struct.pack("!I", h2["window_update"]))
+    for sid, dep, excl, weight in h2.get("priority_frames", ()):
+        out += _frame_bytes(FrameType.PRIORITY, 0, sid, _priority_payload(dep, excl, weight))
+    return out
+
+
+def h2_setting(h2: dict, ident: int, default: int) -> int:
+    """Profilin ilan ettiği SETTINGS değeri (ilan etmiyorsa RFC varsayılanı)."""
+    for i, v in h2["settings"]:
+        if i == ident:
+            return v
+    return default
+
+
+def h2_request_headers(h2: dict, method: str, authority: str, scheme: str, path: str,
+                       headers: "list[tuple[str, str]]") -> "list[tuple[str, str]]":
+    """Pseudo-header'lar profil sırasında, ardından başlıklar profil sırasında.
+
+    Profildeki ``header_order``'da olan başlıklar o sırada gelir; olmayanlar
+    orijinal göreli sıralarıyla SONA eklenir. Pseudo'lar her zaman öne
+    (RFC 7540 §8.1.2.1).
+    """
+    values = {":method": method.upper(), ":authority": authority,
+              ":scheme": scheme, ":path": path}
+    pseudo = [(k, values[k]) for k in h2["pseudo_header_order"]]
+    rest = [(k, v) for k, v in headers if not k.startswith(":")]
+    order = h2.get("header_order") or []
+    if order:
+        rank = {name: i for i, name in enumerate(order)}
+        indexed = list(enumerate(rest))
+        indexed.sort(key=lambda t: (rank.get(t[1][0].lower(), len(rank)),
+                                    t[0] if t[1][0].lower() not in rank else 0))
+        rest = [kv for _, kv in indexed]
+    return pseudo + rest
+
+
+def h2_headers_priority_field(h2: dict) -> bytes:
+    """HEADERS frame'inin 5 baytlık PRIORITY alanı (yoksa b"")."""
+    hp = h2.get("headers_priority")
+    return _priority_payload(*hp) if hp else b""
+
+
+
 class Http2StreamError(Exception):
     """Tek bir HTTP/2 stream seviyesinde hata (RST_STREAM vb.)."""
     pass
@@ -777,6 +853,15 @@ class Http2StreamError(Exception):
 
 class Http2ConnectionError(Exception):
     """Bağlantı seviyesinde HTTP/2 hatası (GOAWAY vb.)."""
+    pass
+
+
+class Http2RefusedError(Http2ConnectionError):
+    """Sunucu isteği İŞLEMEDİ (GOAWAY last_stream_id < stream, RFC 9113 §6.8).
+
+    İstek sunucuya hiç ulaşmamış sayılır; POST dahil yeni bir bağlantıda
+    yeniden denemek güvenlidir.
+    """
     pass
 
 
@@ -804,11 +889,17 @@ class Http2Connection:
 
     DEFAULT_WINDOW = 65535
 
-    def __init__(self, encrypted_socket, initial_settings: Optional[dict] = None, debug: bool = False):
+    def __init__(self, encrypted_socket, initial_settings: Optional[dict] = None, debug: bool = False,
+                 profile=None):
+        """``profile``: TLS/HTTP2 profil adı (ör. "chrome_131") veya profil sözlüğü;
+        SETTINGS/WINDOW_UPDATE/PRIORITY/pseudo-header sırası ondan gelir.
+        None -> ``default`` profili (eski sabit davranış)."""
         self.sock = encrypted_socket
+        self._h2 = h2_for_profile(profile)
         self._next_stream_id = 1
-        # SETTINGS'te HEADER_TABLE_SIZE=65536 ve MAX_HEADER_LIST_SIZE=256KB ilan ediliyor.
-        self._decoder = HpackDecoder(max_table_size=65536,
+        # Dinamik tablo üst sınırı = ilan ettiğimiz SETTINGS_HEADER_TABLE_SIZE
+        # (ilan edilmediyse RFC varsayılanı 4096).
+        self._decoder = HpackDecoder(max_table_size=h2_setting(self._h2, 0x1, HPACK_DEFAULT_TABLE_SIZE),
                                      max_header_list_size=HPACK_MAX_HEADER_LIST_SIZE)
         self._encoder = HpackEncoder()
         self._recv_buf = bytearray()
@@ -816,6 +907,9 @@ class Http2Connection:
         self._conn_window_recv = self.DEFAULT_WINDOW      # server'ın bize gönderebileceği (biz WINDOW_UPDATE yolladıkça artar)
         self._peer_settings = {"max_frame_size": 16384, "initial_window_size": self.DEFAULT_WINDOW}
         self._stream_windows: dict[int, int] = {}
+        # GOAWAY alındıysa (last_stream_id, error_code); bağlantı artık yeni
+        # stream açmak için kullanılmaz (RFC 9113 §6.8).
+        self.goaway: Optional[tuple[int, int]] = None
         self._pending_frames: list[HTTP2Frame] = []
         self._lock = threading.Lock()
         self.debug = debug or __import__("os").environ.get("FASTHTTPC_H2_DEBUG") == "1"
@@ -833,16 +927,13 @@ class Http2Connection:
         "h2 fingerprint") ilk bileşenidir. ENABLE_PUSH=0 ayrıca gerekli:
         bu istemci PUSH_PROMISE işlemiyor, açık bırakmak sunucunun bize
         işleyemeyeceğimiz stream'ler açmasına yol açar.
+
+        İçerik profilden gelir (``fingerprint.PROFILES[ad]["h2"]``): SETTINGS
+        sırası/değerleri, bağlantı WINDOW_UPDATE'i ve PRIORITY frame'leri.
+        Büyük INITIAL_WINDOW_SIZE ilan etmek güvenlidir: alım tarafı her DATA
+        için hemen WINDOW_UPDATE döner, yani pencere hiç daralmaz.
         """
-        self.sock.send_record(HTTP2Detector.H2_PREFACE, content_type=0x17)
-        settings_payload = (
-            struct.pack("!HI", 0x1, 65536)                  # HEADER_TABLE_SIZE
-            + struct.pack("!HI", 0x2, 0)                    # ENABLE_PUSH = kapalı
-            + struct.pack("!HI", 0x4, self.DEFAULT_WINDOW)  # INITIAL_WINDOW_SIZE
-            + struct.pack("!HI", 0x6, 262144)               # MAX_HEADER_LIST_SIZE
-        )
-        frame = HTTP2Frame(len(settings_payload), FrameType.SETTINGS, 0, 0, settings_payload)
-        self.sock.send_record(frame.serialize())
+        self.sock.send_record(build_client_preface(self._h2), content_type=0x17)
 
     def _send_goaway(self, error_code: int) -> None:
         """En iyi çabayla GOAWAY gönderir (bağlantı zaten bozuksa hata yutulur)."""
@@ -896,26 +987,33 @@ class Http2Connection:
         if frame.stream_id == 0:
             self._conn_window_send += increment
         else:
-            self._stream_windows[frame.stream_id] = (
-                self._stream_windows.get(frame.stream_id, self._peer_settings["initial_window_size"])
-                + increment
-            )
+            # Yalnızca bilinen (şu an açık) stream'ler: bitmiş bir stream için geç
+            # gelen WINDOW_UPDATE sözlüğe sonsuza dek kalacak bir girdi eklemesin.
+            if frame.stream_id in self._stream_windows:
+                self._stream_windows[frame.stream_id] += increment
 
     # -- İstek gönderme ---------------------------------------------------
 
     def _next_id(self) -> int:
         sid = self._next_stream_id
         self._next_stream_id += 2
+        # İstekler bağlantı kilidi altında ardışık işlenir; önceki stream'ler
+        # bitmiştir. Temizlenmezse uzun ömürlü bağlantıda istek başına bir
+        # girdi sızar (soak testinde ~70 bayt/istek).
+        self._stream_windows.clear()
         self._stream_windows[sid] = self._peer_settings["initial_window_size"]
         return sid
 
     def _send_headers(self, stream_id: int, headers: list[tuple[str, str]], end_stream: bool) -> None:
         block = self._encoder.encode(headers)
         max_frame = self._peer_settings.get("max_frame_size", 16384)
+        prio = h2_headers_priority_field(self._h2)
         first = True
         offset = 0
         while offset < len(block) or first:
-            chunk = block[offset: offset + max_frame]
+            # İlk HEADERS'ta PRIORITY alanı (5 bayt) frame yükünün parçasıdır.
+            room = max_frame - (len(prio) if first else 0)
+            chunk = block[offset: offset + room]
             offset += len(chunk)
             is_last = offset >= len(block)
             flags = 0
@@ -923,12 +1021,37 @@ class Http2Connection:
                 flags |= FrameFlags.END_STREAM
             if is_last:
                 flags |= FrameFlags.END_HEADERS
+            if first and prio:
+                flags |= FrameFlags.PRIORITY
             ftype = FrameType.HEADERS if first else FrameType.CONTINUATION
-            frame = HTTP2Frame(len(chunk), ftype, flags, stream_id, chunk)
+            payload = (prio + chunk) if first else chunk
+            frame = HTTP2Frame(len(payload), ftype, flags, stream_id, payload)
             self.sock.send_record(frame.serialize())
             first = False
             if not block:
                 break
+
+    def _on_goaway(self, frame: "HTTP2Frame", stream_id: int) -> None:
+        """GOAWAY'i işler (RFC 9113 §6.8).
+
+        last_stream_id >= stream_id ise sunucu bu stream'i işleyecek: yanıtı
+        okumaya devam edilir, bağlantı yalnızca yeniden kullanılmaz (sunucu
+        bakım/boşta kapatma için error_code=NO_ERROR ile gönderir). Aksi halde
+        istek işlenmedi -> Http2RefusedError (güvenle yeniden denenebilir).
+        """
+        p = frame.payload
+        if len(p) < 8:
+            raise Http2ConnectionError(f"Bozuk GOAWAY frame'i: {p!r}")
+        last_sid = struct.unpack("!I", p[:4])[0] & 0x7FFFFFFF
+        err = struct.unpack("!I", p[4:8])[0]
+        if self.goaway is None or last_sid < self.goaway[0]:
+            self.goaway = (last_sid, err)
+        if stream_id > last_sid:
+            raise Http2RefusedError(
+                f"Sunucu GOAWAY ile bağlantıyı kapatıyor (last_stream_id={last_sid}, "
+                f"error_code={err}); stream {stream_id} işlenmedi."
+            )
+        self._dbg(f"GOAWAY (last_stream_id={last_sid}, error={err}); stream {stream_id} tamamlanacak")
 
     def _await_window(self, stream_id: int, needed: int) -> None:
         """Gönderim penceresi açılana kadar sunucudan frame okur.
@@ -947,7 +1070,7 @@ class Http2Connection:
                 pong = HTTP2Frame(len(frame.payload), FrameType.PING, 0x1, 0, frame.payload)
                 self.sock.send_record(pong.serialize())
             elif frame.type == FrameType.GOAWAY:
-                raise Http2ConnectionError(f"Gövde gönderilirken GOAWAY alındı: {frame.payload!r}")
+                self._on_goaway(frame, stream_id)
             elif frame.type == FrameType.RST_STREAM:
                 raise Http2StreamError(f"Stream {frame.stream_id} gövde gönderilirken sıfırlandı.")
             else:
@@ -991,22 +1114,15 @@ class Http2Connection:
         Aynı bağlantı üzerinde ardışık çağrılabilir (her çağrı yeni stream_id alır).
         """
         with self._lock:
+            if self.goaway is not None:
+                raise Http2RefusedError(
+                    f"Bağlantı GOAWAY almış (last_stream_id={self.goaway[0]}); yeni stream açılmaz.")
             stream_id = self._next_id()
             self._dbg(f"--- REQUEST stream_id={stream_id} {method} {path} ---")
 
-            # Pseudo-header SIRASI bir parmak izidir. Chrome/Edge :method,
-            # :authority, :scheme, :path sırasını kullanır; Firefox :method,
-            # :path, :authority, :scheme. Alfabetik veya keyfi bir sıra
-            # "bu bir tarayıcı değil" sinyali verir.
-            pseudo = [
-                (":method", method.upper()),
-                (":authority", authority),
-                (":scheme", scheme),
-                (":path", path),
-            ]
-            # Pseudo-header'lar diğerlerinden önce gelmeli (RFC 7540 §8.1.2.1)
-            filtered = [(k, v) for k, v in headers if not k.startswith(":")]
-            full_headers = pseudo + filtered
+            # Pseudo-header ve başlık SIRASI birer parmak izidir; profilden gelir
+            # (Chrome m,a,s,p; Firefox m,p,a,s; Safari m,s,a,p).
+            full_headers = h2_request_headers(self._h2, method, authority, scheme, path, headers)
             self._dbg(f"giden headers: {full_headers}")
 
             self._send_headers(stream_id, full_headers, end_stream=(len(body) == 0))
@@ -1040,7 +1156,7 @@ class Http2Connection:
                         pong = HTTP2Frame(len(frame.payload), FrameType.PING, 0x1, 0, frame.payload)
                         self.sock.send_record(pong.serialize())
                 elif frame.type == FrameType.GOAWAY:
-                    raise Http2ConnectionError(f"Sunucu GOAWAY gönderdi: {frame.payload!r}")
+                    self._on_goaway(frame, stream_id)
                 elif frame.type == FrameType.RST_STREAM:
                     err_code = struct.unpack("!I", frame.payload[:4])[0] if len(frame.payload) >= 4 else -1
                     err_names = {
@@ -1517,6 +1633,7 @@ def iter_content(
     """
     from ..models.urls import URL as FURL
     from ..security.tls_adapter import TLSAdapter
+    from ..fingerprint import drop_h2_only_defaults, merge_default_headers, order_h1
 
     u    = FURL(url) if isinstance(url, str) else url
     req_headers = kwargs.get("headers", {})
@@ -1527,13 +1644,12 @@ def iter_content(
         conn.socket.raw_socket.settimeout(session.timeout)
         conn.tls_established = True
 
-    req_str = (
-        f"{method} {u.raw_path.decode()} HTTP/1.1\r\n"
-        f"Host: {u.host}\r\n"
-        f"Connection: keep-alive\r\n"
-        f"Accept-Encoding: gzip, deflate\r\n"
-    )
-    for k, v in req_headers.items():
+    pairs = [("Host", u.host), ("Connection", "keep-alive")]
+    pairs += merge_default_headers(
+        session.impersonate, session._merged_headers(req_headers))
+    req_str = f"{method} {u.raw_path.decode()} HTTP/1.1\r\n"
+    for k, v in order_h1(session.impersonate,
+                         drop_h2_only_defaults(session.impersonate, pairs)):
         req_str += f"{k}: {v}\r\n"
     req_str += "\r\n"
     conn.socket.send_record(req_str.encode("ascii"))

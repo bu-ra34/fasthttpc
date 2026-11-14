@@ -1,0 +1,389 @@
+{
+ "dakika": 20.0,
+ "dongu": 60,
+ "proxy": true,
+ "profiller": {
+  "chrome_131/async": {
+   "ok": 236,
+   "hata": 0,
+   "tls12_yalniz_ret": 0,
+   "hata_orani": 0.0,
+   "p50_ms": 452,
+   "p90_ms": 561,
+   "p99_ms": 736,
+   "max_ms": 953
+  },
+  "chrome_131/sync": {
+   "ok": 443,
+   "hata": 1,
+   "tls12_yalniz_ret": 0,
+   "hata_orani": 0.0023,
+   "p50_ms": 269,
+   "p90_ms": 519,
+   "p99_ms": 921,
+   "max_ms": 1509
+  },
+  "firefox_133/async": {
+   "ok": 236,
+   "hata": 0,
+   "tls12_yalniz_ret": 0,
+   "hata_orani": 0.0,
+   "p50_ms": 450,
+   "p90_ms": 543,
+   "p99_ms": 818,
+   "max_ms": 1562
+  },
+  "firefox_133/sync": {
+   "ok": 442,
+   "hata": 0,
+   "tls12_yalniz_ret": 0,
+   "hata_orani": 0.0,
+   "p50_ms": 246,
+   "p90_ms": 566,
+   "p99_ms": 891,
+   "max_ms": 1371
+  },
+  "safari_18/async": {
+   "ok": 236,
+   "hata": 0,
+   "tls12_yalniz_ret": 0,
+   "hata_orani": 0.0,
+   "p50_ms": 443,
+   "p90_ms": 556,
+   "p99_ms": 684,
+   "max_ms": 8133
+  },
+  "safari_18/sync": {
+   "ok": 442,
+   "hata": 0,
+   "tls12_yalniz_ret": 0,
+   "hata_orani": 0.0,
+   "p50_ms": 255,
+   "p90_ms": 570,
+   "p99_ms": 962,
+   "max_ms": 1295
+  }
+ },
+ "hata_tipleri": {
+  "ConnectionError": 1
+ },
+ "hata_ornekleri": {
+  "ConnectionError|www.debian.org": "HTTP/2 isteği başarısız: Sunucu GOAWAY gönderdi: b'\\x7f\\xff\\xff\\xff\\x00\\x00\\x00\\x00'"
+ },
+ "site": {
+  "httpbin.org": {
+   "ok": 177,
+   "hata": 0
+  },
+  "www.google.com": {
+   "ok": 177,
+   "hata": 0
+  },
+  "www.wikipedia.org": {
+   "ok": 177,
+   "hata": 0
+  },
+  "www.python.org": {
+   "ok": 177,
+   "hata": 0
+  },
+  "www.mozilla.org": {
+   "ok": 90,
+   "hata": 0
+  },
+  "www.kernel.org": {
+   "ok": 90,
+   "hata": 0
+  },
+  "www.bing.com": {
+   "ok": 90,
+   "hata": 0
+  },
+  "www.cloudflare.com": {
+   "ok": 178,
+   "hata": 0
+  },
+  "example.com": {
+   "ok": 178,
+   "hata": 0
+  },
+  "nginx.org": {
+   "ok": 177,
+   "hata": 0
+  },
+  "github.com": {
+   "ok": 177,
+   "hata": 0
+  },
+  "pypi.org": {
+   "ok": 87,
+   "hata": 0
+  },
+  "www.apache.org": {
+   "ok": 87,
+   "hata": 0
+  },
+  "duckduckgo.com": {
+   "ok": 87,
+   "hata": 0
+  },
+  "www.debian.org": {
+   "ok": 86,
+   "hata": 1
+  }
+ },
+ "ornekler": [
+  {
+   "t": 0,
+   "rss_mb": 36.8,
+   "fd": 4,
+   "threads": 1
+  },
+  {
+   "t": 30,
+   "rss_mb": 43.8,
+   "fd": 33,
+   "threads": 2
+  },
+  {
+   "t": 60,
+   "rss_mb": 44.3,
+   "fd": 46,
+   "threads": 2
+  },
+  {
+   "t": 90,
+   "rss_mb": 45.2,
+   "fd": 46,
+   "threads": 2
+  },
+  {
+   "t": 120,
+   "rss_mb": 45.0,
+   "fd": 47,
+   "threads": 2
+  },
+  {
+   "t": 150,
+   "rss_mb": 45.2,
+   "fd": 46,
+   "threads": 2
+  },
+  {
+   "t": 180,
+   "rss_mb": 45.2,
+   "fd": 46,
+   "threads": 2
+  },
+  {
+   "t": 210,
+   "rss_mb": 44.6,
+   "fd": 10,
+   "threads": 2
+  },
+  {
+   "t": 240,
+   "rss_mb": 45.2,
+   "fd": 42,
+   "threads": 2
+  },
+  {
+   "t": 270,
+   "rss_mb": 45.3,
+   "fd": 46,
+   "threads": 2
+  },
+  {
+   "t": 300,
+   "rss_mb": 45.3,
+   "fd": 46,
+   "threads": 2
+  },
+  {
+   "t": 330,
+   "rss_mb": 45.5,
+   "fd": 46,
+   "threads": 2
+  },
+  {
+   "t": 360,
+   "rss_mb": 45.7,
+   "fd": 46,
+   "threads": 2
+  },
+  {
+   "t": 390,
+   "rss_mb": 45.8,
+   "fd": 46,
+   "threads": 2
+  },
+  {
+   "t": 420,
+   "rss_mb": 45.8,
+   "fd": 20,
+   "threads": 2
+  },
+  {
+   "t": 450,
+   "rss_mb": 45.8,
+   "fd": 46,
+   "threads": 2
+  },
+  {
+   "t": 480,
+   "rss_mb": 45.8,
+   "fd": 46,
+   "threads": 2
+  },
+  {
+   "t": 510,
+   "rss_mb": 45.8,
+   "fd": 46,
+   "threads": 2
+  },
+  {
+   "t": 540,
+   "rss_mb": 45.8,
+   "fd": 46,
+   "threads": 2
+  },
+  {
+   "t": 570,
+   "rss_mb": 45.8,
+   "fd": 46,
+   "threads": 2
+  },
+  {
+   "t": 600,
+   "rss_mb": 45.8,
+   "fd": 46,
+   "threads": 2
+  },
+  {
+   "t": 630,
+   "rss_mb": 45.8,
+   "fd": 21,
+   "threads": 2
+  },
+  {
+   "t": 660,
+   "rss_mb": 45.8,
+   "fd": 46,
+   "threads": 2
+  },
+  {
+   "t": 690,
+   "rss_mb": 45.8,
+   "fd": 46,
+   "threads": 2
+  },
+  {
+   "t": 720,
+   "rss_mb": 44.8,
+   "fd": 46,
+   "threads": 2
+  },
+  {
+   "t": 750,
+   "rss_mb": 45.7,
+   "fd": 46,
+   "threads": 2
+  },
+  {
+   "t": 780,
+   "rss_mb": 44.8,
+   "fd": 46,
+   "threads": 2
+  },
+  {
+   "t": 810,
+   "rss_mb": 45.5,
+   "fd": 46,
+   "threads": 2
+  },
+  {
+   "t": 840,
+   "rss_mb": 45.5,
+   "fd": 31,
+   "threads": 2
+  },
+  {
+   "t": 870,
+   "rss_mb": 45.5,
+   "fd": 46,
+   "threads": 2
+  },
+  {
+   "t": 900,
+   "rss_mb": 45.6,
+   "fd": 46,
+   "threads": 2
+  },
+  {
+   "t": 930,
+   "rss_mb": 45.8,
+   "fd": 46,
+   "threads": 2
+  },
+  {
+   "t": 960,
+   "rss_mb": 45.9,
+   "fd": 46,
+   "threads": 2
+  },
+  {
+   "t": 990,
+   "rss_mb": 45.9,
+   "fd": 46,
+   "threads": 2
+  },
+  {
+   "t": 1020,
+   "rss_mb": 46.0,
+   "fd": 7,
+   "threads": 2
+  },
+  {
+   "t": 1050,
+   "rss_mb": 46.0,
+   "fd": 38,
+   "threads": 2
+  },
+  {
+   "t": 1080,
+   "rss_mb": 46.0,
+   "fd": 46,
+   "threads": 2
+  },
+  {
+   "t": 1110,
+   "rss_mb": 46.0,
+   "fd": 46,
+   "threads": 2
+  },
+  {
+   "t": 1140,
+   "rss_mb": 46.0,
+   "fd": 52,
+   "threads": 2
+  },
+  {
+   "t": 1170,
+   "rss_mb": 46.0,
+   "fd": 46,
+   "threads": 2
+  },
+  {
+   "t": 1200,
+   "rss_mb": 46.0,
+   "fd": 46,
+   "threads": 2
+  },
+  {
+   "t": 1200,
+   "rss_mb": 46.0,
+   "fd": 4,
+   "threads": 1
+  }
+ ]
+}

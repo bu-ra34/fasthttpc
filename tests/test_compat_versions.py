@@ -93,12 +93,14 @@ def _tls12_sh(random, sid):
 
 
 def test_tls12_server_hello_clear_error():
+    # TLS 1.2 artık güvenli alt küme olarak desteklenir; ama bu sahte ServerHello
+    # Extended Master Secret içermediği için NET bir hatayla reddedilir.
     port = _one_shot_server(_tls12_server_hello(os.urandom(32)))
-    with pytest.raises(ConnectionError, match="TLS 1.2"):
+    with pytest.raises(ConnectionError, match="Extended Master Secret"):
         _negotiate(port)
 
 
 def test_tls12_downgrade_sentinel_detected():
     port = _one_shot_server(_tls12_server_hello(os.urandom(24) + b"DOWNGRD\x01"))
-    with pytest.raises(ConnectionError, match="downgrade"):
+    with pytest.raises(ConnectionError, match="DOWNGRD"):
         _negotiate(port)

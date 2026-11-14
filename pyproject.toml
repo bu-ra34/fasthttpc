@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "fasthttpc"
-version = "0.3.0"
+version = "0.5.0"
 description = "Pure-Python HTTP istemcisi — TLS 1.3 fingerprinting, async destek, connection pool"
 readme = "README.md"
 license = { text = "MIT" }
@@ -18,11 +18,11 @@ dependencies = [
 [project.optional-dependencies]
 brotli = ["brotli>=1.0"]
 zstd   = ["zstandard>=0.21"]
-dev    = ["pytest>=7.0"]
-all    = ["brotli>=1.0", "zstandard>=0.21", "pytest>=7.0"]
+dev    = ["pytest>=7.0", "h2>=4", "tlslite-ng>=0.8", "brotli>=1.0"]
+all    = ["brotli>=1.0", "zstandard>=0.21", "pytest>=7.0", "h2>=4", "tlslite-ng>=0.8"]
 
 [project.urls]
-Repository = "https://github.com/kullanici/fasthttpc"
+Repository = "https://github.com/cevpy/fasthttpc"
 
 [tool.setuptools.packages.find]
 where = ["."]
@@ -30,6 +30,10 @@ include = ["fasthttpc*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+pythonpath = ["."]
+markers = [
+    "interop: bağımsız TLS sunucularına (openssl s_server, tlslite-ng) karşı uyumluluk testleri; varsayılan çalıştırmada da koşar",
+]
 
 [tool.ruff]
 target-version = "py310"

@@ -26,9 +26,24 @@ from cryptography.hazmat.primitives import serialization
 GROUP_X25519 = 0x001D
 GROUP_SECP256R1 = 0x0017
 GROUP_SECP384R1 = 0x0018
+GROUP_X25519MLKEM768 = 0x11EC
 
-#: Bu istemcinin gerçekten key exchange yapabildiği gruplar.
-SUPPORTED_GROUPS = (GROUP_X25519, GROUP_SECP256R1, GROUP_SECP384R1)
+try:  # cryptography >= 47: ML-KEM (FIPS 203); eski sürümlerde yok
+    from cryptography.hazmat.primitives.asymmetric import mlkem as _mlkem
+    _mlkem.MLKEM768PrivateKey.generate()          # backend gerçekten destekliyor mu?
+    HAVE_MLKEM = True
+except Exception:  # noqa: BLE001 - ImportError/UnsupportedAlgorithm/AttributeError
+    _mlkem = None
+    HAVE_MLKEM = False
+
+_MLKEM768_EK = 1184   # ML-KEM-768 encapsulation key
+_MLKEM768_CT = 1088   # ML-KEM-768 ciphertext
+
+#: Bu istemcinin gerçekten key exchange yapabildiği gruplar. X25519MLKEM768
+#: (draft-kwiatkowski-tls-ecdhe-mlkem; Chrome 131+/Firefox 132+ varsayılanı)
+#: yalnızca kurulu ``cryptography`` ML-KEM sunuyorsa listelenir.
+SUPPORTED_GROUPS = (GROUP_X25519, GROUP_SECP256R1, GROUP_SECP384R1) + (
+    (GROUP_X25519MLKEM768,) if HAVE_MLKEM else ())
 
 GROUP_NAMES = {
     GROUP_X25519: "x25519",
@@ -83,6 +98,14 @@ def generate_key_share(group: int):
             serialization.Encoding.X962, serialization.PublicFormat.UncompressedPoint
         )
         return priv, pub
+    if group == GROUP_X25519MLKEM768 and HAVE_MLKEM:
+        # Hibrit: ML-KEM-768 encapsulation key (1184) || x25519 public (32).
+        kem = _mlkem.MLKEM768PrivateKey.generate()
+        xpriv = x25519.X25519PrivateKey.generate()
+        xpub = xpriv.public_key().public_bytes(
+            serialization.Encoding.Raw, serialization.PublicFormat.Raw
+        )
+        return (kem, xpriv), kem.public_key().public_bytes_raw() + xpub
     raise ValueError(f"key_share grubu desteklenmiyor: {group_name(group)}")
 
 
@@ -110,6 +133,15 @@ def compute_shared_secret(group: int, private_key, peer_public: bytes) -> bytes:
         except ValueError as e:
             raise ValueError(f"{group_name(group)} noktası eğri üzerinde değil: {e}") from e
         return private_key.exchange(ec.ECDH(), peer)
+    if group == GROUP_X25519MLKEM768 and HAVE_MLKEM:
+        # Sunucu payı: ML-KEM ciphertext (1088) || x25519 public (32);
+        # sır = mlkem_ss (32) || x25519_ss (32) (bu sırayla).
+        if len(peer_public) != _MLKEM768_CT + 32:
+            raise ValueError("X25519MLKEM768 sunucu payı 1120 byte olmalı.")
+        kem, xpriv = private_key
+        mlkem_ss = kem.decapsulate(bytes(peer_public[:_MLKEM768_CT]))
+        x_ss = compute_shared_secret(GROUP_X25519, xpriv, peer_public[_MLKEM768_CT:])
+        return bytes(mlkem_ss) + x_ss
     raise ValueError(f"key_share grubu desteklenmiyor: {group_name(group)}")
 
 

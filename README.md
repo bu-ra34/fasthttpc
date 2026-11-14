@@ -51,7 +51,7 @@ olarak iletilir).
 ## Kurulum
 
 ```bash
-git clone https://github.com/kullanici/fasthttpc
+git clone https://github.com/cevpy/fasthttpc
 cd fasthttpc
 pip install -e ".[dev]"
 pytest        # ağ gerektirmez
@@ -82,6 +82,23 @@ async def main():
 
 asyncio.run(main())
 ```
+
+### requests / httpx'ten geçiş
+
+`Response` requests/httpx alanlarını sunar: `r.status_code`, `r.headers`,
+`r.url`, `r.ok`, `r.reason`, `r.encoding`, `r.content` (bytes), `r.json()`,
+`r.raise_for_status()`, `r.history`, `r.elapsed` (saniye; `r.elapsed.total_seconds()`
+de çalışır).
+
+- `r.text` bir **property**'dir (`str`), requests'teki gibi; kodlama
+  Content-Type `charset`'inden gelir (yoksa `utf-8`, hatalı byte'lar `replace`),
+  `r.encoding = "latin-1"` ile değiştirilebilir. Geriye uyumluluk: dönen değer
+  çağrılabilir olduğundan eski `r.text()` ve `r.text(encoding="latin-1")` aynen
+  çalışır.
+- `r.json` requests'te olduğu gibi **metottur** (`r.json()`).
+- `requests.get(...)` yerine `Session`/`AsyncSession` kullanın; `verify=False`
+  desteklenmez (bkz. Güvenlik modeli), `proxies={...}` sözlüğü ve `timeout=`
+  (sayı veya `Timeout`) requests ile aynı biçimdedir.
 
 ### Timeout ve Limits
 
@@ -249,24 +266,52 @@ Bilinmeyen bir profil adı `ValueError` fırlatır; sessizce `default`'a düşme
 Bunlar bilinçli olarak eksiktir, sessiz hata değildir — hepsi açık hata mesajı
 verir veya belgelenmiştir:
 
-- **AsyncSession yalnızca HTTP/1.1 konuşur.** `impersonate` verilince TLS
-  sans-IO çekirdekle (`fasthttpc.tls13`) kurulur ve ClientHello parmak izi
-  senkron taraftakiyle aynıdır (JA3). ALPN `http/1.1` olarak sabit olduğundan
-  JA4'ün ALPN alanı profilden farklıdır. `impersonate=None` verilirse stdlib
-  `ssl` kullanılır. `AsyncSession.pre_warm` ve async WebSocket hâlâ stdlib
-  `ssl` kullanır.
-- **HTTP/2 multiplexing yok.** İstekler aynı bağlantıda sıralı gider.
-- **TLS 1.2 bilinçli olarak kapsam dışıdır.** fasthttpc yalnızca TLS 1.3
-  konuşur. Profiller gerçek tarayıcılar gibi `supported_versions` içinde
-  0x0303'ü ve TLS 1.2 cipher suite'lerini *ilan eder* (parmak izi doğruluğu
-  için), ama sunucu TLS 1.3 dışında bir sürüm seçerse bağlantı açık bir hatayla
-  reddedilir ("Sunucu TLS 1.2 ile yanıt verdi ..."). ServerHello.random'da
-  `DOWNGRD` işareti varsa olası downgrade saldırısı ayrıca belirtilir. Bu bir
-  downgrade yolu açmaz: TLS 1.2 handshake'i hiç implemente edilmemiştir.
-  Gerekçe: TLS 1.2 (RSA/ECDHE key exchange, CBC/GCM, renegotiation, ayrı PRF,
-  extended master secret) ikinci bir tam handshake yığını demektir ve saldırı
-  yüzeyini ikiye katlar; günümüzde TLS 1.3 desteklemeyen sunucu oranı düşüktür.
-  TLS 1.2-only sunucular için stdlib `ssl` tabanlı `AsyncSession` kullanılabilir.
+- **AsyncSession HTTP/2:** `impersonate` verilince ALPN profilin kendi listesidir
+  (`h2, http/1.1`; JA3 ve JA4 senkron taraftakiyle aynı). Sunucu `h2` seçerse
+  `fasthttpc.protocol.async_h2` ile gerçek multiplexing yapılır: aynı bağlantıda
+  eşzamanlı çok istek (`asyncio.gather`), akış kontrolü, SETTINGS, GOAWAY (işlenmeyen
+  stream'ler yeni bağlantıda yeniden denenir), RST_STREAM, PING ack. SETTINGS
+  kümesi/sırası senkron taraftan türetilir; pseudo-header sırası ve HPACK
+  kodlaması aynıdır. Sunucu `http/1.1` seçerse (veya `impersonate=None`, stdlib
+  `ssl`) HTTP/1.1 kullanılır. Async HTTP/1.1'de keep-alive havuzu vardır:
+  `(host, port, proxy, TLS yolu)` anahtarlı; `Connection: close`, HTTP/1.0,
+  EOF çerçeveli gövde, hata/iptal sonrası bağlantı havuza dönmez (slot yine de
+  serbest kalır). Havuzdan alınan bağlantı yanıttan hiç bayt gelmeden koparsa
+  (ve hata zaman aşımı değilse) istek bir kez taze bağlantıyla yeniden denenir;
+  zaman aşımı veya yarım yanıtta yeniden denenmez (POST çift gönderilmez).
+  `AsyncSession.pre_warm` ve `ws_connect` aynı bağlantı yolunu kullanır:
+  `impersonate` ile tarayıcı ClientHello'su (WebSocket'te ALPN yalnızca
+  `http/1.1`), `proxy=` / `proxies=` / rotasyon ile tünel üzerinden; `ws://` ve
+  `wss://` desteklenir. `pre_warm` ısıttığı HTTP/1.1 bağlantılarını keep-alive
+  havuzuna, h2 bağlantısını h2 önbelleğine koyar.
+- **AsyncSession proxy:** `proxy=` / `proxies=` senkron `Session` ile aynı
+  anlamdadır (HTTP CONNECT + Basic, SOCKS5 / RFC 1929; `https://` proxy yok).
+  Tünelin içinde hem `impersonate` (kendi TLS 1.3 yığını) hem stdlib `ssl`
+  çalışır; stdlib `ssl` + proxy Python 3.11+ gerektirir. `set_proxies([...])`
+  rotasyonu artık proxy'yi gerçekten kullanır ve `proxy=`'yi geçersiz kılar.
+  `AsyncSession` ayrıca `Timeout` (connect/read/write/pool; read, hareketsizlik
+  süresidir) ve `Limits` (`max_connections` = toplam eşzamanlı bağlantı,
+  `max_keepalive_connections`, `keepalive_expiry`) kabul eder. `max_connections`
+  kullanımdaki bağlantıları sınırlar; boştaki keep-alive bağlantılar slot
+  tutmaz ve `max_keepalive_connections` (varsayılan `max_connections`) ile
+  sınırlıdır. Async'te `keepalive_expiry=0` keep-alive'ı kapatır.
+- Async HTTP/2'de sunucu PUSH_PROMISE'i protokol hatasıdır (ENABLE_PUSH=0 ilan
+  edilir); öncelik (PRIORITY) gönderilmez, yok sayılır.
+- **TLS 1.2: yalnızca güvenli bir alt küme desteklenir** (`fasthttpc/security/tls12.py`,
+  hem senkron hem async yolda). TLS 1.3 tercih edilir; sunucu TLS 1.2 seçerse:
+  - *Desteklenen:* ECDHE (x25519, secp256r1, secp384r1) + ECDSA/RSA sertifika;
+    AES-128-GCM, AES-256-GCM, ChaCha20-Poly1305 (0xC02B, 0xC02F, 0xC02C, 0xC030,
+    0xCCA9, 0xCCA8); ServerKeyExchange imza algoritmaları ecdsa, rsa_pss_rsae ve
+    rsa_pkcs1 (SHA-256/384/512; ClientHello'da ilan edilenlerden biri olmalı).
+  - *Zorunlu:* Extended Master Secret (RFC 7627) ve renegotiation_info (RFC 5746);
+    sunucu birini göndermezse bağlantı reddedilir. Sertifika zinciri + hostname,
+    SKE imzası, Finished (sabit zamanlı), handshake mesaj sırası ve
+    ServerHello.random `DOWNGRD` işareti (downgrade saldırısı) denetlenir.
+  - *Reddedilen (açık hatayla):* CBC suite'leri, statik RSA, DHE, PSK, anonim/export,
+    SHA-1/MD5/SHA-224 imzalar, istemci sertifikası isteği (CertificateRequest),
+    null dışı sıkıştırma, TLS 1.1 ve altı. Renegotiation desteklenmez (HelloRequest'e
+    `no_renegotiation` uyarısı verilir, tekrarlanırsa bağlantı kapanır).
+  - *Kullanılmayan:* NewSessionTicket yalnızca ayrıştırılır; oturum devamı yoktur.
 - **HelloRetryRequest:** destekleniyor (RFC 8446 §4.1.4, cookie dahil); ikinci
   HRR handshake'i sonlandırır.
 - **Session resumption (PSK/0-RTT) yok.** Her bağlantı tam handshake yapar.
@@ -279,7 +324,7 @@ verir veya belgelenmiştir:
 - `Session` thread-safe değildir; thread başına bir tane kullanın.
 - **`verify=False` yok** (bilinçli; yukarıya bakın).
 - `Timeout.write` senkron tarafta ayrı uygulanmıyor (soket `read` zaman aşımını
-  kullanır); `AsyncSession` yalnızca tek bir `timeout` float'ı kabul eder.
+  kullanır); `AsyncSession` `write`'ı drain süresine uygular.
 
 ## Modül yapısı
 

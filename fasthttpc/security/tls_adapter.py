@@ -28,7 +28,9 @@ from ..crypto_math import (
     FastChaCha20Poly1305 as PureChaCha20Poly1305,
     FastAESGCM as PureAESGCM,
 )
-from ..tls_crafter import TLSImpersonator
+from ..tls_crafter import (
+    TLSImpersonator, alps_accepted, build_client_encrypted_extensions,
+)
 from .._log import get_logger
 from .alerts import describe_alert
 from .keyshare import (
@@ -201,8 +203,9 @@ def parse_server_hello(sh_msg: bytes, sent_session_id: bytes | None = None) -> d
         if random[24:32] in (b"DOWNGRD\x01", b"DOWNGRD\x00"):
             hint = " ServerHello.random DOWNGRD işareti taşıyor — olası downgrade saldırısı."
         raise TLSProtocolError(
-            "protocol_version: Sunucu TLS 1.3 (supported_versions=0x0304) müzakere etmedi. Bu istemci "
-            "TLS 1.2 ve altını desteklemez; downgrade kabul edilmiyor." + hint
+            "protocol_version: Sunucu TLS 1.3 (supported_versions=0x0304) müzakere etmedi ve TLS 1.2 "
+            "(0x0303) de seçmedi. Bu istemci yalnızca TLS 1.3 ve güvenli TLS 1.2 alt kümesini "
+            "destekler; TLS 1.1 ve altı reddedilir." + hint
         )
     # Sürüm kontrolünden SONRA: TLS 1.2 ServerHello'su session_id'mizi geri
     # göndermek zorunda değildir; önce kontrol edilirse kullanıcı TLS 1.2
@@ -316,6 +319,8 @@ class HandshakeOrderValidator:
         nxt = self._TRANSITIONS[self.state].get(hs_type)
         if nxt is None:
             name = self._NAMES.get(hs_type, f"tip {hs_type}")
+            if hs_type == 13:  # CertificateRequest: sunucu mTLS istiyor
+                raise _unexpected("Sunucu istemci sertifikası istedi (CertificateRequest) — desteklenmiyor.")
             raise _unexpected(f"{self.state} durumunda beklenmeyen handshake mesajı: {name}.")
         self.state = nxt
         return nxt
@@ -396,9 +401,10 @@ class EncryptedSocket:
         if not self.state.get("is_tls13"):
             raise ConnectionError("Yalnızca TLS 1.3 desteklenmektedir.")
         # RFC 8446 §5.1: TLSPlaintext.length <= 2^14 — büyük veriyi böl.
-        if len(data) > MAX_PLAINTEXT:
-            for i in range(0, len(data), MAX_PLAINTEXT):
-                self._send_one_record(data[i:i + MAX_PLAINTEXT], content_type, use_app_keys)
+        limit = self.state.get("send_limit", MAX_PLAINTEXT)  # sunucunun record_size_limit'i (RFC 8449)
+        if len(data) > limit:
+            for i in range(0, len(data), limit):
+                self._send_one_record(data[i:i + limit], content_type, use_app_keys)
             return
         self._send_one_record(data, content_type, use_app_keys)
 
@@ -453,9 +459,13 @@ class EncryptedSocket:
             rec_type, record_header, payload = self._read_raw_record()
 
             if rec_type == 20:  # change_cipher_spec — TLS 1.3'te uyumluluk için, yok say
+                # RFC 8446 §5: yalnızca tek byte 0x01 geçerli (el sıkışma sonrası CCS'in tolere edilmesi
+                # test_record_layer_perf tarafından bilinçli olarak korunuyor).
+                if payload != b"\x01":
+                    raise _unexpected("beklenmeyen/geçersiz change_cipher_spec record'u.")
                 continue
             if rec_type == 21:  # açık (şifresiz) alert
-                raise ConnectionError(f"Açık TLS Alert Alındı: {payload.hex()}")
+                raise ConnectionError(f"Açık (şifresiz) TLS alert alındı: {describe_alert(payload)}")
             if rec_type != 23:
                 raise _unexpected(f"şifreli bağlantıda beklenmeyen record tipi {rec_type}.")
 
@@ -580,26 +590,28 @@ class EncryptedSocket:
         bağlantıyı düşürmez (resumption bir optimizasyondur), yalnızca loglanır.
         Bir record'da birden fazla NewSessionTicket art arda gelebilir.
         """
-        rms = self.state.get("resumption_master_secret")
-        host = self.state.get("ticket_cache_key")
-        if not rms or not host:
-            return
-        pos = 0
-        while pos + 4 <= len(msg) and msg[pos] == 4:
-            end = pos + 4 + int.from_bytes(msg[pos + 1:pos + 4], "big")
-            try:
-                nst = session_tickets.parse_new_session_ticket(msg[pos:end])
-            except session_tickets.TicketError as e:
-                logger.debug("NewSessionTicket ayrıştırılamadı, yok sayıldı: %s", e)
-                return
-            ticket = session_tickets.ticket_from_message(
-                host, nst, rms, self.state.get("cipher_suite", 0),
-                peer_certificate=self.state.get("peer_certificate"),
-            )
-            if ticket is not None:
-                session_tickets.default_cache.put(ticket)
-                logger.debug("Oturum bileti önbelleğe alındı: host=%s lifetime=%ds", host, ticket.lifetime)
-            pos = end
+        session_tickets.store_new_session_tickets(
+            self.state.get("ticket_cache_key"), msg, self.state.get("resumption_master_secret"),
+            self.state.get("cipher_suite", 0), peer_certificate=self.state.get("peer_certificate"),
+        )
+
+
+def _parse_record_size_limit(hs_payload: bytes) -> int:
+    """EncryptedExtensions içindeki record_size_limit (ext 28, RFC 8449); yoksa 0."""
+    try:
+        total = struct.unpack("!H", hs_payload[4:6])[0]
+        cur, end = 6, min(6 + total, len(hs_payload))
+        while cur + 4 <= end:
+            et, el = struct.unpack("!HH", hs_payload[cur:cur + 4])
+            cur += 4
+            if et == 28:
+                if el != 2:
+                    raise _unexpected("decode_error: bozuk record_size_limit uzantısı.")
+                return struct.unpack("!H", hs_payload[cur:cur + 2])[0]
+            cur += el
+    except (struct.error, IndexError):
+        pass
+    return 0
 
 
 def _parse_alpn_from_encrypted_extensions(hs_payload: bytes) -> str:
@@ -625,6 +637,21 @@ def _parse_alpn_from_encrypted_extensions(hs_payload: bytes) -> str:
 def _read_server_hello(raw_socket: socket.socket, allow_ccs: bool = True) -> bytes:
     """Düz (şifresiz) handshake record'larından tam ServerHello mesajını toplar.
 
+    TLS 1.3'te ServerHello sonrasında aynı düz record'da veri kalması protokol
+    ihlalidir; bu sarmalayıcı onu reddeder (TLS 1.2 için bkz. ``_read_server_hello_ex``).
+    """
+    msg, trailing = _read_server_hello_ex(raw_socket, allow_ccs)
+    if trailing:
+        raise _unexpected("ServerHello sonrasında şifresiz handshake verisi.")
+    return msg
+
+
+def _read_server_hello_ex(raw_socket: socket.socket, allow_ccs: bool = True) -> tuple[bytes, bytes]:
+    """(ServerHello, aynı record'da onu izleyen handshake baytları). Ayrıntı: ``_read_server_hello``.
+
+    TLS 1.2 sunucuları ServerHello'yu Certificate/ServerKeyExchange ile AYNI record'a
+    koyabilir; TLS 1.2 yolu bu artık baytları devralır.
+
     ServerHello birden fazla record'a bölünebilir (RFC 8446 §5.1). Mesajdan
     sonra aynı düz record'da artık veri kalırsa (şifresiz EE vb.) reddedilir.
     allow_ccs: mesaj başlamadan önce gelen TEK bir uyumluluk CCS'si (0x01)
@@ -635,6 +662,8 @@ def _read_server_hello(raw_socket: socket.socket, allow_ccs: bool = True) -> byt
     while True:
         header = _recv_all(raw_socket, 5)
         rec_type, _ver, rec_len = struct.unpack("!BHH", header)
+        if header[:4] == b"HTTP":
+            raise TLSProtocolError("Sunucu TLS yerine düz HTTP ile yanıt verdi (bu port TLS konuşmuyor olabilir).")
         if rec_len > MAX_PLAINTEXT:
             raise TLSProtocolError(
                 f"record_overflow: düz record uzunluğu {rec_len} > {MAX_PLAINTEXT}."
@@ -657,22 +686,9 @@ def _read_server_hello(raw_socket: socket.socket, allow_ccs: bool = True) -> byt
             if total > _MAX_SERVER_HELLO:
                 raise TLSProtocolError("decode_error: ServerHello makul boyutu aşıyor.")
             if len(buf) == total:
-                return buf
+                return buf, b""
             if len(buf) > total:
-                raise _unexpected("ServerHello sonrasında şifresiz handshake verisi.")
-
-
-def _tls12_hint(sh_body: bytes) -> str:
-    """TLS 1.2 ServerHello'su için açıklayıcı ek mesaj (TLS 1.2 kapsam dışı)."""
-    if sh_body[:2] != b"\x03\x03":
-        return ""
-    if sh_body[26:34] in (b"DOWNGRD\x01", b"DOWNGRD\x00"):
-        # RFC 8446 §4.1.3: TLS 1.3 destekleyen sunucu daha düşük sürüm seçerse
-        # random'un son 8 byte'ına bu işareti koyar → aktif downgrade saldırısı.
-        return (" UYARI: ServerHello.random downgrade işareti (DOWNGRD) taşıyor — sunucu "
-                "TLS 1.3 destekliyor ama araya giren biri sürümü düşürmüş olabilir.")
-    return (" Sunucu TLS 1.2 ile yanıt verdi; TLS 1.3 desteklemiyor görünüyor. "
-            "TLS 1.2 bilinçli olarak kapsam dışıdır (README).")
+                return buf[:total], buf[total:]
 
 
 _SUITE_HASH = {0x1301: hashlib.sha256, 0x1302: hashlib.sha384, 0x1303: hashlib.sha256}
@@ -786,28 +802,25 @@ def _handle_hrr(raw_socket: socket.socket, impersonator: TLSImpersonator,
 class TLSAdapter:
     @staticmethod
     def negotiate(raw_socket: socket.socket, host: str, profile_name: str, *,
-                  ca_path: str | None = None) -> EncryptedSocket:
+                  ca_path: str | None = None, port: int | None = None) -> EncryptedSocket:
         """ca_path: None -> certifi + sistem CA'ları; aksi halde YALNIZCA o PEM dosyası."""
         impersonator = TLSImpersonator(host, profile=profile_name)
 
         # PSK resumption (faz4) — VARSAYILAN KAPALI; bkz. session_tickets.enable_resumption.
-        resumption_on = session_tickets.resumption_enabled()
         ticket_key = None
-        if resumption_on:
-            try:
-                peer_port = raw_socket.getpeername()[1]
-            except (OSError, IndexError, TypeError):
-                peer_port = None
-            ticket_key = session_tickets.cache_key(host, peer_port, ca_path)
-        ticket = session_tickets.default_cache.pop(ticket_key) if resumption_on else None
-        psk_hello = (
-            session_tickets.build_resumption_client_hello(impersonator, ticket) if ticket else None
-        )
-        if psk_hello is None:
-            ticket = None
-            record_bytes, priv_key, _c_rand = impersonator.build_client_hello()
-        else:
-            record_bytes, priv_key, _c_rand = psk_hello
+        if session_tickets.resumption_enabled():
+            # Hedef port: proxy tünelinde getpeername() PROXY'nin portunu verir; bu
+            # yüzden çağıran hedef portu ``port=`` ile geçirmeli (bilet anahtarı).
+            peer_port = port
+            if peer_port is None:
+                try:
+                    peer_port = raw_socket.getpeername()[1]
+                except (OSError, IndexError, TypeError):
+                    peer_port = None
+            ticket_key = session_tickets.resumption_key(host, peer_port, ca_path)
+        resumption_on = ticket_key is not None
+        record_bytes, priv_key, _c_rand, ticket = session_tickets.begin_resumption(
+            impersonator, ticket_key)
         sent_session_id = _client_hello_session_id(record_bytes)
 
         raw_socket.sendall(record_bytes)
@@ -828,7 +841,17 @@ class TLSAdapter:
         order = HandshakeOrderValidator()
 
         # ---- ServerHello ---------------------------------------------------
-        server_hello_payload = _read_server_hello(raw_socket)
+        server_hello_payload, sh_trailing = _read_server_hello_ex(raw_socket)
+
+        # TLS 1.2 seçildiyse (legacy_version 0x0303, supported_versions ≠ 0x0304)
+        # güvenli TLS 1.2 alt kümesine dallan (bkz. security/tls12.py).
+        from . import tls12
+        if tls12.is_tls12_server_hello(server_hello_payload):
+            return tls12.negotiate_tls12(
+                raw_socket, host, record_bytes, server_hello_payload, sh_trailing, ca_path=ca_path
+            )
+        if sh_trailing:
+            raise _unexpected("ServerHello sonrasında şifresiz handshake verisi.")
         sh = parse_server_hello(server_hello_payload, sent_session_id)
 
         hrr = None
@@ -864,22 +887,12 @@ class TLSAdapter:
                 "HRR sonrası ServerHello, HRR'de istenen gruptan farklı bir grup seçti."
             )
 
-        psk_accepted = psk_selected is not None
-        if psk_accepted and hrr is not None:
-            # HRR sonrası 2. ClientHello'da PSK teklif edilmiyor.
-            raise ConnectionError(
-                "Sunucu HRR sonrası teklif edilmemiş bir PSK'yı seçti — protokol ihlali."
-            )
+        try:
+            psk_accepted = session_tickets.check_psk_selection(
+                ticket, psk_selected, cipher_suite, hrr is not None)
+        except session_tickets.PskViolation as e:
+            raise ConnectionError(str(e)) from e
         order.psk_accepted = psk_accepted
-        if psk_accepted:
-            if ticket is None or psk_selected != 0:
-                raise ConnectionError(
-                    "Sunucu teklif etmediğimiz bir PSK kimliğini seçti — protokol ihlali."
-                )
-            if session_tickets._SUITE_HASH.get(cipher_suite) is not ticket.hash_alg:
-                raise ConnectionError(
-                    "Sunucu PSK'yı kabul etti ama biletin hash'iyle uyumsuz bir cipher suite seçti."
-                )
 
         state["is_tls13"] = True
         state["key_share_group"] = selected_group
@@ -914,6 +927,7 @@ class TLSAdapter:
         # EE -> (Certificate | CompressedCertificate) -> CertificateVerify -> Finished
         handshake_buffer = b""
         leaf_cert = None
+        send_client_ee = False
 
         while not order.done:
             msg, m_type = esock.recv_record()
@@ -944,6 +958,14 @@ class TLSAdapter:
 
                 if hs_type == _HS_ENCRYPTED_EXTENSIONS:
                     state["alpn"] = _parse_alpn_from_encrypted_extensions(hs_payload)
+                    send_client_ee = alps_accepted(
+                        impersonator.alps_advertised, hs_payload, state["alpn"])
+                    rsl = _parse_record_size_limit(hs_payload)
+                    if rsl:
+                        if rsl < 64:  # RFC 8449 §4
+                            raise TLSProtocolError(f"illegal_parameter: record_size_limit={rsl} < 64")
+                        # TLS 1.3'te sınır içerik tipi baytını da kapsar
+                        state["send_limit"] = min(MAX_PLAINTEXT, rsl - 1)
 
                 elif hs_type in (_HS_CERTIFICATE, _HS_COMPRESSED_CERTIFICATE, _HS_CERTIFICATE_VERIFY) \
                         and psk_accepted:
@@ -972,7 +994,9 @@ class TLSAdapter:
 
                 elif hs_type == _HS_CERTIFICATE_VERIFY:
                     try:
-                        scheme = verify_certificate_verify(hs_payload, leaf_cert, transcript_before)
+                        scheme = verify_certificate_verify(
+                            hs_payload, leaf_cert, transcript_before,
+                            offered_schemes=impersonator.profile.get("signature_algorithms"))
                     except CertificateValidationError as e:
                         raise ConnectionError(f"TLS kimlik doğrulaması başarısız: {e}") from e
                     logger.debug("CertificateVerify doğrulandı (scheme=0x%04x)", scheme)
@@ -996,13 +1020,20 @@ class TLSAdapter:
                 # Finished anahtar değişiminden önce record sınırında bitmeli (§5.1).
                 raise _unexpected("Finished sonrasında aynı record'da ek handshake verisi.")
 
-        # ---- Client Finished --------------------------------------------------
+        # ---- Client EncryptedExtensions (ALPS) + Client Finished ----------------
         hash_len = hash_func().digest_size
+        # Application secret'lar transcript'i SERVER Finished'a kadar kapsar.
         t_hash = hash_func(state["handshake_messages"]).digest()
+        if send_client_ee:
+            # Sunucu ALPS'i kabul etti: istemci EE'yi Finished'tan önce yollar
+            # (transcript'e girer; Finished MAC'i onu da kapsar).
+            client_ee = build_client_encrypted_extensions()
+            esock.send_record(client_ee, content_type=0x16, use_app_keys=False)
+            state["handshake_messages"] += client_ee
         f_key = PureCryptoEngine.tls13_hkdf_expand_label(
             state["client_hts"], "finished", b"", hash_len, hash_alg=hash_func
         )
-        mac = hmac.new(f_key, t_hash, hash_func).digest()
+        mac = hmac.new(f_key, hash_func(state["handshake_messages"]).digest(), hash_func).digest()
         finished_msg = b"\x14" + struct.pack("!I", len(mac))[1:] + mac
 
         esock.send_record(finished_msg, content_type=0x16, use_app_keys=False)

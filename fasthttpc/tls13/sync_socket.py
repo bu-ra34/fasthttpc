@@ -28,6 +28,11 @@ class SyncTLSSocket:
         **conn_kwargs,
     ) -> "SyncTLSSocket":
         """TLSAdapter.negotiate ile aynı imza (+ çekirdek kwargs: alpn, ca_path)."""
+        if conn_kwargs.get("port") is None:
+            try:
+                conn_kwargs["port"] = raw_socket.getpeername()[1]
+            except (OSError, IndexError, TypeError):
+                pass
         conn = TLSClientConnection(host, profile_name, **conn_kwargs)
         self = cls(raw_socket, conn)
         raw_socket.sendall(conn.initiate())
@@ -63,7 +68,18 @@ class SyncTLSSocket:
             data = self.raw_socket.recv(65536)
             if not data:
                 raise ConnectionResetError("TLS şifreli paket beklenirken bağlantı koptu!")
-            self._records.extend(self.conn.receive_data(data))
+            try:
+                self._records.extend(self.conn.receive_data(data))
+            except Exception:
+                # Hata öncesi kuyruğa alınan alert'ler (ör. TLS 1.2 fatal alert /
+                # no_renegotiation uyarıları) best-effort gönderilir.
+                try:
+                    out = self.conn.data_to_send()
+                    if out:
+                        self.raw_socket.sendall(out)
+                except OSError:
+                    pass
+                raise
             out = self.conn.data_to_send()      # ör. KeyUpdate yanıtı
             if out:
                 self.raw_socket.sendall(out)
