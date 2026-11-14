@@ -316,6 +316,8 @@ class HandshakeOrderValidator:
         nxt = self._TRANSITIONS[self.state].get(hs_type)
         if nxt is None:
             name = self._NAMES.get(hs_type, f"tip {hs_type}")
+            if hs_type == 13:  # CertificateRequest: sunucu mTLS istiyor
+                raise _unexpected("Sunucu istemci sertifikası istedi (CertificateRequest) — desteklenmiyor.")
             raise _unexpected(f"{self.state} durumunda beklenmeyen handshake mesajı: {name}.")
         self.state = nxt
         return nxt
@@ -396,9 +398,10 @@ class EncryptedSocket:
         if not self.state.get("is_tls13"):
             raise ConnectionError("Yalnızca TLS 1.3 desteklenmektedir.")
         # RFC 8446 §5.1: TLSPlaintext.length <= 2^14 — büyük veriyi böl.
-        if len(data) > MAX_PLAINTEXT:
-            for i in range(0, len(data), MAX_PLAINTEXT):
-                self._send_one_record(data[i:i + MAX_PLAINTEXT], content_type, use_app_keys)
+        limit = self.state.get("send_limit", MAX_PLAINTEXT)  # sunucunun record_size_limit'i (RFC 8449)
+        if len(data) > limit:
+            for i in range(0, len(data), limit):
+                self._send_one_record(data[i:i + limit], content_type, use_app_keys)
             return
         self._send_one_record(data, content_type, use_app_keys)
 
@@ -602,6 +605,24 @@ class EncryptedSocket:
             pos = end
 
 
+def _parse_record_size_limit(hs_payload: bytes) -> int:
+    """EncryptedExtensions içindeki record_size_limit (ext 28, RFC 8449); yoksa 0."""
+    try:
+        total = struct.unpack("!H", hs_payload[4:6])[0]
+        cur, end = 6, min(6 + total, len(hs_payload))
+        while cur + 4 <= end:
+            et, el = struct.unpack("!HH", hs_payload[cur:cur + 4])
+            cur += 4
+            if et == 28:
+                if el != 2:
+                    raise _unexpected("decode_error: bozuk record_size_limit uzantısı.")
+                return struct.unpack("!H", hs_payload[cur:cur + 2])[0]
+            cur += el
+    except (struct.error, IndexError):
+        pass
+    return 0
+
+
 def _parse_alpn_from_encrypted_extensions(hs_payload: bytes) -> str:
     """EncryptedExtensions (hs_type=8) içinden ALPN sonucunu çıkarır."""
     try:
@@ -635,6 +656,8 @@ def _read_server_hello(raw_socket: socket.socket, allow_ccs: bool = True) -> byt
     while True:
         header = _recv_all(raw_socket, 5)
         rec_type, _ver, rec_len = struct.unpack("!BHH", header)
+        if header[:4] == b"HTTP":
+            raise TLSProtocolError("Sunucu TLS yerine düz HTTP ile yanıt verdi (bu port TLS konuşmuyor olabilir).")
         if rec_len > MAX_PLAINTEXT:
             raise TLSProtocolError(
                 f"record_overflow: düz record uzunluğu {rec_len} > {MAX_PLAINTEXT}."
@@ -944,6 +967,12 @@ class TLSAdapter:
 
                 if hs_type == _HS_ENCRYPTED_EXTENSIONS:
                     state["alpn"] = _parse_alpn_from_encrypted_extensions(hs_payload)
+                    rsl = _parse_record_size_limit(hs_payload)
+                    if rsl:
+                        if rsl < 64:  # RFC 8449 §4
+                            raise TLSProtocolError(f"illegal_parameter: record_size_limit={rsl} < 64")
+                        # TLS 1.3'te sınır içerik tipi baytını da kapsar
+                        state["send_limit"] = min(MAX_PLAINTEXT, rsl - 1)
 
                 elif hs_type in (_HS_CERTIFICATE, _HS_COMPRESSED_CERTIFICATE, _HS_CERTIFICATE_VERIFY) \
                         and psk_accepted:
@@ -972,7 +1001,9 @@ class TLSAdapter:
 
                 elif hs_type == _HS_CERTIFICATE_VERIFY:
                     try:
-                        scheme = verify_certificate_verify(hs_payload, leaf_cert, transcript_before)
+                        scheme = verify_certificate_verify(
+                            hs_payload, leaf_cert, transcript_before,
+                            offered_schemes=impersonator.profile.get("signature_algorithms"))
                     except CertificateValidationError as e:
                         raise ConnectionError(f"TLS kimlik doğrulaması başarısız: {e}") from e
                     logger.debug("CertificateVerify doğrulandı (scheme=0x%04x)", scheme)

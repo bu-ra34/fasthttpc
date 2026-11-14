@@ -22,6 +22,7 @@ from .models.request  import Request
 from .models.response import Response, HTTPStatusError
 from .transport.connection_pool import ConnectionPool
 from .security.tls_adapter      import TLSAdapter
+from .security.alerts          import describe_alert
 from .protocol.http1_parser     import HTTP1Parser
 from .protocol.http2_parser     import Http2Connection, Http2StreamError, Http2ConnectionError
 from .metrics    import RequestMetrics
@@ -226,7 +227,7 @@ class Session:
             elif m_type == 21:
                 if msg == b"\x01\x00":  # close_notify
                     return b""
-                raise ConnectionError(f"Şifreli Alert: {msg.hex()}")
+                raise ConnectionError(f"Sunucudan şifreli TLS alert: {describe_alert(bytes(msg))}")
             # m_type == 22 buraya artık gelmez (skip_post_handshake yuttu)
 
                                                                               
