@@ -118,18 +118,13 @@ class H3TestServer:
         self.tcp_hits = 0
 
     def start(self):
-        if self.tcp:
-            # aynı numarayı hem TCP hem UDP için bul
-            for _ in range(50):
-                s = socket.socket(); s.bind(("127.0.0.1", 0)); p = s.getsockname()[1]; s.close()
-                u = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-                try:
-                    u.bind(("127.0.0.1", p)); u.close(); self.port = p; break
-                except OSError:
-                    u.close()
+        self._exc = None
         self._thread = threading.Thread(target=self._run, daemon=True)
         self._thread.start()
-        assert self._ready.wait(10), "sunucu başlamadı"
+        ok = self._ready.wait(10)
+        if self._exc is not None:           # iş parçacığındaki hatayı testte görünür kıl
+            raise RuntimeError(f"H3 test sunucusu başlamadı: {self._exc!r}") from self._exc
+        assert ok, "sunucu başlamadı (zaman aşımı)"
         return self
 
     def _run(self):
@@ -140,16 +135,33 @@ class H3TestServer:
         cfg.load_cert_chain(self.certfile, self.keyfile)
 
         async def main():
-            srv = await serve("127.0.0.1", self.port, configuration=cfg, create_protocol=_H3Server)
-            if self.port == 0:
-                self.port = srv._transport.get_extra_info("sockname")[1]
-            if self.tcp:
-                self._start_tcp()
+            srv = None
+            # Önce UDP; ``tcp=True`` ise aynı numarayı TCP için de bağlamayı dene, olmazsa başka
+            # UDP portu seç (TCP/UDP port uzayları ayrıdır ama bir başka sürecin TCP portu
+            # dolu olabilir; platforma özgü SO_REUSE* davranışına güvenilmez).
+            for _ in range(20):
+                srv = await serve("127.0.0.1", self.port, configuration=cfg, create_protocol=_H3Server)
+                if self.port == 0 or self.tcp:
+                    self.port = srv._transport.get_extra_info("sockname")[1]
+                if not self.tcp:
+                    break
+                try:
+                    self._start_tcp()
+                    break
+                except OSError:
+                    srv.close()
+                    self.port = 0
+            else:
+                raise OSError("aynı numarada TCP+UDP portu bulunamadı")
             self._stop = asyncio.Event()
             self._ready.set()
             await self._stop.wait()
             srv.close()
-        loop.run_until_complete(main())
+        try:
+            loop.run_until_complete(main())
+        except BaseException as e:      # noqa: BLE001 - start() yeniden fırlatır
+            self._exc = e
+            self._ready.set()
 
     def _start_tcp(self):
         outer = self
