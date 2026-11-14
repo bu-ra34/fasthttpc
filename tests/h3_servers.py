@@ -6,6 +6,7 @@ import datetime
 import http.server
 import json
 import socket
+import socketserver
 import ssl
 import threading
 
@@ -106,6 +107,19 @@ class _H3Server(QuicConnectionProtocol):
         self.transmit()
 
 
+class NoFqdnHTTPServer(http.server.ThreadingHTTPServer):
+    """ThreadingHTTPServer, ters DNS sorgusu YAPMADAN.
+
+    ``HTTPServer.server_bind()`` ``socket.getfqdn(host)`` çağırır; macOS CI runner'larında
+    127.0.0.1 için bu ters sorgu saniyelerce sürüp test sunucusunun başlama süresini
+    aşıyordu ("sunucu başlamadı (zaman aşımı)").
+    """
+
+    def server_bind(self):
+        socketserver.TCPServer.server_bind(self)
+        self.server_name, self.server_port = self.server_address[:2]
+
+
 class H3TestServer:
     """UDP'de H3; ``port=0`` -> boş port. ``tcp=True`` aynı numarada TCP h1 (Alt-Svc başlıklı)."""
 
@@ -185,7 +199,7 @@ class H3TestServer:
             def log_message(self, *a):
                 pass
 
-        httpd = http.server.ThreadingHTTPServer(("127.0.0.1", self.port), H)
+        httpd = NoFqdnHTTPServer(("127.0.0.1", self.port), H)
         ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
         ctx.minimum_version = ssl.TLSVersion.TLSv1_3
         ctx.load_cert_chain(*self.tcp_cert)
