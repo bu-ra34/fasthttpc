@@ -234,6 +234,131 @@ class _StaleConn(Exception):
         self.cause = cause
 
 
+class _BodyState:
+    """``_h1_iter_body`` sonucu: gövde sonrası artakalan bayt sayısı."""
+    extra = 0
+
+
+class _AsyncH1Stream:
+    """HTTP/1.1 akış gövdesi (async): bağlantının sahibi. Gövde bitince bağlantı
+    (yeniden kullanılabilirse) havuza döner; erken ``aclose()``/hata -> kapatılır."""
+
+    def __init__(self, session: "AsyncSession", opened: "_Opened", agen, state: _BodyState,
+                 reusable: bool):
+        self._s, self._o, self._gen, self._state = session, opened, agen, state
+        self._reusable = reusable
+        self._done = False
+
+    async def read_chunk(self) -> bytes:
+        if self._done:
+            return b""
+        try:
+            return await self._gen.__anext__()
+        except StopAsyncIteration:
+            self._done = True
+            await self._s._h1_finish(self._o, self._reusable and self._state.extra == 0)
+            return b""
+        except BaseException:
+            self.close_nowait()
+            raise
+
+    def close_nowait(self) -> None:
+        """Bağlantıyı eşzamanlı kapatır ve slotu iade eder (iptal güvenli)."""
+        if self._done:
+            return
+        self._done = True
+        _AsyncH1Stream._kill(self._o)
+
+    @staticmethod
+    def _kill(o: "_Opened") -> None:
+        try:
+            o.writer.close()
+        except (OSError, RuntimeError):
+            pass
+        o.release()
+
+    async def aclose(self) -> None:
+        if self._done:
+            return
+        self._done = True
+        try:
+            await self._gen.aclose()
+        except Exception:  # noqa: BLE001
+            pass
+        o = self._o
+        try:
+            o.writer.close()
+            await o.writer.wait_closed()
+        except (OSError, RuntimeError, asyncio.CancelledError):
+            pass
+        finally:
+            o.release()
+
+    def __del__(self):
+        try:
+            self.close_nowait()
+        except Exception:  # noqa: BLE001
+            pass
+
+
+class _AsyncH2Stream:
+    """HTTP/2 akış gövdesi (async): erken kapanış stream'i CANCEL ile iptal eder."""
+
+    def __init__(self, handle):
+        self._h = handle
+
+    async def read_chunk(self) -> bytes:
+        try:
+            return await self._h.read_chunk()
+        except (Http2StreamError, Http2ConnectionError) as e:
+            raise ConnectionError(f"HTTP/2 isteği başarısız: {e}") from e
+        except BaseException:
+            self._h.close_nowait()
+            raise
+
+    def close_nowait(self) -> None:
+        self._h.close_nowait()
+
+    async def aclose(self) -> None:
+        await self._h.aclose()
+
+    def __del__(self):
+        try:
+            self._h.close_nowait()
+        except Exception:  # noqa: BLE001
+            pass
+
+
+class _AsyncStreamContext:
+    """``AsyncSession.stream(...)``: ``async with s.stream("GET", url) as r:``."""
+
+    def __init__(self, session, method, url, kwargs):
+        self._args = (session, method, url, kwargs)
+        self._resp = None
+
+    async def __aenter__(self) -> Response:
+        session, method, url, kwargs = self._args
+        self._resp = await session.request(method, url, stream=True, **kwargs)
+        return self._resp
+
+    async def __aexit__(self, *exc) -> None:
+        if self._resp is not None:
+            await self._resp.aclose()
+
+
+async def _discard_stream(resp: Response) -> None:
+    """Yönlendirme gövdesini (küçükse) tüketip bağlantıyı korur; sonra kapatır."""
+    try:
+        n = 0
+        async for c in resp.aiter_raw():
+            n += len(c)
+            if n > 65536:
+                break
+    except Exception as e:  # noqa: BLE001
+        logger.debug("yönlendirme gövdesi okunamadı: %s", e)
+    await resp.aclose()
+
+
 class AsyncSession:
     """
     asyncio tabanlı async HTTP istemcisi.
@@ -679,7 +804,7 @@ class AsyncSession:
         return conn
 
     async def _exchange(self, method: str, u: URL, proxy: Optional[ProxyConfig],
-                        req_headers: dict, raw_body: bytes, metrics):
+                        req_headers: dict, raw_body: bytes, metrics, stream: bool = False):
         """Bağlantıyı bulur/kurar ve isteği h2 veya HTTP/1.1 ile yapar.
 
         ``(status, Headers, body_raw, send_time, http_version)`` döner.
@@ -709,14 +834,16 @@ class AsyncSession:
 
             if conn is not None:
                 try:
-                    return await self._h2_exchange(conn, method, u, req_headers, raw_body, metrics)
+                    return await self._h2_exchange(conn, method, u, req_headers, raw_body, metrics,
+                                                   stream=stream)
                 except H2StreamRefused as e:
                     if attempt == 0:
                         logger.debug("h2 stream işlenmedi, yeni bağlantıda yeniden: %s", e)
                         continue
                     raise ConnectionError(f"HTTP/2 isteği başarısız: {e}") from e
             try:
-                return await self._h1_exchange(opened, method, u, req_headers, raw_body, metrics)
+                return await self._h1_exchange(opened, method, u, req_headers, raw_body, metrics,
+                                               stream=stream)
             except _StaleConn as st:
                 # Havuzdaki bağlantı sunucu tarafında kapanmıştı ve yanıttan HİÇ bayt
                 # gelmedi: bir kez, taze bağlantıyla yeniden dene (zaman aşımı hariç).
@@ -726,7 +853,8 @@ class AsyncSession:
                     opened.release()
                     opened.writer.close()
                     raise ConnectionError("Beklenmeyen ALPN h2 (kaynak h1 olarak biliniyordu).") from st
-                return await self._h1_exchange(opened, method, u, req_headers, raw_body, metrics)
+                return await self._h1_exchange(opened, method, u, req_headers, raw_body, metrics,
+                                               stream=stream)
         raise ConnectionError("Tüm bağlantı denemeleri başarısız oldu.")  # pragma: no cover
 
     # RFC 7540 §8.1.2.2: bağlantıya özgü başlıklar h2'de yasaktır; Host -> :authority.
@@ -734,7 +862,7 @@ class AsyncSession:
                           "transfer-encoding", "upgrade"})
 
     async def _h2_exchange(self, conn: AsyncHttp2Connection, method: str, u: URL,
-                           req_headers: dict, raw_body: bytes, metrics):
+                           req_headers: dict, raw_body: bytes, metrics, stream: bool = False):
         h2_headers = [(k.lower(), str(v)) for k, v in req_headers.items()
                       if k.lower() not in self._H2_SKIP]
         host = f"[{u.host}]" if ":" in u.host else u.host
@@ -743,6 +871,15 @@ class AsyncSession:
             metrics.bytes_sent = len(raw_body) + sum(len(k) + len(v) for k, v in h2_headers)
         send_time = time.monotonic()
         try:
+            if stream:
+                h = await conn.request_stream(method, authority, u.raw_path.decode("latin-1"),
+                                              h2_headers, raw_body)
+                if metrics:
+                    metrics.first_byte_time = h.first_byte_time or time.monotonic()
+                headers = Headers()
+                for k, v in h.headers:
+                    headers.add(k, v)
+                return h.status, headers, _AsyncH2Stream(h), send_time, "HTTP/2"
             r = await conn.request(method, authority, u.raw_path.decode("latin-1"),
                                    h2_headers, raw_body)
         except H2StreamRefused:
@@ -775,77 +912,110 @@ class AsyncSession:
         Eksik gövde ConnectionResetError'dır. ``artakalan_bayt`` > 0 ise bağlantıda
         yanıta ait olmayan veri var demektir (bağlantı yeniden kullanılmamalı).
         """
+        state = _BodyState()
+        parts = [c async for c in AsyncSession._h1_iter_body(
+            reader, method, status, headers, first, read_to, state)]
+        return b"".join(parts), state.extra
+
+    @staticmethod
+    async def _h1_iter_body(reader, method: str, status: int, headers: Headers,
+                            first: bytes, read_to: Optional[float], state: "_BodyState",
+                            stream: bool = False):
+        """HTTP/1.1 gövdesini PARÇA PARÇA üretir (boş parça yok); sonunda
+        ``state.extra`` artakalan bayt sayısıdır. ``stream=False`` iken
+        bağlantı-kapanışlı (eof) gövdede 2 sn sessizlik gövdenin sonu sayılır
+        (eski HTTP/1.0 davranışı); akışta okuma zaman aşımı hata olur."""
         async def more() -> bytes:
-            return await B.wait_for(reader.read(4096), timeout=read_to)
+            return await B.wait_for(reader.read(65536), timeout=read_to)
 
         framing = AsyncSession._h1_framing(method, status, headers)
         if framing == "none":
-            return b"", len(first)      # gövde YOK: bağlantıdan veri beklenmez
+            state.extra = len(first)    # gövde YOK: bağlantıdan veri beklenmez
+            return
 
         buf = bytearray(first)
         if framing == "chunked":
-            out = bytearray()
-            pos = 0
-            while True:
-                nl = buf.find(b"\r\n", pos)
+            async def need_line() -> int:
+                nl = buf.find(b"\r\n")
                 while nl == -1:
                     c = await more()
                     if not c:
                         raise ConnectionResetError("Chunked gövde yarıda kesildi.")
                     buf.extend(c)
-                    nl = buf.find(b"\r\n", pos)
+                    nl = buf.find(b"\r\n")
+                return nl
+
+            while True:
+                nl = await need_line()
                 try:
-                    sz = int(bytes(buf[pos:nl]).split(b";")[0].strip(), 16)
+                    sz = int(bytes(buf[:nl]).split(b";")[0].strip(), 16)
                 except ValueError:
                     raise ConnectionError("Geçersiz chunk boyutu.") from None
-                pos = nl + 2
+                del buf[:nl + 2]
                 if sz == 0:
                     # trailer'lar (varsa) boş satıra kadar tüketilir: bağlantı temiz kalsın
                     while True:
-                        nl = buf.find(b"\r\n", pos)
-                        while nl == -1:
-                            c = await more()
-                            if not c:
-                                raise ConnectionResetError("Chunked gövde yarıda kesildi.")
-                            buf.extend(c)
-                            nl = buf.find(b"\r\n", pos)
-                        empty = nl == pos
-                        pos = nl + 2
+                        nl = await need_line()
+                        empty = nl == 0
+                        del buf[:nl + 2]
                         if empty:
-                            return bytes(out), len(buf) - pos
-                while len(buf) < pos + sz + 2:
+                            state.extra = len(buf)
+                            return
+                remaining = sz
+                while remaining > 0:
+                    if not buf:
+                        c = await more()
+                        if not c:
+                            raise ConnectionResetError("Chunked gövde yarıda kesildi.")
+                        buf.extend(c)
+                    take = min(remaining, len(buf))
+                    yield bytes(buf[:take])
+                    del buf[:take]
+                    remaining -= take
+                while len(buf) < 2:         # chunk sonu CRLF
                     c = await more()
                     if not c:
                         raise ConnectionResetError("Chunked gövde yarıda kesildi.")
                     buf.extend(c)
-                out.extend(buf[pos:pos + sz])
-                pos += sz + 2
-                if pos > 65536:             # işlenmiş kısmı at
-                    del buf[:pos]
-                    pos = 0
+                del buf[:2]
 
         if framing == "length":
             n = int(headers.get("content-length", "").strip())
-            while len(buf) < n:
+            got = 0
+            while True:
+                if buf:
+                    piece = bytes(buf[:n - got])
+                    got += len(piece)
+                    if len(buf) > len(piece):
+                        state.extra = len(buf) - len(piece)
+                    buf.clear()
+                    if piece:
+                        yield piece
+                if got >= n:
+                    return
                 c = await more()
                 if not c:
-                    raise ConnectionResetError(
-                        f"Yanıt gövdesi eksik: {len(buf)}/{n} bayt alındı.")
+                    raise ConnectionResetError(f"Yanıt gövdesi eksik: {got}/{n} bayt alındı.")
                 buf.extend(c)
-            return bytes(buf[:n]), len(buf) - n
 
+        if buf:
+            yield bytes(buf)
         while True:                          # bağlantı kapanana kadar (HTTP/1.0)
             try:
-                c = await B.wait_for(reader.read(4096), timeout=2.0)
-            except (ConnectionResetError, asyncio.TimeoutError):
-                break
+                c = await B.wait_for(reader.read(65536),
+                                           timeout=read_to if stream else 2.0)
+            except ConnectionResetError:
+                return
+            except asyncio.TimeoutError:
+                if stream:
+                    raise
+                return
             if not c:
-                break
-            buf.extend(c)
-        return bytes(buf), 0
+                return
+            yield c
 
     async def _h1_exchange(self, opened: "_Opened", method: str, u: URL,
-                           req_headers: dict, raw_body: bytes, metrics):
+                           req_headers: dict, raw_body: bytes, metrics, stream: bool = False):
         """Bağlantıda tek HTTP/1.1 isteği. Bağlantı yeniden kullanılabilirse havuza
         döner; aksi halde (Connection: close, HTTP/1.0, eof çerçeveli gövde, hata,
         iptal) kapatılır. Slot her durumda serbest bırakılır."""
@@ -901,6 +1071,25 @@ class AsyncSession:
                 k, _, v = line.partition(b":")
                 resp_headers._list.append((k.strip(), k.strip().lower(), v.strip()))
 
+            framing = self._h1_framing(method, status_code, resp_headers)
+            streamable = stream and framing != "none" and not (
+                framing == "length" and int(resp_headers.get("content-length", "0").strip()) == 0)
+            if streamable:
+                conn_tokens = {t.strip() for t in resp_headers.get("connection", "").lower().split(",")}
+                http10 = lines[0].upper().startswith(b"HTTP/1.0")
+                req_close = any(k.lower() == "connection" and "close" in str(v).lower()
+                                for k, v in req_headers.items())
+                reusable = (
+                    status_code != 101 and not req_close and "close" not in conn_tokens
+                    and (not http10 or "keep-alive" in conn_tokens) and framing != "eof")
+                state = _BodyState()
+                agen = self._h1_iter_body(reader, method, status_code, resp_headers,
+                                          first_body_chunk, read_to, state, stream=True)
+                finished = True          # bağlantıyı akış yönetir
+                return (status_code, resp_headers,
+                        _AsyncH1Stream(self, opened, agen, state, reusable),
+                        send_time, "HTTP/1.1")
+
             body_raw, extra = await self._h1_read_body(
                 reader, method, status_code, resp_headers, first_body_chunk, read_to)
 
@@ -935,8 +1124,10 @@ class AsyncSession:
         headers: Optional[dict]  = None,
         body:    bytes           = b"",
         metrics: Optional[RequestMetrics] = None,
+        stream:  bool            = False,
     ) -> Response:
-        """Tek async HTTP isteği (ALPN'e göre HTTP/2 veya HTTP/1.1)."""
+        """Tek async HTTP isteği (ALPN'e göre HTTP/2 veya HTTP/1.1).
+        ``stream=True``: gövde okunmadan döner (``aiter_*``/``aread``/``aclose``)."""
         u = URL(url) if isinstance(url, str) else url
 
         proxy_cfg, proxy = self._select_proxy(u)
@@ -972,19 +1163,26 @@ class AsyncSession:
 
         try:
             status_code, resp_headers, body_raw, send_time, http_version = await self._exchange(
-                method, u, proxy_cfg, req_headers, raw_body, metrics)
+                method, u, proxy_cfg, req_headers, raw_body, metrics, stream=stream)
 
+            is_stream = not isinstance(body_raw, (bytes, bytearray))
             if metrics:
                 metrics.transfer_end   = time.monotonic()
-                metrics.bytes_received = len(body_raw)
+                metrics.bytes_received = 0 if is_stream else len(body_raw)
                 metrics.total_end      = time.monotonic()
 
-            ce  = resp_headers.get("content-encoding", "").lower()
-            body_final = HTTP1Parser._decompress(bytes(body_raw), ce)
+            if is_stream:
+                body_final = b""
+            else:
+                ce  = resp_headers.get("content-encoding", "").lower()
+                body_final = HTTP1Parser._decompress(bytes(body_raw), ce)
 
             self._update_cookies(resp_headers, u)
 
-            resp = Response(status_code=status_code, headers=resp_headers, body=body_final)
+            if is_stream:
+                resp = Response(status_code=status_code, headers=resp_headers, astream=body_raw)
+            else:
+                resp = Response(status_code=status_code, headers=resp_headers, body=body_final)
             resp.http_version = http_version
             resp.url = str(url)
             if metrics and metrics.request_start:
@@ -996,7 +1194,7 @@ class AsyncSession:
             if status_code == 304 and cache_entry:
                 resp = cache_entry.response
 
-            if self._cache and method.upper() == "GET":
+            if self._cache and method.upper() == "GET" and not is_stream:
                 self._cache.store(url, method, resp)
 
             if proxy and self._rotator and metrics and metrics.first_byte_time:
@@ -1018,11 +1216,12 @@ class AsyncSession:
                                                                                 
     # --- Faz 5 kancaları: transport + retry -------------------------------
 
-    async def _send(self, method, url, headers=None, body=b"", metrics=None) -> Response:
+    async def _send(self, method, url, headers=None, body=b"", metrics=None,
+                    stream: bool = False) -> Response:
         """Tek isteği transport'a (verilmişse) ya da ağa gönderir."""
         if self.transport is None:
             return await self._raw_request(method, url, headers=headers, body=body,
-                                           metrics=metrics)
+                                           metrics=metrics, stream=stream)
         req_dict = await self._run_request_hooks(
             {"method": method, "url": url, "headers": headers or {}, "body": body}
         )
@@ -1055,6 +1254,7 @@ class AsyncSession:
                     return resp
                 attempt += 1
                 delay = retry.get_delay(attempt, resp)
+                await resp.aclose()      # akış yanıtıysa bağlantıyı bırak
             logger.debug("%d. yeniden deneme %.2fs sonra", attempt, delay)
             if delay:
                 await B.sleep(delay)
@@ -1068,7 +1268,10 @@ class AsyncSession:
         headers:         Optional[dict] = None,
         files:           Optional[dict] = None,
         allow_redirects: bool = True,
+        stream:          bool = False,
     ) -> Response:
+        """``stream=True``: gövde OKUNMADAN döner; ``async for c in r.aiter_bytes()``,
+        ``await r.aread()`` ile okunur, ``await r.aclose()`` (ya da ``async with``) ile bırakılır."""
         import json as jsonlib
 
         url = str(url)
@@ -1102,12 +1305,14 @@ class AsyncSession:
             attempt = 0
             while True:
                 resp = await self._send_with_retries(
-                    method, current_url, headers=h, body=body, metrics=metrics
+                    method, current_url, headers=h, body=body, metrics=metrics,
+                    stream=stream,
                 )
                 retrying = False
                 for plugin in retry_plugins:
                     if plugin.should_retry(resp, attempt):
                         delay = plugin.delay_for(resp, attempt)
+                        await resp.aclose()
                         logger.debug("HTTP %s alındı, %.2fs sonra tekrar denenecek",
                                      resp.status_code, delay)
                         if delay:
@@ -1133,6 +1338,8 @@ class AsyncSession:
 
             history.append(resp)
             metrics.redirect_count += 1
+            if stream:
+                await _discard_stream(resp)
 
             base = URL(current_url)
             location = _resolve_location(base, location)
@@ -1168,34 +1375,42 @@ class AsyncSession:
                 merged[k] = v
         return merged
 
-    async def get(self, url, headers: Optional[dict] = None, allow_redirects: bool = True) -> Response:
-        return await self.request("GET", url, headers=headers, allow_redirects=allow_redirects)
+    def stream(self, method: str, url, **kwargs):
+        """httpx tarzı: ``async with s.stream("GET", url) as r:`` — çıkışta kapanır."""
+        return _AsyncStreamContext(self, method, url, kwargs)
+
+    async def get(self, url, headers: Optional[dict] = None, allow_redirects: bool = True,
+                  stream: bool = False) -> Response:
+        return await self.request("GET", url, headers=headers, allow_redirects=allow_redirects,
+                                  stream=stream)
 
     async def post(self, url, data=None, json=None, headers: Optional[dict] = None,
-                   files=None, allow_redirects: bool = True) -> Response:
+                   files=None, allow_redirects: bool = True, stream: bool = False) -> Response:
         return await self.request("POST", url, data=data, json=json, headers=headers,
-                                  files=files, allow_redirects=allow_redirects)
+                                  files=files, allow_redirects=allow_redirects, stream=stream)
 
     async def put(self, url, data=None, json=None, headers: Optional[dict] = None,
-                  files=None, allow_redirects: bool = True) -> Response:
+                  files=None, allow_redirects: bool = True, stream: bool = False) -> Response:
         return await self.request("PUT", url, data=data, json=json, headers=headers,
-                                  files=files, allow_redirects=allow_redirects)
+                                  files=files, allow_redirects=allow_redirects, stream=stream)
 
     async def patch(self, url, data=None, json=None, headers: Optional[dict] = None,
-                    allow_redirects: bool = True) -> Response:
+                    allow_redirects: bool = True, stream: bool = False) -> Response:
         return await self.request("PATCH", url, data=data, json=json, headers=headers,
-                                  allow_redirects=allow_redirects)
+                                  allow_redirects=allow_redirects, stream=stream)
 
     async def delete(self, url, headers: Optional[dict] = None,
-                     allow_redirects: bool = True) -> Response:
-        return await self.request("DELETE", url, headers=headers, allow_redirects=allow_redirects)
+                     allow_redirects: bool = True, stream: bool = False) -> Response:
+        return await self.request("DELETE", url, headers=headers, allow_redirects=allow_redirects,
+                                  stream=stream)
 
     async def head(self, url, headers: Optional[dict] = None) -> Response:
         return await self.request("HEAD", url, headers=headers, allow_redirects=False)
 
     async def options(self, url, headers: Optional[dict] = None,
-                      allow_redirects: bool = True) -> Response:
-        return await self.request("OPTIONS", url, headers=headers, allow_redirects=allow_redirects)
+                      allow_redirects: bool = True, stream: bool = False) -> Response:
+        return await self.request("OPTIONS", url, headers=headers, allow_redirects=allow_redirects,
+                                  stream=stream)
 
                                                                                
 
