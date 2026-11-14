@@ -856,6 +856,15 @@ class Http2ConnectionError(Exception):
     pass
 
 
+class Http2RefusedError(Http2ConnectionError):
+    """Sunucu isteği İŞLEMEDİ (GOAWAY last_stream_id < stream, RFC 9113 §6.8).
+
+    İstek sunucuya hiç ulaşmamış sayılır; POST dahil yeni bir bağlantıda
+    yeniden denemek güvenlidir.
+    """
+    pass
+
+
 class Http2Connection:
     """
     Tek bir TCP/TLS bağlantısı üzerinde çalışan, gerçek istek/yanıt akışını
@@ -898,6 +907,9 @@ class Http2Connection:
         self._conn_window_recv = self.DEFAULT_WINDOW      # server'ın bize gönderebileceği (biz WINDOW_UPDATE yolladıkça artar)
         self._peer_settings = {"max_frame_size": 16384, "initial_window_size": self.DEFAULT_WINDOW}
         self._stream_windows: dict[int, int] = {}
+        # GOAWAY alındıysa (last_stream_id, error_code); bağlantı artık yeni
+        # stream açmak için kullanılmaz (RFC 9113 §6.8).
+        self.goaway: Optional[tuple[int, int]] = None
         self._pending_frames: list[HTTP2Frame] = []
         self._lock = threading.Lock()
         self.debug = debug or __import__("os").environ.get("FASTHTTPC_H2_DEBUG") == "1"
@@ -1019,6 +1031,28 @@ class Http2Connection:
             if not block:
                 break
 
+    def _on_goaway(self, frame: "HTTP2Frame", stream_id: int) -> None:
+        """GOAWAY'i işler (RFC 9113 §6.8).
+
+        last_stream_id >= stream_id ise sunucu bu stream'i işleyecek: yanıtı
+        okumaya devam edilir, bağlantı yalnızca yeniden kullanılmaz (sunucu
+        bakım/boşta kapatma için error_code=NO_ERROR ile gönderir). Aksi halde
+        istek işlenmedi -> Http2RefusedError (güvenle yeniden denenebilir).
+        """
+        p = frame.payload
+        if len(p) < 8:
+            raise Http2ConnectionError(f"Bozuk GOAWAY frame'i: {p!r}")
+        last_sid = struct.unpack("!I", p[:4])[0] & 0x7FFFFFFF
+        err = struct.unpack("!I", p[4:8])[0]
+        if self.goaway is None or last_sid < self.goaway[0]:
+            self.goaway = (last_sid, err)
+        if stream_id > last_sid:
+            raise Http2RefusedError(
+                f"Sunucu GOAWAY ile bağlantıyı kapatıyor (last_stream_id={last_sid}, "
+                f"error_code={err}); stream {stream_id} işlenmedi."
+            )
+        self._dbg(f"GOAWAY (last_stream_id={last_sid}, error={err}); stream {stream_id} tamamlanacak")
+
     def _await_window(self, stream_id: int, needed: int) -> None:
         """Gönderim penceresi açılana kadar sunucudan frame okur.
 
@@ -1036,7 +1070,7 @@ class Http2Connection:
                 pong = HTTP2Frame(len(frame.payload), FrameType.PING, 0x1, 0, frame.payload)
                 self.sock.send_record(pong.serialize())
             elif frame.type == FrameType.GOAWAY:
-                raise Http2ConnectionError(f"Gövde gönderilirken GOAWAY alındı: {frame.payload!r}")
+                self._on_goaway(frame, stream_id)
             elif frame.type == FrameType.RST_STREAM:
                 raise Http2StreamError(f"Stream {frame.stream_id} gövde gönderilirken sıfırlandı.")
             else:
@@ -1080,6 +1114,9 @@ class Http2Connection:
         Aynı bağlantı üzerinde ardışık çağrılabilir (her çağrı yeni stream_id alır).
         """
         with self._lock:
+            if self.goaway is not None:
+                raise Http2RefusedError(
+                    f"Bağlantı GOAWAY almış (last_stream_id={self.goaway[0]}); yeni stream açılmaz.")
             stream_id = self._next_id()
             self._dbg(f"--- REQUEST stream_id={stream_id} {method} {path} ---")
 
@@ -1119,7 +1156,7 @@ class Http2Connection:
                         pong = HTTP2Frame(len(frame.payload), FrameType.PING, 0x1, 0, frame.payload)
                         self.sock.send_record(pong.serialize())
                 elif frame.type == FrameType.GOAWAY:
-                    raise Http2ConnectionError(f"Sunucu GOAWAY gönderdi: {frame.payload!r}")
+                    self._on_goaway(frame, stream_id)
                 elif frame.type == FrameType.RST_STREAM:
                     err_code = struct.unpack("!I", frame.payload[:4])[0] if len(frame.payload) >= 4 else -1
                     err_names = {
