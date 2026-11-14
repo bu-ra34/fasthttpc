@@ -1596,6 +1596,7 @@ def iter_content(
     """
     from ..models.urls import URL as FURL
     from ..security.tls_adapter import TLSAdapter
+    from ..fingerprint import drop_h2_only_defaults, merge_default_headers, order_h1
 
     u    = FURL(url) if isinstance(url, str) else url
     req_headers = kwargs.get("headers", {})
@@ -1606,13 +1607,12 @@ def iter_content(
         conn.socket.raw_socket.settimeout(session.timeout)
         conn.tls_established = True
 
-    req_str = (
-        f"{method} {u.raw_path.decode()} HTTP/1.1\r\n"
-        f"Host: {u.host}\r\n"
-        f"Connection: keep-alive\r\n"
-        f"Accept-Encoding: gzip, deflate\r\n"
-    )
-    for k, v in req_headers.items():
+    pairs = [("Host", u.host), ("Connection", "keep-alive")]
+    pairs += merge_default_headers(
+        session.impersonate, session._merged_headers(req_headers))
+    req_str = f"{method} {u.raw_path.decode()} HTTP/1.1\r\n"
+    for k, v in order_h1(session.impersonate,
+                         drop_h2_only_defaults(session.impersonate, pairs)):
         req_str += f"{k}: {v}\r\n"
     req_str += "\r\n"
     conn.socket.send_record(req_str.encode("ascii"))
