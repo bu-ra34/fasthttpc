@@ -19,6 +19,18 @@ ya da ortam değişkeni FASTHTTPC_TLS_RESUMPTION=1.
 
 Yalnızca psk_dhe_ke modu kullanılır (her bağlantıda yine taze ECDHE; ileri
 gizlilik korunur). 0-RTT (early data) BİLEREK desteklenmez — replay'e açıktır.
+
+Senkron / async paylaşımı (KARAR): senkron yol (tls_adapter.negotiate) ve async
+sans-IO çekirdek (tls13/connection.py) AYNI süreç içi `default_cache`'i ve
+AYNI saf fonksiyonları (begin_resumption, check_psk_selection,
+store_new_session_tickets) kullanır. Bir bilet yalnızca anahtarı birebir
+eşleşen bağlantıda geçerlidir: (host, port, ca_path) — yani aynı güven kökünde
+doğrulanmış aynı hedef. Senkron alınan bilet bu yüzden async'te (ve tersi)
+kullanılabilir; bilet tek kullanımlık olduğundan iki yol aynı PSK'yı asla iki
+kez göndermez. İstisna: async çekirdeğe ÖZEL `cert_validator` verildiyse
+resumption hiç teklif edilmez ve bilet saklanmaz (kimliğin hangi güven
+kökünden geldiği bilinemez). Profil/ALPN anahtara girmez: sunucu ALPN'yi
+resumption'da yeniden seçer (EE) ve parmak izi güvenlik sınırı değildir.
 """
 from __future__ import annotations
 
@@ -375,3 +387,74 @@ def build_resumption_client_hello(impersonator, ticket: SessionTicket, now: Opti
     record = finalize_binder(record, ticket.psk, ticket.hash_alg)
     impersonator.last_client_hello = record
     return record, priv, rand
+
+
+# ---------------------------------------------------------------------------
+# Senkron (tls_adapter.negotiate) ve async sans-IO çekirdek (tls13/connection.py)
+# ORTAK saf mantık. İki yol da yalnızca bunları kullanır; PSK kuralları tek yerde.
+# ---------------------------------------------------------------------------
+class PskViolation(ValueError):
+    """Sunucunun PSK davranışı protokol ihlali (çağıran uygun hata tipine çevirir)."""
+
+
+def resumption_key(host: str, port=None, ca_path=None) -> Optional[str]:
+    """Bayrak açıksa cache_key, kapalıysa None (None = bu bağlantıda resumption yok)."""
+    return cache_key(host, port, ca_path) if _enabled else None
+
+
+def begin_resumption(impersonator, key: Optional[str]):
+    """ClientHello'yu kurar; key verilmiş ve önbellekte bilet varsa PSK'lı kurar.
+
+    Döner: (record, priv_key, client_random, ticket_or_None). Bilet TÜKETİLİR
+    (tek kullanımlık); profil PSK modlarını desteklemiyorsa bilet yine tüketilir
+    ve düz ClientHello kurulur. key=None -> düz ClientHello, önbelleğe dokunulmaz.
+    """
+    ticket = default_cache.pop(key) if key is not None else None
+    hello = build_resumption_client_hello(impersonator, ticket) if ticket is not None else None
+    if hello is None:
+        record, priv, rand = impersonator.build_client_hello()
+        return record, priv, rand, None
+    record, priv, rand = hello
+    return record, priv, rand, ticket
+
+
+def check_psk_selection(ticket: Optional[SessionTicket], selected_identity: Optional[int],
+                        cipher_suite: int, hello_retry: bool) -> bool:
+    """ServerHello pre_shared_key kararını doğrular. True = PSK kabul edildi.
+
+    PskViolation: HRR sonrası PSK seçimi (CH2'de PSK teklif edilmez), teklif
+    edilmemiş kimlik (bilet yok ya da selected_identity != 0), ya da biletin
+    hash'iyle uyumsuz cipher suite (RFC 8446 §4.2.11).
+    """
+    if selected_identity is None:
+        return False
+    if hello_retry:
+        raise PskViolation("Sunucu HRR sonrası teklif edilmemiş bir PSK'yı seçti — protokol ihlali.")
+    if ticket is None or selected_identity != 0:
+        raise PskViolation("Sunucu teklif etmediğimiz bir PSK kimliğini seçti — protokol ihlali.")
+    if _SUITE_HASH.get(cipher_suite) is not ticket.hash_alg:
+        raise PskViolation("Sunucu PSK'yı kabul etti ama biletin hash'iyle uyumsuz bir cipher suite seçti.")
+    return True
+
+
+def store_new_session_tickets(key: Optional[str], messages: bytes, resumption_master_secret: Optional[bytes],
+                              cipher_suite: int, peer_certificate=None) -> int:
+    """Ham NewSessionTicket mesaj(lar)ını (art arda olabilir, hs başlığı dahil)
+    ayrıştırıp önbelleğe koyar. Bozuk bilet sessizce bırakılır (resumption bir
+    optimizasyondur; bağlantı düşmez). Döner: saklanan bilet sayısı."""
+    if not resumption_master_secret or not key:
+        return 0
+    pos = stored = 0
+    while pos + 4 <= len(messages) and messages[pos] == 4:
+        end = pos + 4 + int.from_bytes(messages[pos + 1:pos + 4], "big")
+        try:
+            nst = parse_new_session_ticket(messages[pos:end])
+        except TicketError:
+            break
+        ticket = ticket_from_message(key, nst, resumption_master_secret, cipher_suite,
+                                     peer_certificate=peer_certificate)
+        if ticket is not None:
+            default_cache.put(ticket)
+            stored += 1
+        pos = end
+    return stored
