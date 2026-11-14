@@ -192,6 +192,7 @@ class Session:
 
         resp         = Response(status_code=status_code, headers=resp_headers, body=body_raw)
         resp.request = req
+        resp.http_version = "HTTP/2"
         if metrics:
             metrics.total_end = time.monotonic()
             resp.metrics = metrics
@@ -206,7 +207,13 @@ class Session:
     def _read_app_data(self, conn) -> bytes:
         """Sadece Application Data döner; post-handshake handshake mesajları
         (NewSessionTicket vb.) TLS katmanında yutulur."""
+        dl = conn.conn_data.get("deadline")
         while True:
+            if dl is not None:
+                kalan = dl - time.monotonic()
+                if kalan <= 0:
+                    raise TimeoutError("İstek toplam süre sınırını (Timeout.total) aştı.")
+                conn.socket.raw_socket.settimeout(min(self.timeout.read_timeout, kalan))
             msg, m_type = conn.socket.recv_record(skip_post_handshake=True)
             if m_type == 23:
                 return msg
@@ -218,49 +225,65 @@ class Session:
 
                                                                               
 
+    @staticmethod
+    def _body_framing(method: str, status_code: int, headers: Headers) -> str:
+        """Yanıt gövdesinin çerçevelenme biçimi (RFC 9112 §6.3).
+
+        ``"none"`` (HEAD, 1xx, 204, 304: gövde YOK, bağlantıdan veri beklenmez),
+        ``"chunked"``, ``"length"`` ya da ``"eof"`` (bağlantı kapanana kadar).
+        """
+        if method.upper() == "HEAD" or status_code in (204, 304) or 100 <= status_code < 200:
+            return "none"
+        if "chunked" in headers.get("transfer-encoding", "").lower():
+            return "chunked"
+        cl = headers.get("content-length", "").strip()
+        if cl.isdigit():
+            return "length"
+        return "eof"
+
     def _collect_body(
         self,
         conn,
         first_body_chunk: bytes,
         headers: Headers,
         metrics: RequestMetrics | None = None,
+        framing: str | None = None,
     ) -> bytes:
         """
         Headers parse edildikten sonra body'yi güvenilir biçimde toplar.
-        
+
         Chunked: proper chunk state-machine (TLS record boundary sorununu çözer)
-        Content-Length: tam miktar okunana kadar devam et
-        Bilinmiyor: bağlantı kapanana kadar oku (HTTP/1.0 compat)
+        Content-Length: tam miktar okunana kadar devam et; eksik gelirse
+        ``ConnectionResetError`` (sessizce kısaltılmış gövde DÖNMEZ).
+        Bilinmiyor: bağlantı kapanana kadar oku (HTTP/1.0 uyumu). Bu modda
+        close_notify'sız TCP kapanışı normal sayılır (çoğu HTTP/1.0 sunucusu
+        TLS'i düzgün kapatmaz; tarayıcılar/curl da böyle davranır).
         """
-        te = headers.get("transfer-encoding", "").lower()
-        is_chunked = "chunked" in te
-
-        cl_str = headers.get("content-length", "")
-        content_length: int | None = None
-        if cl_str:
-            try:
-                content_length = int(cl_str.strip())
-            except ValueError:
-                pass
-
-                                                                              
-        if is_chunked:
+        if framing is None:
+            framing = self._body_framing("GET", 200, headers)
+        if framing == "none":
+            return b""
+        if framing == "chunked":
             return self._collect_chunked(conn, first_body_chunk)
 
-                                                                               
-        if content_length is not None:
+        if framing == "length":
+            content_length = int(headers.get("content-length", "").strip())
             body = bytearray(first_body_chunk)
             while len(body) < content_length:
                 chunk = self._read_app_data(conn)
                 if not chunk:
-                    break
+                    raise ConnectionResetError(
+                        f"Yanıt gövdesi eksik: {len(body)}/{content_length} bayt alındı."
+                    )
                 body.extend(chunk)
             return bytes(body[:content_length])
 
-                                                                              
         body = bytearray(first_body_chunk)
         while True:
-            chunk = self._read_app_data(conn)
+            try:
+                chunk = self._read_app_data(conn)
+            except ConnectionResetError:
+                break  # close_notify'sız EOF: bağlantı-kapanışlı gövdenin sonu
             if not chunk:
                 break
             body.extend(chunk)
@@ -285,7 +308,7 @@ class Session:
                                      
                 more = self._read_app_data(conn)
                 if not more:
-                    return bytes(result)                    
+                    raise ConnectionResetError("Chunked gövde yarıda kesildi.")
                 buf.extend(more)
 
             size_line = bytes(buf[pos:nl]).split(b";")[0].strip()
@@ -294,19 +317,31 @@ class Session:
             try:
                 chunk_size = int(size_line, 16)
             except ValueError:
-                break
+                raise ConnectionError(f"Geçersiz chunk boyutu: {size_line[:20]!r}") from None
 
             if chunk_size == 0:
-                break                  
+                # Trailer satırlarını ve kapanış boş satırını TÜKET; aksi hâlde
+                # artan baytlar keep-alive bağlantıda bir sonraki yanıtı bozar.
+                while True:
+                    nl = buf.find(b"\r\n", pos)
+                    while nl == -1:
+                        more = self._read_app_data(conn)
+                        if not more:
+                            raise ConnectionResetError("Chunked gövde yarıda kesildi.")
+                        buf.extend(more)
+                        nl = buf.find(b"\r\n", pos)
+                    bos = nl == pos
+                    pos = nl + 2
+                    if bos:
+                        break
+                break
 
                                                                            
             end = pos + chunk_size
             while len(buf) < end + 2:                      
                 more = self._read_app_data(conn)
                 if not more:
-                                                    
-                    result.extend(buf[pos:])
-                    return bytes(result)
+                    raise ConnectionResetError("Chunked gövde yarıda kesildi.")
                 buf.extend(more)
 
             result.extend(buf[pos:end])
@@ -390,6 +425,7 @@ class Session:
 
             conn = None
             is_new_conn = False
+            got_bytes = False
             try:
                 conn = self.pool.acquire(req.url, timeout=self.timeout.pool)
                 is_new_conn = not conn.tls_established
@@ -436,6 +472,9 @@ class Session:
 
                 if metrics: metrics.bytes_sent = len(raw_bytes)
 
+                total = self.timeout.total
+                if total is not None:
+                    conn.conn_data["deadline"] = time.monotonic() + total
                 conn.socket.send_record(raw_bytes)
                 send_time = time.monotonic()
 
@@ -443,12 +482,14 @@ class Session:
                 # bytearray + kaldığı yerden arama: header'lar çok record'a bölünse
                 # bile birleştirme/arama doğrusal kalır.
                 header_acc  = bytearray()
+                got_bytes   = False   # yanıttan en az 1 bayt geldi mi (yeniden deneme güvenliği)
                 first_byte  = True
                 sep         = -1
                 while True:
                     chunk = self._read_app_data(conn)
                     if not chunk:
                         break
+                    got_bytes = True
                     if first_byte and metrics:
                         metrics.first_byte_time = time.monotonic()
                         first_byte = False
@@ -490,10 +531,10 @@ class Session:
 
                                                                            
                                                                     
-                if req.method.upper() == "HEAD":
-                    body_raw = b""
-                else:
-                    body_raw = self._collect_body(conn, first_body_chunk, resp_headers, metrics)
+                framing  = self._body_framing(req.method, status_code, resp_headers)
+                body_raw = self._collect_body(conn, first_body_chunk, resp_headers, metrics, framing)
+                if conn.conn_data.pop("deadline", None) is not None:
+                    conn.socket.raw_socket.settimeout(self.timeout.read_timeout)
 
                 if metrics:
                     metrics.transfer_end   = time.monotonic()
@@ -527,8 +568,16 @@ class Session:
                 if self._cache and method.upper() == "GET":
                     self._cache.store(str(url), method, resp)
 
-                if "close" in resp_headers.get("connection", "").lower():
+                conn_hdr = resp_headers.get("connection", "").lower()
+                http10   = lines[0].upper().startswith(b"HTTP/1.0")
+                if ("close" in conn_hdr or framing == "eof"
+                        or (http10 and "keep-alive" not in conn_hdr)):
+                    # Yeniden kullanılamaz: kapat VE havuza iade et. release()
+                    # kapalı bağlantıyı havuza koymaz ama semaphore slotunu
+                    # geri verir; atlanırsa max_connections kadar "close"
+                    # yanıtından sonra havuz kalıcı kilitlenir.
                     conn.close()
+                    self.pool.release(conn)
                 else:
                     self.pool.release(conn)
 
@@ -544,10 +593,13 @@ class Session:
                     conn.close()
                     self.pool.release(conn)  # close() semaphore'a dokunmaz
                     conn = None
-                    if not is_new_conn:
+                    if (not is_new_conn and not got_bytes
+                            and not isinstance(e, TimeoutError)):
                         # Yeniden kullanılan bağlantı sunucu tarafında kapanmış
-                        # olabilir; bu idempotent olmayan istekler için de
-                        # güvenlidir çünkü sunucu isteği hiç görmemiştir.
+                        # olabilir; yanıttan HİÇ bayt gelmediyse ve hata zaman aşımı
+                        # değilse yeniden denemek güvenlidir. Zaman aşımı (sunucu
+                        # isteği işliyor olabilir) ya da yarım yanıt YENİDEN
+                        # DENENMEZ: POST çift gönderilir, bekleme süresi katlanır.
                         retry_count += 1
                         logger.debug("Bayat bağlantı, yeniden deneniyor (%s)", e)
                         continue
