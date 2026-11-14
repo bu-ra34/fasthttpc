@@ -131,7 +131,7 @@ def parse_set_cookie(header_value: str, request_host: str, request_path: str) ->
 class CookieJar:
     """Domain/path/secure kurallarına uyan basit cookie deposu."""
 
-    def __init__(self):
+    def __init__(self) -> None:
         self._cookies: dict[tuple[str, str, str], Cookie] = {}
         # Session thread'ler arasında paylaşılabilir: sözlük, başka bir thread
         # eklerken yinelenirse "dictionary changed size during iteration" olur.

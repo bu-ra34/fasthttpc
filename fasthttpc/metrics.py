@@ -4,7 +4,7 @@ FAZ 1 — Per-request metrik objesi (resp.metrics)
 from __future__ import annotations
 import time
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import Any, Optional
 
 
 @dataclass
@@ -13,7 +13,7 @@ class RequestMetrics:
     Tek bir HTTP isteğinin zaman ve boyut ölçümlerini tutar.
     resp.metrics ile erişilir.
 
-    Zaman damgaları: monotonic (float, saniye)
+    Zaman damgaları: time.perf_counter (float, saniye; Windows'ta monotonic ~15,6 ms çözünürlüklüdür)
     """
                      
     request_start:     float = 0.0                      
@@ -93,7 +93,7 @@ class RequestMetrics:
             f"rx={self.bytes_received}B>"
         )
 
-    def to_dict(self) -> dict:
+    def to_dict(self) -> dict[str, Any]:
         return {
             "total_ms":         round(self.total_time, 2),
             "ttfb_ms":          round(self.ttfb, 2),

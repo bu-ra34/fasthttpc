@@ -11,11 +11,11 @@ import typing
 _HDR_ENCODING = "latin-1"
 
 
-class Headers(MutableMapping):
+class Headers(MutableMapping[str, str]):
     """
     HTTP Header'ları için case-insensitive, sıralı multi-dict yapısı.
     """
-    def __init__(self, headers: typing.Optional[typing.Union[dict, list]] = None):
+    def __init__(self, headers: typing.Optional[typing.Union[dict[typing.Any, typing.Any], list[typing.Any]]] = None):
                                      
         self._list: list[tuple[bytes, bytes, bytes]] = []
         
@@ -84,7 +84,7 @@ class Headers(MutableMapping):
             raise KeyError(key)
         self._list = new_list
 
-    def __iter__(self):
+    def __iter__(self) -> typing.Iterator[str]:
                                 
         seen = set()
         for _, l_key, _ in self._list:
@@ -93,7 +93,7 @@ class Headers(MutableMapping):
                 yield l_key.decode(_HDR_ENCODING, errors="replace")
 
     def __len__(self) -> int:
-        return len(list(self.__iter__()))
+        return len(set(l_key for _, l_key, _ in self._list))
 
     def get_list(self, key: str) -> list[str]:
         """Aynı key'den birden fazla varsa hepsini döndür (örn: Set-Cookie)."""

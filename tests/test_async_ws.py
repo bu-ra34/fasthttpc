@@ -10,6 +10,7 @@ from cryptography.hazmat.primitives import serialization
 from fasthttpc import AsyncSession, Timeout
 from fasthttpc.protocol.http2_parser import WebSocketFrame
 
+from netutil import start_dual
 from async_fakes import AsyncFakeProxy, start_tls13
 from tls13_fakeserver import PKI, http_responder
 
@@ -79,7 +80,7 @@ class WSServer:
             self.ctx.set_alpn_protocols(["http/1.1"])
 
     async def start(self):
-        self.server = await asyncio.start_server(self._on_conn, "127.0.0.1", 0, ssl=self.ctx)
+        self.server = await start_dual(self._on_conn, ssl=self.ctx)
         self.port = self.server.sockets[0].getsockname()[1]
         return self
 

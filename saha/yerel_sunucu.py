@@ -11,6 +11,10 @@ Yollar (sorgu parametreleri ``?k=v``):
   /setcookie?i=X   Set-Cookie: cX=vX (çerez kavanozu yarış testi)
   /sleep?d=SN      SN saniye bekleyip yanıtla
   /drip?n=N&d=SN   N parça, her biri arası SN sn (toplam süre N*SN)
+  /gen?n=BAYT      n bayt, 64 KB bloklarla ÜRETİLİP akıtılır (bellekte tutulmaz; Content-Length)
+  /chunkgen?n=BAYT aynısı, Transfer-Encoding: chunked
+  /lines?n=N&d=SN  chunked; N satır ("satir-i\\n"), her biri SN sn arayla ayrı chunk'ta
+  /gzlines?n=N     gzip'li (Content-Encoding) N satır, Content-Length, parça parça gönderilir
   /cut             Content-Length 1000 vaat edip 10 bayt gönderip kapatır (close_notify'sız)
   /cutn            aynısı, ama temiz TLS kapanışıyla (close_notify)
   /trailer         chunked + trailer, kapanış satırı ayrı TLS kaydında
@@ -110,13 +114,29 @@ class YerelSunucu:
         self.sock.bind(("127.0.0.1", 0))
         self.sock.listen(256)
         self.port = self.sock.getsockname()[1]
+        # ::1'de de AYNI portta dinle (varsa): "localhost"u önce ::1'e çözen istemciler (Windows)
+        # bağlantıyı ilk denemede kurar. IPv6 yoksa / port doluysa sessizce yalnız IPv4.
+        self.sock6 = None
+        try:
+            s6 = socket.socket(socket.AF_INET6, socket.SOCK_STREAM)
+            try:
+                s6.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 1)
+                s6.bind(("::1", self.port))
+                s6.listen(256)
+                self.sock6 = s6
+            except OSError:
+                s6.close()
+        except OSError:
+            pass
         self.kabul_edilen_baglanti = 0   # kaç TCP bağlantısı kabul edildi
         self.istek_sayisi = 0
         self.acik_baglanti = 0
         self._kilit = threading.Lock()
         self._dur = False
         self._soketler: set = set()
-        threading.Thread(target=self._kabul_dongusu, daemon=True).start()
+        for ls in (self.sock, self.sock6):
+            if ls is not None:
+                threading.Thread(target=self._kabul_dongusu, args=(ls,), daemon=True).start()
 
     @property
     def url(self) -> str:
@@ -124,10 +144,12 @@ class YerelSunucu:
 
     def durdur(self) -> None:
         self._dur = True
-        try:
-            self.sock.close()
-        except OSError:
-            pass
+        for ls in (self.sock, self.sock6):
+            try:
+                if ls is not None:
+                    ls.close()
+            except OSError:
+                pass
         with self._kilit:
             for s in list(self._soketler):
                 try:
@@ -143,10 +165,10 @@ class YerelSunucu:
         self.durdur()
 
     # ------------------------------------------------------------------
-    def _kabul_dongusu(self) -> None:
+    def _kabul_dongusu(self, ls) -> None:
         while not self._dur:
             try:
-                raw, _ = self.sock.accept()
+                raw, _ = ls.accept()
             except OSError:
                 return
             threading.Thread(target=self._baglanti, args=(raw,), daemon=True).start()
@@ -240,6 +262,39 @@ class YerelSunucu:
         elif yol == "/big":
             self._gonder(s, "200 OK", [("Content-Type", "application/octet-stream")],
                          govde_uret(int(q["n"])))
+        elif yol == "/gen":
+            n = int(q["n"])
+            blok = govde_uret(65536)
+            s.sendall(f"HTTP/1.1 200 OK\r\nContent-Length: {n}\r\n\r\n".encode())
+            kalan = n
+            while kalan > 0:
+                p = blok[:kalan]
+                s.sendall(p)
+                kalan -= len(p)
+        elif yol == "/chunkgen":
+            n = int(q["n"])
+            blok = govde_uret(65536)
+            s.sendall(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n")
+            kalan = n
+            while kalan > 0:
+                p = blok[:kalan]
+                s.sendall(b"%x\r\n" % len(p) + p + b"\r\n")
+                kalan -= len(p)
+            s.sendall(b"0\r\n\r\n")
+        elif yol == "/lines":
+            n, d = int(q.get("n", "3")), float(q.get("d", "0.3"))
+            s.sendall(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n")
+            for i in range(n):
+                p = f"satir-{i}\n".encode()
+                s.sendall(b"%x\r\n" % len(p) + p + b"\r\n")
+                time.sleep(d)
+            s.sendall(b"0\r\n\r\n")
+        elif yol == "/gzlines":
+            n = int(q.get("n", "50"))
+            z = gzip.compress("".join(f"satir-{i}\n" for i in range(n)).encode())
+            s.sendall(f"HTTP/1.1 200 OK\r\nContent-Encoding: gzip\r\nContent-Length: {len(z)}\r\n\r\n".encode())
+            for i in range(0, len(z), 7):
+                s.sendall(z[i:i + 7])
         elif yol == "/chunked":
             i = q.get("i", "x")
             parcalar = [b"parca1-", b"parca2-", i.encode()]
@@ -273,6 +328,15 @@ class YerelSunucu:
         elif yol == "/cutn":
             # Eksik gövde + TEMİZ TLS kapanışı (close_notify): sessiz kısaltma tuzağı
             s.sendall(b"HTTP/1.1 200 OK\r\nContent-Length: 1000\r\n\r\n0123456789")
+            s.settimeout(0.5)
+            try:
+                s.unwrap()
+            except (OSError, ssl.SSLError):
+                pass
+            return False
+        elif yol == "/hdrcut":
+            # Başlık bloğu (CRLF CRLF) HİÇ tamamlanmadan temiz TLS kapanışı
+            s.sendall(b"HTTP/1.1 200 OK\nContent-Length: 1000\n\n0123456789")
             s.settimeout(0.5)
             try:
                 s.unwrap()

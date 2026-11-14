@@ -55,15 +55,12 @@ from .tls_tools     import (
     TLSDowngradeDetector,
     ClientHelloEntropyScorer,
 )
-from .async_session import (
-    Plugin,
-    RetryPlugin,
-    LoggingPlugin,
-    RateLimitPlugin,
-    ProxyRotator,
-)
+from .async_session import ProxyRotator
+from .plugins import Plugin, RetryPlugin, LoggingPlugin, RateLimitPlugin
+from .auth import Auth, BasicAuth, BearerAuth, DigestAuth
+from ._api import USE_CLIENT_DEFAULT
 
-__version__ = "0.5.0"
+__version__ = "0.6.0"
 __author__  = "Buğra"
 __all__ = [
     "Session",
@@ -97,4 +94,9 @@ __all__ = [
     "LoggingPlugin",
     "RateLimitPlugin",
     "ProxyRotator",
+    "Auth",
+    "BasicAuth",
+    "BearerAuth",
+    "DigestAuth",
+    "USE_CLIENT_DEFAULT",
 ]

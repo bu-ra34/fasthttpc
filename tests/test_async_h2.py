@@ -15,6 +15,7 @@ from fasthttpc.protocol.http2_parser import (
     FrameType, HpackDecoder, Http2Connection,
 )
 
+from netutil import start_dual
 from async_fakes import PREFACE, AsyncFakeProxy, RawH2Conn, start_h2
 from tls13_fakeserver import PKI, FakeTLS13Server
 
@@ -182,7 +183,7 @@ def test_h2_http11_secilirse_eski_yol(pki, ca):
             srv = FakeTLS13Server(pki, alpn="http/1.1")
             servers.append(srv)
             await async_serve(srv, r, w, http_responder(b"h1 yolu"))
-        srv = await asyncio.start_server(on_conn, "127.0.0.1", 0)
+        srv = await start_dual(on_conn)
         port = srv.sockets[0].getsockname()[1]
         async with srv:
             s = sess(ca)
@@ -547,24 +548,30 @@ def test_h2_ping_ack(pki, ca):
 def test_h2_iptal_rst_stream_cancel_gonderir(pki, ca):
     got = {}
 
-    async def script(c):
-        await c.handshake()
-        f = await c.next_frame(FrameType.HEADERS)
-        r = await c.next_frame(FrameType.RST_STREAM)
-        got["rst"] = (r.stream_id, struct.unpack("!I", r.payload)[0], f.stream_id)
-        while await c.next_frame() is not None:
-            pass
-
     async def main():
+        headers_seen, rst_seen = asyncio.Event(), asyncio.Event()
+
+        async def script(c):
+            await c.handshake()
+            f = await c.next_frame(FrameType.HEADERS)
+            headers_seen.set()
+            r = await c.next_frame(FrameType.RST_STREAM)
+            got["rst"] = (r.stream_id, struct.unpack("!I", r.payload)[0], f.stream_id)
+            rst_seen.set()
+            while await c.next_frame() is not None:
+                pass
+
         srv, port, conns = await start_h2(pki, script)
         async with srv:
             s = sess(ca, timeout=30)
             t = asyncio.ensure_future(s.get(f"https://localhost:{port}/"))
-            await asyncio.sleep(0.3)
+            # Sabit uyku yerine sunucunun HEADERS'ı aldığını bekle: bağlantı süresi (örn. Windows'ta
+            # localhost -> ::1 denemesi) isteğin iptalden ÖNCE gönderilmiş olmasını bozmasın.
+            await asyncio.wait_for(headers_seen.wait(), 10)
             t.cancel()
             with pytest.raises(asyncio.CancelledError):
                 await t
-            await asyncio.sleep(0.2)
+            await asyncio.wait_for(rst_seen.wait(), 5)
             assert got["rst"] == (1, 8, 1)                   # CANCEL
             await s.close()
     run(main())
@@ -854,7 +861,7 @@ async def _h2lib_server(pki, delay=0.0, big=b""):
                 t.cancel()
             w.close()
 
-    server = await asyncio.start_server(on_conn, "127.0.0.1", 0)
+    server = await start_dual(on_conn)
     return server, server.sockets[0].getsockname()[1], state
 
 

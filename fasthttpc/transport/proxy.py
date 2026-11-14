@@ -26,6 +26,7 @@ from typing import Mapping, Optional, Union
 from urllib.parse import unquote, urlsplit
 
 from .._log import get_logger
+from .happy_eyeballs import CONNECTION_ATTEMPT_DELAY, create_connection
 
 logger = get_logger("proxy")
 
@@ -222,7 +223,7 @@ def connect_via_proxy(proxy: ProxyConfig, host: str, port: int,
     Dönen soket üzerinde doğrudan ``TLSAdapter.negotiate`` çalıştırılabilir.
     """
     try:
-        sock = socket.create_connection((proxy.host, proxy.port), timeout=timeout)
+        sock = create_connection((proxy.host, proxy.port), timeout=timeout)
     except OSError as e:
         raise ProxyError(f"Proxy'ye bağlanılamadı ({proxy.host}:{proxy.port}): {e}") from e
     try:
@@ -370,19 +371,35 @@ async def async_open_tunnel(reader, writer, proxy: ProxyConfig, host: str, port:
 
 
 async def async_connect_via_proxy(proxy: ProxyConfig, host: str, port: int,
-                                  timeout: Optional[float] = 30.0):
+                                  timeout: Optional[float] = 30.0,
+                                  progress: Optional[dict] = None):
     """Proxy'ye bağlanır, tüneli kurar; (reader, writer) döner.
 
     ``timeout`` TCP bağlantısı + tünel kurulumu için toplam süredir. Dönen akış
     üzerinde ``AsyncTLSStream.negotiate`` veya ``writer.start_tls`` çalıştırılır.
+    ``progress`` verilirse proxy'ye TCP bağlantısı kurulunca ``progress["proxy_tcp"] = True``
+    yazılır: aynı süreli bir DIŞ zaman aşımı içindeki çağıran, süre bu aşamada dolduysa onu da
+    ProxyError'a çevirebilsin (iki zamanlayıcı aynı anda dolunca dışarıdaki kazanır).
     """
     import asyncio
+    import time
 
-    async def _go():
-        try:
-            reader, writer = await asyncio.open_connection(proxy.host, proxy.port)
-        except OSError as e:
-            raise ProxyError(f"Proxy'ye bağlanılamadı ({proxy.host}:{proxy.port}): {e}") from e
+    from .. import _backend as B
+
+    # Senkron ``connect_via_proxy`` ile aynı anlam: proxy'ye TCP bağlantısı kurulamaması —
+    # reddedilme de, connect süresinin dolması da (Windows'ta kapalı porta bağlanma reddi ~2 sn
+    # sonra bildirilir) — ProxyError'dır. Tünel aşamasının zaman aşımı ham TimeoutError kalır.
+    t0 = time.perf_counter()
+    try:
+        reader, writer = await B.wait_for(B.open_connection(proxy.host, proxy.port), timeout)
+    except (OSError, asyncio.TimeoutError) as e:
+        raise ProxyError(f"Proxy'ye bağlanılamadı ({proxy.host}:{proxy.port}): "
+                         f"{str(e) or type(e).__name__}") from e
+    if progress is not None:
+        progress["proxy_tcp"] = True
+    left = None if timeout is None else max(0.0, timeout - (time.perf_counter() - t0))
+
+    async def _tunnel():
         try:
             await async_open_tunnel(reader, writer, proxy, host, port)
         except BaseException:
@@ -390,4 +407,4 @@ async def async_connect_via_proxy(proxy: ProxyConfig, host: str, port: int,
             raise
         return reader, writer
 
-    return await asyncio.wait_for(_go(), timeout)
+    return await B.wait_for(_tunnel(), left)

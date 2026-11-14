@@ -57,6 +57,29 @@ def test_eksik_content_length_govdesi_hata_verir(sv, sess, yol):
     assert sess.get(sv.url + "/id?i=x").content == b"x"  # havuz sağlam
 
 
+def test_baslik_blogu_tamamlanmadan_kapanis_hata_verir(sv, sess):
+    """Başlıklar CRLF CRLF ile bitmeden bağlantı kapanırsa yanıt GEÇERSİZDİR.
+
+    Eskiden senkron yol bu yarım bloğu (sep=-1) yanıt sayıp ``200`` + çöp gövde dönüyordu
+    (Windows CI'da openssl s_server dosyayı metin kipinde okuyup CRLF'leri LF yaptığında
+    yakalandı). Async yol zaten hata veriyordu."""
+    with pytest.raises(ConnectionError, match="başlık"):
+        sess.get(sv.url + "/hdrcut")
+    assert sess.get(sv.url + "/id?i=x").content == b"x"
+
+
+def test_baslik_blogu_tamamlanmadan_kapanis_hata_verir_async(sv):
+    import asyncio
+
+    from fasthttpc import AsyncSession
+
+    async def main():
+        async with AsyncSession(verify=sv.ca_path, timeout=3) as s:
+            with pytest.raises(ConnectionError, match="başlık"):
+                await s.get(sv.url + "/hdrcut")
+    asyncio.run(main())
+
+
 def test_zaman_asimi_yeniden_denenmez(sv):
     """Yeniden kullanılan bağlantıda read timeout eskiden isteği ikinci kez gönderiyordu."""
     with Session(verify=sv.ca_path, timeout=1, max_connections=2) as s:
