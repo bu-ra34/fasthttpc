@@ -274,6 +274,8 @@ class AsyncSession:
         proxy                         = None,
         resolver                      = None,
         headers                       = None,
+        *,
+        cert                          = None,
     ):
         # impersonate verilirse TLS, fasthttpc.tls13 çekirdeğiyle (tarayıcı
         # ClientHello'su) kurulur ve profilin ALPN'i (h2, http/1.1) kullanılır;
@@ -281,6 +283,13 @@ class AsyncSession:
         # impersonate=None -> stdlib ssl, yalnızca HTTP/1.1.
         from .session import _proxy_spec
         self.impersonate   = impersonate
+        # mTLS (oturum düzeyi): yol | (cert, key) | (cert, key, parola) | ClientCert
+        from .security.client_cert import ClientCert
+        self.client_cert   = ClientCert.coerce(cert)
+        self._owns_cert    = self.client_cert is not None and not isinstance(cert, ClientCert)
+        if self.client_cert is not None and impersonate is None:
+            # impersonate=None yolu stdlib ssl kullanır; sertifikayı SESSİZCE yok saymak yerine reddet.
+            raise ValueError("cert= (mTLS) için impersonate verilmelidir (impersonate=None desteklemez).")
         # Oturum düzeyi varsayılan başlıklar (mutable; Session ile aynı öncelik:
         # profil başlıkları < headers < istek başlıkları; None değer kaldırır).
         self.headers       = Headers(headers)
@@ -314,6 +323,11 @@ class AsyncSession:
             self._cache = None
 
                                                                                
+
+    def _origin_key(self, u: URL, proxy) -> tuple:
+        """h2/protokol önbelleği anahtarı; mTLS'de sertifika kimliği anahtara girer."""
+        k = (u.host, u.port, proxy)
+        return k + (self.client_cert.identity,) if self.client_cert is not None else k
 
     @property
     def cookies(self) -> dict[str, str]:
@@ -394,7 +408,7 @@ class AsyncSession:
             o = _Opened(reader, writer, alpn, lambda: None, key=self._h1_key(u, proxy_cfg),
                         loop=asyncio.get_running_loop())
             try:
-                key = (u.host, u.port, proxy_cfg)
+                key = self._origin_key(u, proxy_cfg)
                 if alpn == "h2":
                     if self._h2_get(key) is None:
                         await self._start_h2(key, o)
@@ -456,13 +470,13 @@ class AsyncSession:
                 if proxy is None:
                     stream = await AsyncTLSStream.connect(
                         host, port, self.impersonate, server_hostname=sni,
-                        ca_path=self._ca_path, **kw)
+                        ca_path=self._ca_path, client_cert=self.client_cert, **kw)
                 else:
                     reader, writer = await async_connect_via_proxy(proxy, host, port, timeout=connect_to)
                     try:
                         stream = await AsyncTLSStream.negotiate(
                             reader, writer, sni, self.impersonate, ca_path=self._ca_path,
-                            port=port, **kw)   # bilet anahtarı: proxy'nin değil hedefin portu
+                            port=port, client_cert=self.client_cert, **kw)   # bilet anahtarı: proxy'nin değil hedefin portu
                     except BaseException:
                         writer.close()
                         raise
@@ -510,7 +524,8 @@ class AsyncSession:
         return release
 
     def _h1_key(self, u: URL, proxy: Optional[ProxyConfig]) -> tuple:
-        return (u.host, u.port, proxy, self.impersonate is not None)
+        k = (u.host, u.port, proxy, self.impersonate is not None)
+        return k + (self.client_cert.identity,) if self.client_cert is not None else k
 
     @staticmethod
     def _conn_dead(o: "_Opened") -> bool:
@@ -670,7 +685,7 @@ class AsyncSession:
 
         ``(status, Headers, body_raw, send_time, http_version)`` döner.
         """
-        key = (u.host, u.port, proxy)
+        key = self._origin_key(u, proxy)
         for attempt in (0, 1):
             conn = self._h2_get(key)
             opened = None
@@ -1241,7 +1256,9 @@ class AsyncSession:
             if c.loop is running:
                 await c.close()
         if self.transport is not None:
-            self.transport.close()                                         
+            self.transport.close()
+        if self.client_cert is not None and self._owns_cert:
+            self.client_cert.close()          # özel anahtar referansını bırak
 
     async def __aenter__(self):
         return self

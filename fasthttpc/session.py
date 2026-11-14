@@ -31,6 +31,7 @@ from .cache      import ResponseCache
 from .buffer     import AdaptiveReceiver, get_pool
 from .timeout    import Timeout
 from .config     import Limits, resolve_verify
+from .security.client_cert import ClientCert
 from .retry      import Retry
 from .multipart  import encode_multipart
 from .cookies    import CookieJar
@@ -98,6 +99,10 @@ class Session:
                          verilirse istekler ağ yerine buna gönderilir.
         limits:          Opsiyonel :class:`~fasthttpc.config.Limits`; verilirse
                          ``max_connections`` parametresini geçersiz kılar.
+        cert:            İstemci sertifikası (mTLS), YALNIZCA oturum düzeyinde: ``"client.pem"``
+                         (sertifika+anahtar), ``("cert.pem", "key.pem")``, ``("cert.pem", "key.pem",
+                         "parola")`` veya ``ClientCert.from_pkcs12(yol, parola)``. Bağlantı havuzu ve
+                         TLS bilet önbelleği anahtarına sertifika kimliği girer.
         headers:         Oturum düzeyi varsayılan başlıklar (``s.headers`` ile
                          değiştirilebilir). Öncelik: profilin tarayıcı
                          başlıkları < ``headers`` < istek başlıkları; değeri
@@ -126,8 +131,14 @@ class Session:
         proxies                                       = None,
         proxy                                         = None,
         headers                                       = None,
+        *,
+        cert                                          = None,
     ):
         self.impersonate   = impersonate
+        # mTLS (oturum düzeyi): cert= yol | (cert, key) | (cert, key, parola) | ClientCert.
+        # Yükleme hatası burada (kurucuda) ClientCertError(ValueError) olarak yükselir.
+        self.client_cert   = ClientCert.coerce(cert)
+        self._owns_cert    = self.client_cert is not None and not isinstance(cert, ClientCert)
         # Oturum düzeyi varsayılan başlıklar (requests gibi mutable): profilin
         # tarayıcı başlıklarını geçersiz kılar, istek başlıkları bunları.
         self.headers       = Headers(headers)
@@ -145,6 +156,7 @@ class Session:
             timeout=self.timeout.connect_timeout,
             resolver=resolver,
             proxy=_proxy_spec(proxy, proxies),
+            tls_scope=self.client_cert.identity if self.client_cert is not None else None,
         )
         self.limits.apply_to_pool(self.pool)
         self.cookie_jar = CookieJar()
@@ -468,6 +480,7 @@ class Session:
                     conn.socket = TLSAdapter.negotiate(
                         conn.socket, req.url.host, self.impersonate,
                         ca_path=self._ca_path, port=req.url.port,
+                        **({"client_cert": self.client_cert} if self.client_cert is not None else {}),
                     )
                     conn.socket.raw_socket.settimeout(self.timeout.read_timeout)
                     conn.tls_established = True
@@ -819,7 +832,8 @@ class Session:
     def pre_warm(self, hosts: list[str], count: int = 2) -> dict[str, int]:
         return self.pool.prewarm(
             hosts, count=count,
-            tls_negotiate_fn=functools.partial(TLSAdapter.negotiate, ca_path=self._ca_path),
+            tls_negotiate_fn=functools.partial(TLSAdapter.negotiate, ca_path=self._ca_path,
+                                               client_cert=self.client_cert),
             impersonate=self.impersonate,
         )
 
@@ -858,6 +872,8 @@ class Session:
 
     def close(self) -> None:
         self.pool.close_all()
+        if self.client_cert is not None and self._owns_cert:
+            self.client_cert.close()          # özel anahtar referansını bırak
         if self.transport is not None:
             self.transport.close()
 
