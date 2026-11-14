@@ -266,3 +266,25 @@ def test_session_proxies_dict_end_to_end_with_hrr(trust_leaf):
         r = s.get("https://example.com/")
     assert r.status_code == 200
     srv.close()
+
+
+def test_psk_bilet_anahtari_proxy_degil_hedef_portu(trust_leaf, monkeypatch):
+    """Proxy tünelinde bilet önbelleği anahtarı HEDEF portu içermeli (proxy'ninkini değil);
+    aksi halde aynı proxy arkasındaki aynı host'un farklı portları bileti paylaşır."""
+    from fasthttpc.security import session_tickets
+    anahtarlar = []
+    gercek = session_tickets.resumption_key
+
+    def kaydet(host, port=None, ca_path=None):
+        anahtarlar.append((host, port))
+        return gercek(host, port, ca_path)
+
+    monkeypatch.setattr(session_tickets, "_enabled", True)
+    monkeypatch.setattr(session_tickets, "resumption_key", kaydet)
+    srv = FakeTLS13Server()
+    px = FakeProxy("http", upstream_port=srv.port)
+    with Session(impersonate="chrome_131", proxy=f"http://{px.url_base}") as s:
+        r = s.get("https://example.com:8443/")
+    assert r.status_code == 200
+    srv.close()
+    assert anahtarlar == [("example.com", 8443)], anahtarlar

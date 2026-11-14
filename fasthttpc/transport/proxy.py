@@ -235,3 +235,159 @@ def connect_via_proxy(proxy: ProxyConfig, host: str, port: int,
         sock.close()
         raise
     return sock
+
+
+# ---- asyncio sürümü -------------------------------------------------------------
+# Aşağıdaki saf fonksiyonlar (bayt üretimi / yanıt ayrıştırma) ve asyncio
+# sarmalayıcıları, yukarıdaki senkron ``http_connect`` / ``socks5_connect`` ile
+# AYNI wire formatını üretir ve aynı hata mesajlarını verir (testlerle sabitlenir).
+
+def build_connect_request(proxy: ProxyConfig, host: str, port: int) -> bytes:
+    """HTTP CONNECT isteğinin baytlarını üretir (Basic auth dahil)."""
+    target = _host_header(host, port)
+    lines = [f"CONNECT {target} HTTP/1.1", f"Host: {target}"]
+    if proxy.username is not None:
+        cred = f"{proxy.username}:{proxy.password or ''}".encode("utf-8")
+        lines.append("Proxy-Authorization: Basic " + base64.b64encode(cred).decode("ascii"))
+    lines.append("Proxy-Connection: keep-alive")
+    return ("\r\n".join(lines) + "\r\n\r\n").encode("ascii")
+
+
+def check_connect_response(head: bytes) -> None:
+    """CONNECT yanıt başlıklarını doğrular; başarısızsa :class:`ProxyError`."""
+    status_line = bytes(head).split(b"\r\n", 1)[0].decode("latin-1")
+    parts = status_line.split(" ", 2)
+    if len(parts) < 2 or not parts[0].startswith("HTTP/") or not parts[1].isdigit():
+        raise ProxyError(f"Geçersiz proxy yanıtı: {status_line!r}")
+    code = int(parts[1])
+    if code == 407:
+        raise ProxyError(
+            "Proxy kimlik doğrulaması gerekli/başarısız (407). Proxy URL'inde "
+            "kullanıcı:parola verin."
+        )
+    if not 200 <= code < 300:
+        raise ProxyError(f"Proxy CONNECT reddedildi: {status_line}")
+
+
+def socks5_greeting(proxy: ProxyConfig) -> bytes:
+    methods = [0x02, 0x00] if proxy.username is not None else [0x00]
+    return bytes([0x05, len(methods)]) + bytes(methods)
+
+
+def socks5_auth_request(proxy: ProxyConfig) -> bytes:
+    if proxy.username is None:
+        raise ProxyError("SOCKS5 proxy kullanıcı/parola istedi ama verilmedi.")
+    user = proxy.username.encode("utf-8")
+    pwd = (proxy.password or "").encode("utf-8")
+    if len(user) > 255 or len(pwd) > 255:
+        raise ProxyError("SOCKS5 kullanıcı adı/parola 255 byte'ı aşamaz.")
+    return bytes([0x01, len(user)]) + user + bytes([len(pwd)]) + pwd
+
+
+def socks5_connect_request(host: str, port: int) -> bytes:
+    try:
+        ip = ipaddress.ip_address(host)
+        addr = (b"\x01" if ip.version == 4 else b"\x04") + ip.packed
+    except ValueError:
+        name = host.encode("idna")
+        if len(name) > 255:
+            raise ProxyError("SOCKS5 için host adı çok uzun.")
+        addr = b"\x03" + bytes([len(name)]) + name
+    return b"\x05\x01\x00" + addr + struct.pack("!H", port)
+
+
+def _socks5_check_method(method_reply: bytes, proxy: ProxyConfig) -> int:
+    ver, method = method_reply
+    if ver != 0x05:
+        raise ProxyError(f"SOCKS5 değil (sürüm={ver}).")
+    if method == 0xFF:
+        raise ProxyError("SOCKS5 proxy teklif edilen kimlik doğrulama yöntemlerini kabul etmedi.")
+    if method not in (0x00, 0x02):
+        raise ProxyError(f"SOCKS5 proxy desteklenmeyen yöntem seçti: {method}")
+    return method
+
+
+async def async_http_connect(reader, writer, proxy: ProxyConfig, host: str, port: int) -> None:
+    """asyncio akışı üzerinde HTTP CONNECT tüneli kurar."""
+    import asyncio
+    writer.write(build_connect_request(proxy, host, port))
+    await writer.drain()
+    try:
+        head = await reader.readuntil(b"\r\n\r\n")
+    except asyncio.IncompleteReadError as e:
+        raise ProxyError("Proxy CONNECT yanıtı tamamlanmadan bağlantıyı kapattı.") from e
+    except asyncio.LimitOverrunError as e:
+        raise ProxyError("Proxy CONNECT yanıt başlıkları çok büyük.") from e
+    if len(head) > _MAX_CONNECT_RESPONSE:
+        raise ProxyError("Proxy CONNECT yanıt başlıkları çok büyük.")
+    check_connect_response(head)
+
+
+async def _async_recv_exact(reader, n: int) -> bytes:
+    import asyncio
+    try:
+        return await reader.readexactly(n)
+    except asyncio.IncompleteReadError as e:
+        raise ProxyError("Proxy bağlantıyı beklenmedik biçimde kapattı.") from e
+
+
+async def async_socks5_connect(reader, writer, proxy: ProxyConfig, host: str, port: int) -> None:
+    """asyncio akışı üzerinde SOCKS5 CONNECT yapar (RFC 1928 / RFC 1929)."""
+    writer.write(socks5_greeting(proxy))
+    await writer.drain()
+    method = _socks5_check_method(await _async_recv_exact(reader, 2), proxy)
+    if method == 0x02:
+        writer.write(socks5_auth_request(proxy))
+        await writer.drain()
+        _v, status = await _async_recv_exact(reader, 2)
+        if status != 0x00:
+            raise ProxyError("SOCKS5 kimlik doğrulaması başarısız (kullanıcı/parola).")
+    writer.write(socks5_connect_request(host, port))
+    await writer.drain()
+
+    ver, rep, _rsv, atyp = await _async_recv_exact(reader, 4)
+    if ver != 0x05:
+        raise ProxyError("SOCKS5 yanıtı bozuk.")
+    if rep != 0x00:
+        raise ProxyError(f"SOCKS5 CONNECT reddedildi: {_SOCKS5_REPLIES.get(rep, rep)}")
+    if atyp == 0x01:
+        await _async_recv_exact(reader, 4 + 2)
+    elif atyp == 0x04:
+        await _async_recv_exact(reader, 16 + 2)
+    elif atyp == 0x03:
+        await _async_recv_exact(reader, (await _async_recv_exact(reader, 1))[0] + 2)
+    else:
+        raise ProxyError(f"SOCKS5 yanıtında bilinmeyen adres tipi: {atyp}")
+
+
+async def async_open_tunnel(reader, writer, proxy: ProxyConfig, host: str, port: int) -> None:
+    """Proxy'ye BAĞLI asyncio akışı üzerinde hedef host:port'a tünel kurar."""
+    logger.debug("Proxy tüneli (async): %r -> %s:%d", proxy, host, port)
+    if proxy.scheme == "http":
+        await async_http_connect(reader, writer, proxy, host, port)
+    else:
+        await async_socks5_connect(reader, writer, proxy, host, port)
+
+
+async def async_connect_via_proxy(proxy: ProxyConfig, host: str, port: int,
+                                  timeout: Optional[float] = 30.0):
+    """Proxy'ye bağlanır, tüneli kurar; (reader, writer) döner.
+
+    ``timeout`` TCP bağlantısı + tünel kurulumu için toplam süredir. Dönen akış
+    üzerinde ``AsyncTLSStream.negotiate`` veya ``writer.start_tls`` çalıştırılır.
+    """
+    import asyncio
+
+    async def _go():
+        try:
+            reader, writer = await asyncio.open_connection(proxy.host, proxy.port)
+        except OSError as e:
+            raise ProxyError(f"Proxy'ye bağlanılamadı ({proxy.host}:{proxy.port}): {e}") from e
+        try:
+            await async_open_tunnel(reader, writer, proxy, host, port)
+        except BaseException:
+            writer.close()
+            raise
+        return reader, writer
+
+    return await asyncio.wait_for(_go(), timeout)

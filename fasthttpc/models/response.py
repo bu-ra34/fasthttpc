@@ -6,10 +6,39 @@ history ve links özelliklerini içerir.
 """
 from __future__ import annotations
 
+import http
 import json as jsonlib
+import re
 import time
 from typing import Optional, List
 from .headers import Headers
+
+_CHARSET_RE = re.compile(r"""charset\s*=\s*["']?([^\s;"']+)""", re.IGNORECASE)
+
+
+class _Text(str):
+    """``Response.text`` değeri: hem ``str`` (requests/httpx uyumu: ``r.text``)
+    hem çağrılabilir (eski API: ``r.text()``, ``r.text(encoding="latin-1")``)."""
+
+    def __new__(cls, value: str, body: bytes = b""):
+        self = super().__new__(cls, value)
+        self._body = body
+        return self
+
+    def __call__(self, encoding: Optional[str] = None, errors: str = "replace") -> str:
+        if encoding is None:
+            return str(self)
+        return self._body.decode(encoding, errors=errors)
+
+    def __reduce__(self):
+        return (_Text, (str(self), self._body))
+
+
+class _Elapsed(float):
+    """Saniye cinsinden float; requests'teki ``timedelta.total_seconds()`` ile uyumlu."""
+
+    def total_seconds(self) -> float:
+        return float(self)
 
 
 class HTTPStatusError(Exception):
@@ -17,6 +46,13 @@ class HTTPStatusError(Exception):
     def __init__(self, message: str, response: "Response"):
         super().__init__(message)
         self.response = response
+
+
+def _reason(status: int) -> str:
+    try:
+        return http.HTTPStatus(status).phrase
+    except ValueError:
+        return ""
 
 
 class Response:
@@ -30,6 +66,7 @@ class Response:
         request:     Bu yanıtı oluşturan istek objesi
         history:     Redirect zinciri (önceki Response listesi)
         elapsed:     İsteğin toplam süresi (saniye cinsinden float)
+        http_version: Yanıtın taşındığı protokol ("HTTP/1.1" veya "HTTP/2")
     """
 
     def __init__(
@@ -45,19 +82,75 @@ class Response:
         self.body: bytes                   = body
         self.request                       = request
         self.history: List["Response"]     = []
-        self.elapsed: float                = elapsed          
+        self.elapsed                       = elapsed
+        self._reason: str                  = ""
+        self._url: Optional[str]           = None
+        self._encoding: Optional[str]      = None
+        self.http_version: str             = "HTTP/1.1"   # "HTTP/2" ise h2 üzerinden geldi
 
                                                                               
 
-    def text(self, encoding: str = "utf-8", errors: str = "replace") -> str:
-        """
-        Yanıt gövdesini string olarak döner.
+    @property
+    def encoding(self) -> str:
+        """Gövde kodlaması: atanmışsa o, yoksa Content-Type charset'i, yoksa ``utf-8``."""
+        if self._encoding:
+            return self._encoding
+        m = _CHARSET_RE.search(self.headers.get("content-type", "") or "")
+        return m.group(1) if m else "utf-8"
 
-        Args:
-            encoding: Karakter kodlaması (varsayılan: utf-8)
-            errors:   Hatalı byte'lar için strateji (varsayılan: replace)
+    @encoding.setter
+    def encoding(self, value: Optional[str]) -> None:
+        self._encoding = value
+
+    @property
+    def text(self) -> str:
         """
-        return self.body.decode(encoding, errors=errors)
+        Yanıt gövdesi (``str``); kodlama :attr:`encoding`'den gelir (hatalı
+        byte'lar ``replace`` ile). Eski kullanım ``r.text()`` ve
+        ``r.text(encoding="latin-1", errors="strict")`` da çalışır.
+        """
+        try:
+            s = self.body.decode(self.encoding, errors="replace")
+        except LookupError:            # bilinmeyen charset adı
+            s = self.body.decode("utf-8", errors="replace")
+        return _Text(s, self.body)
+
+    @property
+    def elapsed(self) -> float:
+        """İstek süresi (saniye); ``.total_seconds()`` de desteklenir."""
+        return self._elapsed
+
+    @elapsed.setter
+    def elapsed(self, value: float) -> None:
+        self._elapsed = _Elapsed(value or 0.0)
+
+    @property
+    def url(self) -> str:
+        """İsteğin (yönlendirmeler sonrası) URL'i."""
+        if self._url is not None:
+            return self._url
+        return str(self.request.url) if self.request is not None else ""
+
+    @url.setter
+    def url(self, value) -> None:
+        self._url = None if value is None else str(value)
+
+    @property
+    def ok(self) -> bool:
+        """Durum kodu 400'den küçükse True (requests ile aynı)."""
+        return self.status_code < 400
+
+    @property
+    def reason(self) -> str:
+        """Durum ifadesi ("OK", "Not Found"); atanmadıysa standart ifade."""
+        return self._reason or _reason(self.status_code)
+
+    @reason.setter
+    def reason(self, value: str) -> None:
+        self._reason = value or ""
+
+    def close(self) -> None:
+        """Uyumluluk için no-op (gövde zaten belleğe okunmuştur)."""
 
     def json(self, **kwargs):
         """
@@ -145,9 +238,8 @@ class Response:
             HTTPStatusError: HTTP hata kodu alındığında.
         """
         if self.is_client_error or self.is_server_error:
-            url = self.request.url if self.request else ""
             raise HTTPStatusError(
-                f"HTTP {self.status_code} hatası: {url}",
+                f"HTTP {self.status_code} hatası: {self.url}",
                 response=self,
             )
         return self
