@@ -35,6 +35,28 @@ PROFILES = ["chrome_131", "firefox_133", "safari_18"]
 
 # --------------------------------------------------------------------------- yardımcılar
 
+# Windows'ta `openssl s_server` (-WWW/-HTTP) dosyaları METİN kipinde açar (apps/s_server.c:
+# BIO_new_file(p, "r")): C çalışma zamanı 0x1A (Ctrl-Z) görünce EOF sayar ve CRLF -> LF çevirir.
+# Rastgele ikili veri bu yüzden ilk 0x1A'da (~256 baytta) kesilir. Windows'ta yük, 0x1A/CR/LF
+# içermeyen alfasayısal baytlardan üretilir; yine 3 MB'tır, yani çok sayıda TLS record'una bölünür
+# ve SHA-256 karşılaştırması aynı kuvvette kalır. Diğer platformlarda tam ikili (urandom) veri.
+_METIN_GUVENLI = bytes.maketrans(bytes(range(256)),
+                                 bytes((b"abcdefghijklmnopqrstuvwxyz"
+                                        b"ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789")[i % 62] for i in range(256)))
+
+
+def _big_payload(n: int) -> bytes:
+    raw = os.urandom(n)
+    return raw.translate(_METIN_GUVENLI) if sys.platform == "win32" else raw
+
+
+def text_mode_crlf(head: bytes) -> bytes:
+    """Windows'ta s_server dosyayı metin kipinde okurken CRLF -> LF çevirir; ``\\r\\r\\n`` ise
+    ``\\r\\n``'e iner (yalnızca CR+LF çifti birleşir). Başlık dosyalarını bu yüzden win32'de
+    ``\\r\\r\\n`` ile yazarız ki istemci gerçek CRLF görsün."""
+    return head.replace(b"\r\n", b"\r\r\n") if sys.platform == "win32" else head
+
+
 class Env:
     """Oturum boyunca paylaşılan PKI (RSA-4096 üretimi yavaş olduğu için bir kez)."""
 
@@ -55,7 +77,7 @@ class Env:
         self.chain_cert, self.chain_key = pki.write(d, "chain_leaf", self.chain_leaf)
         self.chain_file = pki.write_ca(d, "chain_inter", self.inter)
         (d / "index.html").write_text("merhaba interop")
-        self.big = os.urandom(3 * 1024 * 1024 + 17)
+        self.big = _big_payload(3 * 1024 * 1024 + 17)
         (d / "big.bin").write_bytes(self.big)
 
     def server(self, key="p256", *args, www="-WWW", chain=None):
