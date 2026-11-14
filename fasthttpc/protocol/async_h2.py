@@ -26,6 +26,7 @@ Akış (``stream``) arayüzü: ``read(n)`` (await), ``write(b)``, ``drain()``
 from __future__ import annotations
 
 import asyncio
+import collections
 import struct
 import time
 from dataclasses import dataclass, field
@@ -55,7 +56,7 @@ from .http2_parser import (
 
 logger = get_logger("async_h2")
 
-__all__ = ["AsyncHttp2Connection", "H2Response", "H2StreamRefused", "client_preface_bytes"]
+__all__ = ["AsyncHttp2Connection", "H2Response", "H2StreamHandle", "H2StreamRefused", "client_preface_bytes"]
 
 _MAX_STREAM_ID = 2 ** 31 - 1
 _MAX_WINDOW = 2 ** 31 - 1
@@ -86,7 +87,8 @@ class H2Response:
 
 class _Stream:
     __slots__ = ("id", "fut", "status", "headers", "body", "headers_done",
-                 "send_window", "activity", "first_byte_time")
+                 "send_window", "activity", "first_byte_time",
+                 "streaming", "chunks", "hdr_fut", "waiter")
 
     def __init__(self, sid: int, fut: "asyncio.Future", send_window: int):
         self.id = sid
@@ -98,6 +100,17 @@ class _Stream:
         self.send_window = send_window
         self.activity = False
         self.first_byte_time = 0.0
+        # Akış modu: DATA ``chunks``'ta (bytes, ham_uzunluk) birikir; ``hdr_fut``
+        # başlıklar gelince; ``waiter`` okuyucuyu uyandırır. ``fut`` akış sonunu işaret eder.
+        self.streaming = False
+        self.chunks: "collections.deque[tuple[bytes, int]]" = collections.deque()
+        self.hdr_fut: "Optional[asyncio.Future]" = None
+        self.waiter: "Optional[asyncio.Future]" = None
+
+    def notify(self) -> None:
+        w, self.waiter = self.waiter, None
+        if w is not None and not w.done():
+            w.set_result(None)
 
 
 class _ReaderWriter:
@@ -120,6 +133,78 @@ class _ReaderWriter:
 
     async def wait_closed(self) -> None:
         await self._w.wait_closed()
+
+
+class H2StreamHandle:
+    """``request_stream`` dönüşü: başlıklar hazır; ``read_chunk()`` ile gövde (``b""`` = bitti)."""
+
+    def __init__(self, conn: "AsyncHttp2Connection", st: _Stream):
+        self._c, self._st = conn, st
+        self.status = 0
+        self.headers: "list[tuple[str, str]]" = []
+        self.first_byte_time = 0.0
+        self._closed = False
+
+    async def read_chunk(self) -> bytes:
+        st, c = self._st, self._c
+        while True:
+            if st.chunks:
+                data, raw_len = st.chunks.popleft()
+                if raw_len and not st.fut.done() and not c._closed:
+                    try:
+                        c._write(_frame(FrameType.WINDOW_UPDATE, 0, st.id, struct.pack("!I", raw_len)))
+                        await c._drain()
+                    except (OSError, Http2ConnectionError):
+                        pass        # bağlantı koptu: sıradaki okuma hatayı bildirir
+                if data:
+                    return data
+                continue
+            if st.fut.done():
+                self._closed = True
+                if st.fut.cancelled():
+                    return b""
+                st.fut.result()      # hata varsa fırlatır
+                return b""
+            fut = B.new_future()
+            st.waiter = fut
+            try:
+                await B.wait_for(fut, c.read_timeout)
+            except asyncio.TimeoutError:
+                st.waiter = None
+                if st.activity:
+                    st.activity = False
+                    continue
+                self.close_nowait()
+                raise asyncio.TimeoutError(
+                    f"HTTP/2 gövdesi {c.read_timeout} sn içinde gelmedi (stream {st.id}).") from None
+
+    def close_nowait(self) -> None:
+        """Bitmemiş stream'i RST_STREAM(CANCEL) ile iptal eder; bağlantı yaşar."""
+        st, c = self._st, self._c
+        if self._closed:
+            return
+        self._closed = True
+        if not st.fut.done():
+            c._streams.pop(st.id, None)
+            c._rst(st.id, 8)
+            st.fut.cancel()
+            if st.hdr_fut is not None and not st.hdr_fut.done():
+                st.hdr_fut.cancel()
+            st.notify()
+            c._wake()
+        else:
+            if not st.fut.cancelled():
+                st.fut.exception()          # "never retrieved" uyarısını önle
+            if st.hdr_fut is not None and st.hdr_fut.done() and not st.hdr_fut.cancelled():
+                st.hdr_fut.exception()
+
+    async def aclose(self) -> None:
+        self.close_nowait()
+        if not self._c._closed:
+            try:
+                await self._c._drain()
+            except (OSError, asyncio.TimeoutError, Http2ConnectionError):
+                pass
 
 
 def _frame(ftype: int, flags: int, stream_id: int, payload: bytes = b"") -> bytes:
@@ -304,8 +389,7 @@ class AsyncHttp2Connection:
         self._close_error = err
         streams, self._streams = self._streams, {}
         for st in streams.values():
-            if not st.fut.done():
-                st.fut.set_exception(err)
+            self._fail(st, err)
         self._wake()
         try:
             self._s.close()
@@ -346,12 +430,23 @@ class AsyncHttp2Connection:
         self.last_used = time.monotonic()
         if not st.fut.done():
             st.fut.set_result(H2Response(st.status, st.headers, bytes(st.body), st.first_byte_time))
+        if st.hdr_fut is not None and not st.hdr_fut.done():
+            st.hdr_fut.set_result(None)
+        st.notify()
         self._wake()
+
+    @staticmethod
+    def _fail(st: _Stream, exc: BaseException) -> None:
+        if not st.fut.done():
+            st.fut.set_exception(exc)
+        if st.hdr_fut is not None and not st.hdr_fut.done():
+            st.hdr_fut.set_exception(exc)
+        st.notify()
 
     def _fail_stream(self, sid: int, exc: BaseException) -> None:
         st = self._streams.pop(sid, None)
-        if st is not None and not st.fut.done():
-            st.fut.set_exception(exc)
+        if st is not None:
+            self._fail(st, exc)
         self._wake()
 
     def _on_data(self, f: HTTP2Frame) -> None:
@@ -361,10 +456,17 @@ class AsyncHttp2Connection:
         st = self._streams.get(f.stream_id)
         if st is not None:
             st.activity = True
-            st.body += _strip_data_frame_padding(f)
+            if st.streaming:
+                data = _strip_data_frame_padding(f)
+                st.chunks.append((bytes(data), raw_len))
+                st.notify()
+            else:
+                st.body += _strip_data_frame_padding(f)
         if raw_len:
             wu = _frame(FrameType.WINDOW_UPDATE, 0, 0, struct.pack("!I", raw_len))
-            if st is not None and not f.end_stream:
+            # Akış modunda stream penceresi TÜKETİCİ okudukça açılır (geri basınç):
+            # okunmayan veri en çok ilan edilen stream penceresi kadar tamponlanır.
+            if st is not None and not f.end_stream and not st.streaming:
                 wu += _frame(FrameType.WINDOW_UPDATE, 0, f.stream_id, struct.pack("!I", raw_len))
             self._write(wu)
         if st is not None and f.end_stream:
@@ -420,6 +522,8 @@ class AsyncHttp2Connection:
             st.status = status
             st.headers.extend(hdrs)
             st.first_byte_time = time.monotonic()
+            if st.hdr_fut is not None and not st.hdr_fut.done():
+                st.hdr_fut.set_result(None)
         if end_stream:
             self._finish(st)
 
@@ -601,6 +705,60 @@ class AsyncHttp2Connection:
                 self._wake()
             elif not st.fut.cancelled():
                 st.fut.exception()       # "never retrieved" uyarısını önle
+
+    async def request_stream(
+        self,
+        method: str,
+        authority: str,
+        path: str,
+        headers: "list[tuple[str, str]]",
+        body: bytes = b"",
+        scheme: str = "https",
+    ) -> "H2StreamHandle":
+        """İsteği gönderir, yanıt BAŞLIKLARI gelince döner; gövde
+        :meth:`H2StreamHandle.read_chunk` ile parça parça okunur.
+
+        Geri basınç: stream WINDOW_UPDATE'i tüketici okudukça gönderilir
+        (bağlantı penceresi hemen açılır ki aynı bağlantıdaki diğer stream'ler
+        aç kalmasın); okunmayan veri ilan edilen stream penceresiyle sınırlıdır."""
+        while True:
+            if not self.usable:
+                raise H2StreamRefused("HTTP/2 bağlantısı yeni stream kabul etmiyor.")
+            if len(self._streams) < self._max_streams:
+                break
+            await self._wait_change(self.write_timeout)
+
+        full = h2_request_headers(self._h2, method, authority, scheme, path, headers)
+        st = self._alloc_stream()
+        st.streaming = True
+        st.hdr_fut = B.new_future()
+        self.last_used = time.monotonic()
+        handle = H2StreamHandle(self, st)
+        try:
+            self._send_headers(st.id, full, end_stream=not body)
+        except BaseException:
+            self._streams.pop(st.id, None)
+            raise
+        try:
+            await self._drain()
+            if body:
+                await self._send_body(st, body)
+            while True:
+                done = await B.wait_future(st.hdr_fut, self.read_timeout)
+                if done:
+                    st.hdr_fut.result()
+                    break
+                if st.activity:
+                    st.activity = False
+                    continue
+                raise asyncio.TimeoutError(
+                    f"HTTP/2 yanıtı {self.read_timeout} sn içinde gelmedi (stream {st.id}).")
+        except BaseException:
+            handle.close_nowait()
+            raise
+        handle.status, handle.headers = st.status, list(st.headers)
+        handle.first_byte_time = st.first_byte_time
+        return handle
 
     # ------------------------------------------------------------ kapanış
     async def close(self) -> None:
