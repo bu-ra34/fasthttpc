@@ -583,26 +583,10 @@ class EncryptedSocket:
         bağlantıyı düşürmez (resumption bir optimizasyondur), yalnızca loglanır.
         Bir record'da birden fazla NewSessionTicket art arda gelebilir.
         """
-        rms = self.state.get("resumption_master_secret")
-        host = self.state.get("ticket_cache_key")
-        if not rms or not host:
-            return
-        pos = 0
-        while pos + 4 <= len(msg) and msg[pos] == 4:
-            end = pos + 4 + int.from_bytes(msg[pos + 1:pos + 4], "big")
-            try:
-                nst = session_tickets.parse_new_session_ticket(msg[pos:end])
-            except session_tickets.TicketError as e:
-                logger.debug("NewSessionTicket ayrıştırılamadı, yok sayıldı: %s", e)
-                return
-            ticket = session_tickets.ticket_from_message(
-                host, nst, rms, self.state.get("cipher_suite", 0),
-                peer_certificate=self.state.get("peer_certificate"),
-            )
-            if ticket is not None:
-                session_tickets.default_cache.put(ticket)
-                logger.debug("Oturum bileti önbelleğe alındı: host=%s lifetime=%ds", host, ticket.lifetime)
-            pos = end
+        session_tickets.store_new_session_tickets(
+            self.state.get("ticket_cache_key"), msg, self.state.get("resumption_master_secret"),
+            self.state.get("cipher_suite", 0), peer_certificate=self.state.get("peer_certificate"),
+        )
 
 
 def _parse_alpn_from_encrypted_extensions(hs_payload: bytes) -> str:
@@ -796,23 +780,16 @@ class TLSAdapter:
         impersonator = TLSImpersonator(host, profile=profile_name)
 
         # PSK resumption (faz4) — VARSAYILAN KAPALI; bkz. session_tickets.enable_resumption.
-        resumption_on = session_tickets.resumption_enabled()
         ticket_key = None
-        if resumption_on:
+        if session_tickets.resumption_enabled():
             try:
                 peer_port = raw_socket.getpeername()[1]
             except (OSError, IndexError, TypeError):
                 peer_port = None
-            ticket_key = session_tickets.cache_key(host, peer_port, ca_path)
-        ticket = session_tickets.default_cache.pop(ticket_key) if resumption_on else None
-        psk_hello = (
-            session_tickets.build_resumption_client_hello(impersonator, ticket) if ticket else None
-        )
-        if psk_hello is None:
-            ticket = None
-            record_bytes, priv_key, _c_rand = impersonator.build_client_hello()
-        else:
-            record_bytes, priv_key, _c_rand = psk_hello
+            ticket_key = session_tickets.resumption_key(host, peer_port, ca_path)
+        resumption_on = ticket_key is not None
+        record_bytes, priv_key, _c_rand, ticket = session_tickets.begin_resumption(
+            impersonator, ticket_key)
         sent_session_id = _client_hello_session_id(record_bytes)
 
         raw_socket.sendall(record_bytes)
@@ -879,22 +856,12 @@ class TLSAdapter:
                 "HRR sonrası ServerHello, HRR'de istenen gruptan farklı bir grup seçti."
             )
 
-        psk_accepted = psk_selected is not None
-        if psk_accepted and hrr is not None:
-            # HRR sonrası 2. ClientHello'da PSK teklif edilmiyor.
-            raise ConnectionError(
-                "Sunucu HRR sonrası teklif edilmemiş bir PSK'yı seçti — protokol ihlali."
-            )
+        try:
+            psk_accepted = session_tickets.check_psk_selection(
+                ticket, psk_selected, cipher_suite, hrr is not None)
+        except session_tickets.PskViolation as e:
+            raise ConnectionError(str(e)) from e
         order.psk_accepted = psk_accepted
-        if psk_accepted:
-            if ticket is None or psk_selected != 0:
-                raise ConnectionError(
-                    "Sunucu teklif etmediğimiz bir PSK kimliğini seçti — protokol ihlali."
-                )
-            if session_tickets._SUITE_HASH.get(cipher_suite) is not ticket.hash_alg:
-                raise ConnectionError(
-                    "Sunucu PSK'yı kabul etti ama biletin hash'iyle uyumsuz bir cipher suite seçti."
-                )
 
         state["is_tls13"] = True
         state["key_share_group"] = selected_group
