@@ -9,6 +9,7 @@ import asyncio
 import time
 from typing import AsyncIterator, Optional
 
+from ..security.cert_validator import CertificateValidationError
 from .core import H3Core, Http3ConnectError, Http3Error, Http3RequestRefused, authority_for
 from .options import Http3Options
 
@@ -85,15 +86,45 @@ class AsyncH3Connection:
         await fut
 
     async def connect(self) -> None:
+        """Adresleri sırayla dener (bkz. SyncH3Connection.connect); toplam süre connect_timeout."""
+        import socket
         o = self._opts
-        host, port = self.origin
         self.loop = asyncio.get_running_loop()
         try:
             infos = await self.loop.getaddrinfo(self._target[0], self._target[1],
-                                                type=__import__("socket").SOCK_DGRAM)
-            addr = infos[0][4]
+                                                type=socket.SOCK_DGRAM)
+        except OSError as e:
+            raise Http3ConnectError(f"DNS çözümlenemedi: {e}", e) from e
+        addrs: list = []
+        for info in infos:
+            if (info[0], info[4]) not in addrs:
+                addrs.append((info[0], info[4]))
+        if not addrs:
+            raise Http3ConnectError("UDP için adres bulunamadı")
+        deadline = time.monotonic() + o.connect_timeout
+        last: "Exception | None" = None
+        for i, (family, addr) in enumerate(addrs):
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            try:
+                await self._attempt(family, addr, remaining / (len(addrs) - i))
+                return
+            except Http3ConnectError as e:
+                last = e
+                if isinstance(getattr(e, "cause", None), CertificateValidationError):
+                    raise
+        raise last or Http3ConnectError("QUIC el sıkışması zaman aşımı")
+
+    async def _attempt(self, family, addr, timeout: float) -> None:
+        o = self._opts
+        host, port = self.origin
+        try:
+            # asyncio remote_addr için 2'li (host, port) ister; aile adresle eşleşir
+            # (IPv6 4'lü adresi AF_INET soketine verilmez). scope id gerekiyorsa host'ta %scope.
+            host_part = addr[0] if len(addr) == 2 or not addr[3] else f"{addr[0]}%{addr[3]}"
             self._transport, _ = await self.loop.create_datagram_endpoint(
-                lambda: _Proto(self), remote_addr=addr)
+                lambda: _Proto(self), remote_addr=(host_part, addr[1]), family=family)
         except OSError as e:
             raise Http3ConnectError(f"UDP soketi açılamadı: {e}", e) from e
         self._connected_addr = addr
@@ -102,11 +133,11 @@ class AsyncH3Connection:
         self.core.connect(addr)
         self._after_event()
         try:
-            await asyncio.wait_for(self._wait_handshake(), o.connect_timeout)
+            await asyncio.wait_for(self._wait_handshake(), timeout)
         except (asyncio.TimeoutError, Http3Error) as e:
             err = self.core.error
             await self.close()
-            if err is not None:
+            if isinstance(err, Http3ConnectError):
                 raise err from None
             raise Http3ConnectError(f"QUIC el sıkışması başarısız: {e or 'zaman aşımı'}", e) from e
         if not self.core.handshake_done:
