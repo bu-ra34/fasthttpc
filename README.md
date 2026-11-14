@@ -51,7 +51,7 @@ olarak iletilir).
 ## Kurulum
 
 ```bash
-git clone https://github.com/kullanici/fasthttpc
+git clone https://github.com/cevpy/fasthttpc
 cd fasthttpc
 pip install -e ".[dev]"
 pytest        # ağ gerektirmez
