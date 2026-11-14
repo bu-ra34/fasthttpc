@@ -172,6 +172,8 @@ def test_proxies_sozlugu_all_anahtari_ve_rotator_gercekten_kullanilir(pki, ca):
         await s2.get("https://example.com/")
         await s2.get("https://example.com/")
         assert p1.connections == 2 and p2.connections == 1
+        await s.close()
+        await s2.close()               # boştaki keep-alive bağlantıları kapat (stop() beklemesin)
         await p1.stop()
         await p2.stop()
         srv.close()
@@ -255,6 +257,7 @@ def test_limits_max_connections_ve_pool_timeout_h1(pki_local, ca_local):
             rs = await asyncio.gather(*[s.get(f"https://localhost:{port}/{i}") for i in range(6)])
             assert [r.body for r in rs] == [b"ok"] * 6
             assert state["max"] == 2
+            await s.close()
             # havuz zaman aşımı
             s = AsyncSession(impersonate="chrome_131", verify=ca_local,
                              timeout=Timeout(5, pool=0.05), limits=Limits(max_connections=1))
@@ -262,6 +265,7 @@ def test_limits_max_connections_ve_pool_timeout_h1(pki_local, ca_local):
                                        s.get(f"https://localhost:{port}/b"),
                                        return_exceptions=True)
             assert sum(isinstance(x, asyncio.TimeoutError) for x in res) == 1
+            await s.close()
     run(main())
 
 
