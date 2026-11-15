@@ -14,7 +14,7 @@ import threading
 import collections
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from typing import Optional
+from typing import TYPE_CHECKING, Any, Optional
 
 from ..models.urls import URL
 from .happy_eyeballs import connect_infos
@@ -22,6 +22,9 @@ from .proxy import ProxyConfig, connect_via_proxy, resolve_proxy
 
 
 from .._log import get_logger
+
+if TYPE_CHECKING:
+    from ..protocol.http2_parser import Http2Connection
 
 logger = get_logger("pool")
 
@@ -51,14 +54,16 @@ class HTTPConnection:
 
     def __init__(self, origin: tuple[str, str, int]):
         self.origin: tuple          = origin
-        self.socket                 = None
+        # Ham ``socket.socket``; TLS el sıkışmasından sonra ``EncryptedSocket`` (TLS 1.3)
+        # ya da legacy TLS 1.2 soketi ile değiştirilir — ortak bir taban tipi yok.
+        self.socket: Any            = None
         self.is_closed: bool        = True
         self.tls_established: bool  = False
         self.conn_data: dict        = {}
         self.ttfb_ms: float         = float("inf")                          
         self._lock                  = threading.Lock()
         self.in_use: bool           = False
-        self.h2_conn                = None       # ALPN "h2" ise Http2Connection nesnesi
+        self.h2_conn: "Http2Connection | None" = None   # ALPN "h2" ise Http2Connection nesnesi
         self.idle_since: float      = 0.0
         self.pool_key               = origin     # rotasyonda proxy'yi de içerir
 
