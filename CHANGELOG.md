@@ -20,6 +20,33 @@ bulgular ve açık maddeler `docs/security-audit.md`'de.
 - TLS 1.3 Certificate mesajında boş olmayan `certificate_request_context` ve
   liste sonrası artık bayt reddediliyor (FHC-06).
 
+### Tip denetimi
+- mypy (strict) kapsamı genişletildi: `session.py`, `async_session.py`,
+  `models/request.py`, `models/response.py`, `models/__init__.py`, `streaming.py`,
+  `_api.py` ve `plugins.py` artık `[tool.mypy] files` listesinde. Yapılandırma
+  gevşetilmedi; yeni `# type: ignore` eklenmedi.
+- Akış gövdesi kaynakları için `BodyStream` / `AsyncBodyStream` Protocol'leri
+  (`fasthttpc.models.response`); `Response.metrics` sınıf düzeyinde tiplendi.
+- `_api` içinde ortak tip takma adları (`HeadersArg`, `HeaderDict`, `ParamsArg`,
+  `AuthArg`, `TimeoutArg` ...); `AuthFlow` artık `Generator[Request, Response, None]`.
+- `streaming`: opsiyonel `brotli`/`zstandard` modülleri `importlib` ile yüklenir
+  (davranış aynı; stub'ı olmayan/kurulu olmayan paket tip denetimini ortama göre
+  değiştirmez).
+
+### Düzeltmeler
+- **Async yolda el sıkışma hatasında TLS alert:** `AsyncTLSStream` (asyncio ve
+  trio) el sıkışma başarısız olduğunda çekirdeğin kuyruğa aldığı fatal alert'i
+  artık sunucuya göndermeden kapatmıyor; senkron yolla aynı alert kodları
+  (ör. bozuk SKE imzası → `decrypt_error`). Gönderim best-effort'tur, asıl hatayı
+  maskelemez. Ardından RST yerine FIN + kısa, sınırlı boşaltma
+  (`transport.lingering.async_send_and_drain`); trio akışına `write_eof` eklendi.
+- `Headers(...)` yalnızca `dict` kabul ediyordu: `Headers` nesnesi ya da başka bir
+  `Mapping` (ör. `MappingProxyType`) verilince başlıklar SESSİZCE düşüyordu
+  (`Session(headers=Headers({...}))` -> başlık yok). Artık her `Mapping` kabul
+  edilir; `Headers` kopyası çoklu değerleri (Set-Cookie) ve sırayı korur.
+- `AsyncSession.pool_stats()`: `cert=` (mTLS) ile havuz/h2 anahtarlarına sertifika
+  kimliği eklendiğinden anahtar sabit uzunlukta açılırken `ValueError` fırlatıyordu.
+
 ## [0.6.0] — 2026-11-15
 
 requests/httpx'e göre kalan on eksik kapatıldı: akış, mTLS, auth, senkron

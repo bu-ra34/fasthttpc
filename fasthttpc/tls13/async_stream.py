@@ -13,6 +13,7 @@ from __future__ import annotations
 from typing import Any, Optional
 
 from .. import _backend as B
+from ..transport.lingering import async_send_and_drain
 from .connection import TLSClientConnection
 from ._records import RecordQueue
 
@@ -66,16 +67,23 @@ class AsyncTLSStream:
         self = cls(reader, writer, conn)
         writer.write(conn.initiate())
         await writer.drain()
-        while not conn.handshake_complete:
-            data = await reader.read(65536)
-            if not data:
-                raise ConnectionResetError("TLS handshake sırasında sunucu bağlantıyı kapattı.")
-            events = conn.receive_data(data)
-            out = conn.data_to_send()
-            if out:
-                writer.write(out)
-                await writer.drain()
-            self._records.extend(events)
+        try:
+            while not conn.handshake_complete:
+                data = await reader.read(65536)
+                if not data:
+                    raise ConnectionResetError("TLS handshake sırasında sunucu bağlantıyı kapattı.")
+                events = conn.receive_data(data)
+                out = conn.data_to_send()
+                if out:
+                    writer.write(out)
+                    await writer.drain()
+                self._records.extend(events)
+        except Exception:
+            # Senkron yolla (tls12.negotiate_tls12) aynı: çekirdeğin kuyruğa aldığı fatal
+            # alert best-effort gönderilir, ardından RST yerine FIN + kısa boşaltma
+            # (bkz. transport/lingering.py). Gönderim hatası asıl istisnayı maskelemez.
+            await async_send_and_drain(reader, writer, conn.data_to_send())
+            raise
         return self
 
     @property

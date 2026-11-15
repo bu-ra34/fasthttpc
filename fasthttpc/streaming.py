@@ -7,20 +7,28 @@ G/Ç yok; yalnızca bayt -> bayt dönüşümleri vardır.
 """
 from __future__ import annotations
 
+import importlib
 import zlib
+from types import ModuleType
+from typing import Any
 
 from ._log import get_logger
 
 logger = get_logger("streaming")
 
-try:  # opsiyonel bağımlılıklar (http1_parser ile aynı)
-    import brotli as _brotli
-except ImportError:  # pragma: no cover
-    _brotli = None
-try:
-    import zstandard as _zstd
-except ImportError:  # pragma: no cover
-    _zstd = None
+
+def _optional_module(name: str) -> ModuleType | None:
+    """Opsiyonel bağımlılık (http1_parser ile aynı): kurulu değilse ``None``.
+    ``importlib`` ile yüklenir; böylece stub'ı olmayan/kurulu olmayan modül
+    tip denetimini ortama göre değiştirmez."""
+    try:
+        return importlib.import_module(name)
+    except ImportError:  # pragma: no cover
+        return None
+
+
+_brotli = _optional_module("brotli")
+_zstd = _optional_module("zstandard")
 
 
 class StreamConsumed(RuntimeError):
@@ -39,7 +47,7 @@ class DecodeError(ValueError):
     """Akış ortasında Content-Encoding açılamadı (bozuk sıkıştırılmış veri)."""
 
 
-_DECODE_ERRORS: tuple = (zlib.error, ValueError, EOFError)
+_DECODE_ERRORS: tuple[type[BaseException], ...] = (zlib.error, ValueError, EOFError)
 if _brotli is not None:
     _DECODE_ERRORS += (getattr(_brotli, "error", ValueError),)
 if _zstd is not None:
@@ -53,6 +61,9 @@ class _OneDecoder:
 
     def __init__(self, enc: str):
         self.enc = enc
+        # zlib/brotli/zstandard açıcıları ortak bir tip paylaşmaz (brotli ``process``,
+        # diğerleri ``decompress``); ``_run`` kodlamaya göre doğru yöntemi çağırır.
+        self._obj: Any
         self._passthrough = False
         self._started = False
         self._obj = self._make(enc)
@@ -60,7 +71,7 @@ class _OneDecoder:
             self._passthrough = True
 
     @staticmethod
-    def _make(enc: str, raw_deflate: bool = False):
+    def _make(enc: str, raw_deflate: bool = False) -> Any:
         if enc in ("gzip", "x-gzip"):
             return zlib.decompressobj(zlib.MAX_WBITS | 16)
         if enc == "deflate":
@@ -73,9 +84,8 @@ class _OneDecoder:
 
     def _run(self, chunk: bytes) -> bytes:
         o = self._obj
-        if self.enc == "br":
-            return o.process(chunk)
-        return o.decompress(chunk)
+        out: bytes = o.process(chunk) if self.enc == "br" else o.decompress(chunk)
+        return out
 
     def decode(self, chunk: bytes) -> bytes:
         if self._passthrough or not chunk:
@@ -103,7 +113,8 @@ class _OneDecoder:
         try:
             if self.enc == "br":
                 return b""
-            return self._obj.flush() if hasattr(self._obj, "flush") else b""
+            tail: bytes = self._obj.flush() if hasattr(self._obj, "flush") else b""
+            return tail
         except _DECODE_ERRORS as e:
             logger.warning("Akış flush hatası (%s): %s", self.enc, e)
             return b""
@@ -175,9 +186,9 @@ class Rechunker:
 
     def __init__(self, size: "int | None"):
         self._size = size if size and size > 0 else None
-        self._buf = bytearray() if self._size else None
+        self._buf = bytearray()
 
-    def feed(self, data):
+    def feed(self, data: bytes) -> "list[bytes]":
         if self._size is None:
             return [data]
         buf, size = self._buf, self._size
@@ -189,7 +200,7 @@ class Rechunker:
         del buf[:n]
         return out
 
-    def flush(self):
+    def flush(self) -> "list[bytes]":
         if self._size is None or not self._buf:
             return []
         out = [bytes(self._buf)]
@@ -204,7 +215,7 @@ class TextRechunker:
         self._size = size if size and size > 0 else None
         self._buf = ""
 
-    def feed(self, text: str):
+    def feed(self, text: str) -> "list[str]":
         if self._size is None:
             return [text]
         self._buf += text
@@ -213,6 +224,6 @@ class TextRechunker:
         self._buf = self._buf[n:]
         return out
 
-    def flush(self):
+    def flush(self) -> "list[str]":
         out, self._buf = ([self._buf] if self._buf else []), ""
         return out

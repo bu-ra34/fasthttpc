@@ -21,7 +21,8 @@ import asyncio
 import inspect
 import threading
 import time
-from typing import Optional
+from contextlib import AbstractAsyncContextManager
+from typing import Any, Optional
 
 from .models.response import Response
 
@@ -29,7 +30,7 @@ from .models.response import Response
 class Plugin:
     """Base plugin sınıfı. Yalnızca gereken kancaları override edin."""
 
-    def on_request(self, request: dict) -> dict:
+    def on_request(self, request: "dict[str, Any]") -> "dict[str, Any]":
         """İstek gönderilmeden önce çağrılır. request dict'ini döndürün."""
         return request
 
@@ -42,7 +43,7 @@ class Plugin:
         return error
 
 
-def call_sync(plugin, name: str, arg):
+def call_sync(plugin: Plugin, name: str, arg: Any) -> Any:
     """Senkron oturum için kancayı çağırır; coroutine döndüren kancayı reddeder."""
     out = getattr(plugin, name)(arg)
     if inspect.isawaitable(out):
@@ -54,7 +55,7 @@ def call_sync(plugin, name: str, arg):
     return out
 
 
-async def call_async(plugin, name: str, arg):
+async def call_async(plugin: Plugin, name: str, arg: Any) -> Any:
     """AsyncSession için: ``async_<ad>`` varsa onu, yoksa ``<ad>``'ı çağırır; coroutine ise bekler."""
     fn = getattr(plugin, "async_" + name, None) or getattr(plugin, name)
     out = fn(arg)
@@ -76,7 +77,7 @@ class RetryPlugin(Plugin):
     """
 
     def __init__(self, max_retries: int = 3,
-                 retry_on: tuple = (429, 500, 502, 503, 504),
+                 retry_on: "tuple[int, ...]" = (429, 500, 502, 503, 504),
                  backoff: float = 0.5):
         self.max_retries = max_retries
         self.retry_on = set(retry_on)
@@ -102,7 +103,7 @@ class LoggingPlugin(Plugin):
     def __init__(self, verbose: bool = False):
         self._verbose = verbose
 
-    def on_request(self, request: dict) -> dict:
+    def on_request(self, request: "dict[str, Any]") -> "dict[str, Any]":
         print(f"[LOG] → {request['method']} {request['url']}")
         return request
 
@@ -124,9 +125,10 @@ class RateLimitPlugin(Plugin):
         self._interval = 1.0 / rps
         self._last_req = 0.0
         self._tlock    = threading.Lock()
-        self._alock: "asyncio.Lock | None" = None   # döngüye bağlı; tembel oluşur
+        # Döngüye bağlı; tembel oluşur. asyncio.Lock ya da (trio altında) anyio.Lock.
+        self._alock: "AbstractAsyncContextManager[Any] | None" = None
 
-    def on_request(self, request: dict) -> dict:
+    def on_request(self, request: "dict[str, Any]") -> "dict[str, Any]":
         with self._tlock:
             wait = self._interval - (time.monotonic() - self._last_req)
             if wait > 0:
@@ -134,7 +136,7 @@ class RateLimitPlugin(Plugin):
             self._last_req = time.monotonic()
         return request
 
-    async def async_on_request(self, request: dict) -> dict:
+    async def async_on_request(self, request: "dict[str, Any]") -> "dict[str, Any]":
         from . import _backend as B      # asyncio ya da trio (çalışan arka uca uygun kilit)
         if self._alock is None:
             self._alock = B.Lock()
