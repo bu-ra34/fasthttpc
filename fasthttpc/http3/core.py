@@ -11,13 +11,22 @@ import ssl
 from typing import Callable, Optional
 
 from aioquic.h3.connection import H3Connection
-from aioquic.h3.events import DataReceived, HeadersReceived
+from aioquic.h3.events import DataReceived, H3Event, HeadersReceived
 
-try:    # aioquic >= 1.8; eski sürümlerde GOAWAY olayı yüzeye çıkmaz (sunucu GOAWAY'i görünmez)
+try:    # aioquic >= 1.8 emits GoAwayReceived for a server GOAWAY.
     from aioquic.h3.events import GoAwayReceived
-except ImportError:     # pragma: no cover - sürüme bağlı
-    class GoAwayReceived:       # type: ignore[no-redef]
-        stream_id = 0
+    _NATIVE_GOAWAY = True
+except ImportError:     # pragma: no cover - aioquic < 1.8 (the only line on Python 3.10: 1.3)
+    # aioquic 1.3-1.7 parse a GOAWAY frame on the control stream and silently DROP it
+    # (H3Connection._handle_control_frame has no GOAWAY branch), so a server's graceful
+    # shutdown would be invisible. make_h3_class() adds a shim that surfaces it as this event.
+    from dataclasses import dataclass
+
+    @dataclass
+    class GoAwayReceived(H3Event):      # type: ignore[no-redef]
+        stream_id: int
+
+    _NATIVE_GOAWAY = False
 from aioquic.quic import events as qevents
 from aioquic.quic.configuration import QuicConfiguration
 from aioquic.quic.connection import QuicConnection
@@ -66,7 +75,55 @@ def make_h3_class(profile: fp.QuicProfile):
                 except TypeError:   # eski pylsqpack: bu anahtar yok
                     self._decoder = pylsqpack.Decoder(profile.qpack_table_capacity, 0)
 
-    return _H3
+    return _H3 if _NATIVE_GOAWAY else _with_goaway_shim(_H3)
+
+
+def _with_goaway_shim(base: type) -> type:
+    """aioquic < 1.8: surface the server GOAWAY that H3Connection drops, with the checks
+    aioquic 1.8 performs (RFC 9114 sections 5.2, 7.2.6): a malformed frame is H3_FRAME_ERROR,
+    an ID that is not a client bidi stream or that increases is H3_ID_ERROR. aioquic's
+    handle_event turns these ProtocolErrors into a connection close."""
+    from aioquic.buffer import Buffer, BufferReadError
+    from aioquic.h3.connection import ErrorCode, FrameType, ProtocolError
+
+    def _error(code: int, reason: str) -> ProtocolError:
+        err = ProtocolError(reason)
+        err.error_code = code
+        return err
+
+    class _H3GoAway(base):  # type: ignore[valid-type, misc]
+        def __init__(self, quic):
+            super().__init__(quic)
+            self._fh_goaway_id: "Optional[int]" = None
+            self._fh_goaway_pending: "list[int]" = []
+
+        def _handle_control_frame(self, frame_type, frame_data):
+            super()._handle_control_frame(frame_type, frame_data)   # SETTINGS-first check etc.
+            if frame_type != FrameType.GOAWAY or not self._is_client:
+                return
+            buf = Buffer(data=frame_data)
+            try:
+                goaway_id = buf.pull_uint_var()
+            except BufferReadError:
+                raise _error(ErrorCode.H3_FRAME_ERROR, "truncated GOAWAY frame") from None
+            if not buf.eof():
+                raise _error(ErrorCode.H3_FRAME_ERROR, "GOAWAY frame has trailing bytes")
+            if goaway_id % 4 != 0:
+                raise _error(ErrorCode.H3_ID_ERROR,
+                             "GOAWAY does not carry a client-initiated bidirectional stream ID")
+            if self._fh_goaway_id is not None and goaway_id > self._fh_goaway_id:
+                raise _error(ErrorCode.H3_ID_ERROR, "GOAWAY increased the ID of a previous GOAWAY")
+            self._fh_goaway_id = goaway_id
+            self._fh_goaway_pending.append(goaway_id)
+
+        def handle_event(self, event):
+            events = super().handle_event(event)
+            if self._fh_goaway_pending:
+                events = list(events) + [GoAwayReceived(stream_id=i) for i in self._fh_goaway_pending]
+                self._fh_goaway_pending.clear()
+            return events
+
+    return _H3GoAway
 
 
 class _Stream:
