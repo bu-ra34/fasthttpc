@@ -1,8 +1,8 @@
 site_name: fasthttpc
 site_description: Pure-Python HTTP client with browser TLS/HTTP2 fingerprint impersonation
-site_url: https://cevpy.github.io/fasthttpc/
-repo_url: https://github.com/cevpy/fasthttpc
-repo_name: cevpy/fasthttpc
+site_url: https://bu-ra34.github.io/fasthttpc/
+repo_url: https://github.com/bu-ra34/fasthttpc
+repo_name: bu-ra34/fasthttpc
 edit_uri: edit/main/docs/
 strict: true
 
