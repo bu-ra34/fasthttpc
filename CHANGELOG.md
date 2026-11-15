@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+## [0.6.1.post1] — 2026-11-16
+
+Yalnızca dokümantasyon güncellemesi; kod 0.6.1 ile aynı.
+
 ### Dokümantasyon
 - README, README.tr ve mkdocs sayfaları koda göre güncellendi: HTTP/3 (deneysel,
   yalnızca yerel testler), trio, TLS 1.3 PSK oturum devamı (varsayılan kapalı,
