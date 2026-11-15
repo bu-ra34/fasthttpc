@@ -529,6 +529,29 @@ class AnyioStream:
         if self._err is not None:
             raise self._err
 
+    def can_write_eof(self) -> bool:
+        """Yalnızca düz TCP akışında (anyio TLSStream ``send_eof`` desteklemez)."""
+        return not self._closing and isinstance(self._s, _anyio().abc.SocketStream)
+
+    def write_eof(self) -> None:
+        """Bekleyen veri gönderildikten sonra yazma yönünü kapatır (TCP FIN)."""
+        if not self.can_write_eof():
+            return
+        coro = self._send_eof()
+        try:
+            spawn(coro, name="fasthttpc-eof")
+        except RuntimeError:
+            coro.close()
+
+    async def _send_eof(self) -> None:
+        f = self._flusher
+        if f is not None:
+            await f.wait()
+        try:
+            await self._s.send_eof()
+        except Exception as e:  # noqa: BLE001
+            logger.debug("send_eof hatası yok sayıldı: %s", e)
+
     # ----------------------------------------------------------------- kapanış
     def is_closing(self) -> bool:
         return self._closing
