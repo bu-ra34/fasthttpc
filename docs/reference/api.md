@@ -4,11 +4,11 @@
 
 ::: fasthttpc.Session
     options:
-      members: [request, get, post, put, patch, delete, head, options, close, pre_warm, pool_stats, set_proxies, cookies, websocket]
+      members: [request, get, post, put, patch, delete, head, options, stream, close, use, pre_warm, pool_stats, set_proxies, cookies, websocket]
 
 ::: fasthttpc.AsyncSession
     options:
-      members: [request, get, post, put, patch, delete, head, options, gather, close, use, cookies, websocket]
+      members: [request, get, post, put, patch, delete, head, options, stream, gather, close, use, pre_warm, pool_stats, set_proxies, cookies, websocket, ws_connect]
 
 ## Models
 
@@ -23,6 +23,20 @@
 ::: fasthttpc.Timeout
 ::: fasthttpc.Limits
 ::: fasthttpc.Retry
+::: fasthttpc.http3.Http3Options
+
+## Authentication
+
+::: fasthttpc.Auth
+::: fasthttpc.BasicAuth
+::: fasthttpc.BearerAuth
+::: fasthttpc.DigestAuth
+
+## Client certificates
+
+::: fasthttpc.security.client_cert.ClientCert
+    options:
+      members: [from_pem, from_pkcs12, coerce, close]
 
 ## Testing
 
@@ -36,7 +50,7 @@
 ::: fasthttpc.ResponseCache
 ::: fasthttpc.RequestMetrics
 
-## Plugins (async)
+## Plugins
 
 ::: fasthttpc.Plugin
 ::: fasthttpc.RetryPlugin

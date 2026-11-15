@@ -47,12 +47,12 @@ nav:
       - HTTP/2: http2.md
       - Timeouts, limits, retries: timeouts-limits-retries.md
       - Testing with MockTransport: testing.md
-  - Upcoming features:
+  - Features:
       - Streaming responses: features/streaming.md
       - Auth and hooks: features/auth-hooks.md
       - Client certificates (mTLS): features/client-certs.md
       - Legacy TLS: features/legacy-tls.md
-      - HTTP/3: features/http3.md
+      - HTTP/3 (experimental): features/http3.md
       - Trio support: features/trio.md
   - Reference:
       - API reference: reference/api.md

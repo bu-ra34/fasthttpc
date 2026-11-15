@@ -1,8 +1,11 @@
 """
-fasthttpc — Pure-Python HTTP istemcisi
+fasthttpc — Pure-Python HTTP istemcisi (deneysel / alpha)
 
-TLS 1.3 fingerprinting, Chrome/Firefox/Safari impersonation,
-async destek, akıllı connection pool ve plugin sistemi içerir.
+Kendi TLS 1.3 / TLS 1.2 yığını, Chrome/Firefox/Safari TLS ve HTTP/2 parmak
+izi taklidi, HTTP/2, senkron ``Session`` ve async ``AsyncSession`` (asyncio
+veya ``fasthttpc[trio]`` ile trio), akış, auth/hook'lar, mTLS, connection pool
+ve plugin sistemi içerir. HTTP/3 deneyseldir ve isteğe bağlıdır
+(``fasthttpc[http3]``, varsayılan kapalı). ``verify=False`` desteklenmez.
 
 Hızlı başlangıç::
 

@@ -2,13 +2,88 @@
 
 [English](README.md) | **Türkçe**
 
-Pure-Python HTTP istemcisi. TLS 1.3 handshake'i, tarayıcı parmak izi taklidi,
-HTTP/2 ve async destek içerir.
+Pure-Python HTTP istemcisi: kendi TLS 1.3 / TLS 1.2 yığını, tarayıcı TLS ve
+HTTP/2 parmak izi taklidi (Chrome, Firefox, Safari), HTTP/2 multiplexing,
+senkron ve async API (asyncio ya da anyio üzerinden trio). Deneysel HTTP/3
+isteğe bağlı bir ek paket olarak gelir. Kendine ait C eklentisi yoktur: tek
+derlenmiş çalışma zamanı bağımlılığı primitifler (AEAD, X25519, ML-KEM,
+sertifika ayrıştırma) için `cryptography`'dir; isteğe bağlı ekler (`http3`,
+`brotli`, `zstd`) kendi derlenmiş paketlerini getirir.
 
-> **Durum: deneysel.** TLS yığını sıfırdan yazılmıştır. v0.2.0 ile sunucu kimlik
-> doğrulaması tam hâle geldi (aşağıya bakın), ama bu kod bağımsız bir güvenlik
-> denetiminden geçmedi. Kritik üretim trafiği için `curl_cffi` gibi olgun bir
-> alternatifi tercih edin.
+> **Durum: deneysel (alpha).** TLS yığını sıfırdan yazılmıştır. v0.2.0 ile sunucu
+> kimlik doğrulaması tam hâle geldi (aşağıya bakın). Kod kendi içimizde bir
+> güvenlik incelemesinden geçti ([docs/security-audit.md](docs/security-audit.md)),
+> ama **bağımsız bir güvenlik denetimi yapılmadı**. Kritik üretim trafiği için
+> `curl_cffi`, `httpx` veya `requests` gibi olgun bir alternatifi tercih edin.
+
+## Kurulum
+
+```bash
+pip install fasthttpc
+pip install "fasthttpc[brotli,zstd]"   # isteğe bağlı içerik kod çözücüleri
+pip install "fasthttpc[trio]"          # AsyncSession'ı trio altında çalıştırmak için (anyio + trio)
+pip install "fasthttpc[http3]"         # deneysel HTTP/3 (aioquic)
+```
+
+Python 3.10+. CI testleri Linux'ta Python 3.10 - 3.13, Windows ve macOS'ta
+Python 3.12 ile çalıştırır.
+
+Geliştirme için:
+
+```bash
+git clone https://github.com/bu-ra34/fasthttpc
+cd fasthttpc
+pip install -e ".[dev]"
+pytest        # ağ gerektirmez (canlı testler FASTHTTPC_LIVE=1 olmadan atlanır)
+```
+
+## Özellikler
+
+| Alan | Destek |
+|---|---|
+| Protokoller | HTTP/1.1 (keep-alive, chunked), HTTP/2 (akış kontrolü, GOAWAY; eşzamanlı akışlar `AsyncSession`'da), WebSocket (`ws://`, `wss://`), HTTP/3 (**deneysel**, isteğe bağlı, aşağıya bakın) |
+| TLS | Kendi TLS 1.3'ümüz (HelloRetryRequest; key_share x25519, secp256r1, secp384r1 ve `cryptography` ML-KEM sunuyorsa hibrit post-kuantum X25519MLKEM768) ve TLS 1.2'nin güvenli bir alt kümesi (ECDHE + AEAD, EMS zorunlu). TLS 1.3 PSK oturum devamı var ama varsayılan kapalı; 0-RTT yok |
+| Sunucu doğrulaması | Zincir + hostname, CertificateVerify, Finished, hepsi zorunlu; `verify=` ile özel CA bundle |
+| İstemci sertifikası | `cert=` (mTLS): PEM, şifreli PKCS#8 veya PKCS#12; RSA >= 2048, P-256, P-384, Ed25519; TLS 1.3 ve TLS 1.2 |
+| Parmak izi | `chrome_131`, `firefox_133`, `safari_18` profilleri: ClientHello (JA3/JA4), HTTP/2 SETTINGS, pseudo-header sırası, başlık sırası |
+| Async | `AsyncSession` asyncio altında ya da anyio üzerinden trio altında (`fasthttpc[trio]`); aynı parmak izi ve gerçek HTTP/2 multiplexing |
+| Akış | `stream=True` / `s.stream(...)`; `iter_bytes`, `iter_text`, `iter_lines`, `iter_raw` ve async `aiter_*` karşılıkları; HTTP/1.1 ve HTTP/2 |
+| Auth ve hook'lar | Basic, Digest (RFC 7616), Bearer, `.netrc`, özel auth (requests veya httpx tarzı); requests tarzı `hooks=`, httpx tarzı `event_hooks=`; `Session` ve `AsyncSession`'da plugin'ler |
+| Proxy | HTTP CONNECT (+Basic), SOCKS5 (RFC 1929), rotasyon; TLS her zaman tünelin içinde kurulur |
+| Zaman aşımı / sınır / yeniden deneme | `Timeout` (`total` dahil), `Limits`, urllib3 tarzı `Retry` (`Retry-After` ile) |
+| Çerez, cache, yönlendirme | RFC 6265 cookie jar, response cache, yönlendirme geçmişi |
+| DNS | İsteğe bağlı DNS-over-HTTPS çözücü; çok adresli host'larda Happy Eyeballs (RFC 8305) |
+| Eski sunucular | `legacy_tls=True` (varsayılan kapalı): TLS 1.2 CBC ve statik RSA suite'leri. TLS 1.0/1.1 hiçbir zaman desteklenmez |
+| Test | `MockTransport` (senkron ve async handler) |
+| Tip bilgisi | `py.typed` ile gelir |
+
+HTTP/3 (`http3=True`: Alt-Svc keşfi ve sessizce HTTP/2'ye düşüş, ya da
+`http3="force"`) **deneyseldir** ve varsayılan kapalıdır. `fasthttpc[http3]`
+(aioquic) gerektirir. QUIC içindeki TLS el sıkışmasını aioquic yapar; bu yüzden
+tarayıcı ClientHello parmak izi HTTP/3'te **taşınmaz**, yalnızca QUIC transport
+parametreleri ve HTTP/3 SETTINGS Chrome benzeri bir profili izler. Yalnızca yerel
+bir aioquic sunucusuna karşı test edildi: gerçek sunuculara karşı isteğe bağlı
+canlı testler var (`tests/live/`), ama CI'da çalışmıyor.
+
+## Karşılaştırma
+
+Dürüst karşılaştırma; burada "olgunluk" özellikler kadar önemlidir.
+
+| | fasthttpc | requests | httpx | curl_cffi |
+|---|---|---|---|---|
+| Gerçekleme | Pure Python + `cryptography` | Pure Python + urllib3 + `ssl` | Pure Python + h11/h2 + `ssl` | libcurl-impersonate (C), cffi ile |
+| TLS kütüphanesi | **Kendi TLS 1.3/1.2 kodu** | `ssl` üzerinden OpenSSL | `ssl` üzerinden OpenSSL | BoringSSL |
+| Tarayıcı TLS/JA3/JA4 taklidi | Evet (3 aile) | Hayır | Hayır | Evet (çok sürüm, en geniş kapsam) |
+| HTTP/2 parmak izi | Evet | Hayır | Hayır | Evet |
+| HTTP/2 | Evet | Hayır | Evet | Evet |
+| HTTP/3 | **Deneysel**, isteğe bağlı (aioquic); QUIC'te tarayıcı TLS parmak izi yok; yalnızca yerel testler | Hayır | Hayır | Evet |
+| Async | Evet (asyncio, anyio üzerinden trio) | Hayır | Evet (asyncio, anyio üzerinden trio) | Evet |
+| `verify=False` | **Bilinçli olarak desteklenmez** | Evet | Evet | Evet |
+| Oturum devamı / 0-RTT | TLS 1.3 PSK oturum devamı, **varsayılan kapalı**; 0-RTT yok | Evet (OpenSSL) | Evet (OpenSSL) | Evet |
+| Post-kuantum anahtar değişimi | Chrome ve Firefox profillerinde X25519MLKEM768, yalnızca `cryptography` >= 47 ile; HTTP/3'te yok | OpenSSL 3.5+ ile | OpenSSL 3.5+ ile | Evet |
+| Olgunluk / üretim kullanımı | **Alpha, genç; yalnızca iç inceleme, bağımsız denetim yok** | Çok olgun | Olgun | Olgun |
+| Gerçek dünyada sertleşme yılı | Yok | >10 | >5 | Birkaç |
+| Hız | Pure Python: büyük aktarımlarda daha yavaş | Yeterince hızlı | Yeterince hızlı | En hızlı |
 
 ## Güvenlik modeli
 
@@ -24,9 +99,15 @@ Her TLS 1.3 bağlantısında sunucu kimliği **üç ayrı kontrolle** doğrulan�
 İkincisi olmadan sertifika doğrulaması tek başına MITM'i engellemez: sertifika
 herkese açık veridir, araya giren biri onu aynen iletip kendi anahtar
 değişimini yapabilir. Herhangi biri başarısız olursa bağlantı reddedilir.
+HTTP/3 bağlantıları da istek gönderilmeden önce aynı sertifika doğrulayıcısından
+geçer.
 
 Güven kökü olarak `certifi` bundle'ı + varsa sistem CA deposu kullanılır.
 Sertifika doğrulamayı kapatmanın bir yolu yoktur; bu kasıtlıdır.
+
+`AsyncSession(impersonate=None)` ve DNS-over-HTTPS çözücüsü bu yığını
+kullanmaz: Python'un `ssl` modülünü `ssl.create_default_context()` ile kullanır;
+orada da sertifika zinciri ve hostname her zaman doğrulanır.
 
 ### `verify`: özel CA bundle
 
@@ -47,17 +128,8 @@ with Session(verify="/etc/kurum/ca.pem") as s:   # yalnızca bu CA'lara güvenil
   istiyoruz. Kendinden imzalı bir test sunucusu için de o sertifikayı (veya
   imzalayan CA'yı) `verify=` ile verin.
 
-`AsyncSession(verify=...)` da aynı kuralları uygular (stdlib `ssl`'e `cafile`
-olarak iletilir).
-
-## Kurulum
-
-```bash
-git clone https://github.com/bu-ra34/fasthttpc
-cd fasthttpc
-pip install -e ".[dev]"
-pytest        # ağ gerektirmez
-```
+`AsyncSession(verify=...)` da aynı kuralları uygular (`impersonate=None` ile
+stdlib `ssl`'e `cafile` olarak iletilir).
 
 ## Hızlı başlangıç
 
@@ -77,13 +149,16 @@ import asyncio
 from fasthttpc import AsyncSession
 
 async def main():
-    # Async tarafta da tarayıcı parmak izi taklidi var (kendi TLS 1.3 yığını)
+    # Async tarafta da tarayıcı parmak izi taklidi var (kendi TLS yığını)
     async with AsyncSession(impersonate="chrome_131") as s:
         r = await s.get("https://httpbin.org/get")
         print(r.status_code)
 
 asyncio.run(main())
 ```
+
+Aynı `AsyncSession` `fasthttpc[trio]` kuruluysa `trio.run(main)` ile de çalışır
+(HTTP/3 hariç).
 
 ### requests / httpx'ten geçiş
 
@@ -99,8 +174,11 @@ de çalışır).
   çalışır.
 - `r.json` requests'te olduğu gibi **metottur** (`r.json()`).
 - `requests.get(...)` yerine `Session`/`AsyncSession` kullanın; `verify=False`
-  desteklenmez (bkz. Güvenlik modeli), `proxies={...}` sözlüğü ve `timeout=`
-  (sayı veya `Timeout`) requests ile aynı biçimdedir.
+  desteklenmez (bkz. Güvenlik modeli). `proxies={...}` sözlüğü requests ile aynı
+  biçimdedir ama yalnızca oturum düzeyindedir. `timeout=`, `params=`, `auth=`,
+  `cookies=`, `hooks=` ve `stream=True` istek başına da verilebilir.
+- Proxy ortam değişkenleri (`HTTPS_PROXY` ...) okunmaz; `trust_env` yalnızca
+  `.netrc`'yi etkiler.
 
 ### Timeout ve Limits
 
@@ -122,7 +200,8 @@ with Session(
 | `connect` | TCP bağlantısı + TLS el sıkışması |
 | `read` | Sunucudan veri bekleme |
 | `write` | Veri gönderme (şimdilik senkron tarafta `read` ile aynı soket zaman aşımını paylaşır) |
-| `pool` | Havuzdan boş bağlantı bekleme (verilmezse `connect`) |
+| `pool` | Havuzdan boş bağlantı bekleme (diğer alanlar gibi ilk argümanı alır; yine de `None` ise `Session` `connect` süresini kullanır, `AsyncSession` sınırsız bekler) |
+| `total` | Gövde dahil tüm isteğin süre sınırı (varsayılan `None`, sınırsız) |
 
 Geriye dönük uyumluluk: `Session(timeout=30)` ve `Timeout(connect=5, read=30)`
 eskisi gibi çalışır; `from fasthttpc.timeout import Timeout` aynı sınıftır.
@@ -130,9 +209,9 @@ eskisi gibi çalışır; `from fasthttpc.timeout import Timeout` aynı sınıft�
 
 | `Limits` alanı | Varsayılan | Anlamı |
 |---|---|---|
-| `max_connections` | 10 | Origin başına eşzamanlı bağlantı |
+| `max_connections` | 10 | `Session`'da origin başına, `AsyncSession`'da toplam eşzamanlı bağlantı (`AsyncSession`'ın `max_connections` varsayılanı 100) |
 | `max_keepalive_connections` | `None` (= `max_connections`) | Havuzda boşta tutulan bağlantı |
-| `keepalive_expiry` | 30.0 | Boştaki bağlantının ömrü (sn); `None` → sınırsız |
+| `keepalive_expiry` | 30.0 | Boştaki bağlantının ömrü (sn); `None` → sınırsız, `0` → keep-alive kapalı |
 
 ### Yeniden deneme (`retries`)
 
@@ -196,6 +275,8 @@ async with AsyncSession(impersonate=None) as s:
 ```
 
 `RetryPlugin` `Retry-After` başlığına saygı duyar, yoksa üstel bekleme uygular.
+Aynı plugin'ler senkron `Session.use()` ile de çalışır (orada kancalar düz
+fonksiyon olmalıdır).
 
 ### DNS-over-HTTPS
 
@@ -228,8 +309,9 @@ with Session(proxies={"https": "socks5://u:p@127.0.0.1:1080"}) as s:
     r = s.get("https://example.com")
 ```
 
-TLS (ve parmak izi) her zaman tünelin İÇİNDE fasthttpc'nin kendi TLS 1.3
-yığınıyla kurulur; proxy yalnızca TCP baytlarını taşır.
+TLS (ve parmak izi) her zaman tünelin İÇİNDE fasthttpc'nin kendi TLS yığınıyla
+kurulur (`AsyncSession(impersonate=None)` ile stdlib `ssl`); proxy yalnızca TCP
+baytlarını taşır.
 
 ### Logging
 
@@ -259,9 +341,10 @@ print(ja3_hash)
 | `chrome_131` | `chrome` |
 | `firefox_133` | `firefox`, `firefox_120` |
 | `safari_18` | `safari`, `safari_17` |
-| `default` | — (tarayıcı taklidi yok) |
+| `default` | — (tarayıcı taklidi yok; `impersonate=None`) |
 
 Bilinmeyen bir profil adı `ValueError` fırlatır; sessizce `default`'a düşmez.
+`Session` ve `AsyncSession`'ın varsayılanı `"chrome_131"`'dir.
 
 ## Bilinen sınırlar
 
@@ -285,57 +368,90 @@ verir veya belgelenmiştir:
   `impersonate` ile tarayıcı ClientHello'su (WebSocket'te ALPN yalnızca
   `http/1.1`), `proxy=` / `proxies=` / rotasyon ile tünel üzerinden; `ws://` ve
   `wss://` desteklenir. `pre_warm` ısıttığı HTTP/1.1 bağlantılarını keep-alive
-  havuzuna, h2 bağlantısını h2 önbelleğine koyar.
+  havuzuna, h2 bağlantısını h2 önbelleğine koyar. Senkron `Session` bir HTTP/2
+  bağlantısında istekleri sırayla yürütür.
+- **Senkron WebSocket:** `Session.websocket()` daha az test edilmiştir: `ws://`
+  adresi şu an `TypeError` veriyor ve `wss://`'de ALPN profilin tam listesidir
+  (`h2, http/1.1`). WebSocket için `AsyncSession` tercih edin.
 - **AsyncSession proxy:** `proxy=` / `proxies=` senkron `Session` ile aynı
   anlamdadır (HTTP CONNECT + Basic, SOCKS5 / RFC 1929; `https://` proxy yok).
-  Tünelin içinde hem `impersonate` (kendi TLS 1.3 yığını) hem stdlib `ssl`
-  çalışır; stdlib `ssl` + proxy Python 3.11+ gerektirir. `set_proxies([...])`
-  rotasyonu artık proxy'yi gerçekten kullanır ve `proxy=`'yi geçersiz kılar.
+  Tünelin içinde hem `impersonate` (kendi TLS yığını) hem stdlib `ssl`
+  çalışır (Python 3.10'da da). `set_proxies([...])` rotasyonu proxy'yi gerçekten
+  kullanır ve `proxy=`'yi geçersiz kılar.
   `AsyncSession` ayrıca `Timeout` (connect/read/write/pool; read, hareketsizlik
   süresidir) ve `Limits` (`max_connections` = toplam eşzamanlı bağlantı,
   `max_keepalive_connections`, `keepalive_expiry`) kabul eder. `max_connections`
   kullanımdaki bağlantıları sınırlar; boştaki keep-alive bağlantılar slot
   tutmaz ve `max_keepalive_connections` (varsayılan `max_connections`) ile
   sınırlıdır. Async'te `keepalive_expiry=0` keep-alive'ı kapatır.
+- Proxy ortam değişkenleri (`HTTP_PROXY`, `HTTPS_PROXY`, `NO_PROXY`) okunmaz.
+- **Düz HTTP yok:** `http://` adresleri de TLS ile istenir (adreste port yoksa
+  80'e), bu yüzden yalnızca düz HTTP konuşan sunuculara ulaşılamaz. `ws://`
+  WebSocket'leri (async) düz TCP kullanır.
 - Async HTTP/2'de sunucu PUSH_PROMISE'i protokol hatasıdır (ENABLE_PUSH=0 ilan
-  edilir); öncelik (PRIORITY) gönderilmez, yok sayılır.
-- **TLS 1.2: yalnızca güvenli bir alt küme desteklenir** (`fasthttpc/security/tls12.py`,
-  hem senkron hem async yolda). TLS 1.3 tercih edilir; sunucu TLS 1.2 seçerse:
+  edilir); PRIORITY frame'i gönderilmez, gelirse yok sayılır (HEADERS'ın öncelik
+  alanı profili izler).
+- **TLS 1.2: varsayılan olarak yalnızca güvenli bir alt küme desteklenir**
+  (`fasthttpc/security/tls12.py`, hem senkron hem async yolda). TLS 1.3 tercih
+  edilir; sunucu TLS 1.2 seçerse:
   - *Desteklenen:* ECDHE (x25519, secp256r1, secp384r1) + ECDSA/RSA sertifika;
     AES-128-GCM, AES-256-GCM, ChaCha20-Poly1305 (0xC02B, 0xC02F, 0xC02C, 0xC030,
     0xCCA9, 0xCCA8); ServerKeyExchange imza algoritmaları ecdsa, rsa_pss_rsae ve
     rsa_pkcs1 (SHA-256/384/512; ClientHello'da ilan edilenlerden biri olmalı).
+    CertificateRequest (mTLS) yanıtlanır: `cert=` varsa sertifika, yoksa boş
+    Certificate gönderilir.
   - *Zorunlu:* Extended Master Secret (RFC 7627) ve renegotiation_info (RFC 5746);
     sunucu birini göndermezse bağlantı reddedilir. Sertifika zinciri + hostname,
     SKE imzası, Finished (sabit zamanlı), handshake mesaj sırası ve
     ServerHello.random `DOWNGRD` işareti (downgrade saldırısı) denetlenir.
   - *Reddedilen (açık hatayla):* CBC suite'leri, statik RSA, DHE, PSK, anonim/export,
-    SHA-1/MD5/SHA-224 imzalar, istemci sertifikası isteği (CertificateRequest),
-    null dışı sıkıştırma, TLS 1.1 ve altı. Renegotiation desteklenmez (HelloRequest'e
-    `no_renegotiation` uyarısı verilir, tekrarlanırsa bağlantı kapanır).
-  - *Kullanılmayan:* NewSessionTicket yalnızca ayrıştırılır; oturum devamı yoktur.
+    SHA-1/MD5/SHA-224 imzalar, null dışı sıkıştırma, TLS 1.1 ve altı. Renegotiation
+    desteklenmez (HelloRequest'e `no_renegotiation` uyarısı verilir, tekrarlanırsa
+    bağlantı kapanır). CBC, statik RSA, SHA-1 SKE imzası ve EMS'siz sunucular
+    yalnızca `legacy_tls=True` ile kabul edilir; DHE, PSK ve TLS 1.0/1.1 hiçbir
+    zaman.
+  - *Kullanılmayan:* TLS 1.2'de NewSessionTicket yalnızca ayrıştırılır; TLS 1.2
+    oturum devamı yoktur.
 - **HelloRetryRequest:** destekleniyor (RFC 8446 §4.1.4, cookie dahil); ikinci
   HRR handshake'i sonlandırır.
-- **Session resumption (PSK/0-RTT) yok.** Her bağlantı tam handshake yapar.
+- **TLS 1.3 PSK oturum devamı varsayılan KAPALIDIR.** Süreç genelinde
+  `fasthttpc.security.session_tickets.enable_resumption(True)` ya da
+  `FASTHTTPC_TLS_RESUMPTION=1` ile açılır (yalnızca `psk_dhe_ke`, biletler tek
+  kullanımlık). Kapalıyken her bağlantı tam handshake yapar. 0-RTT hiç yoktur;
+  HTTP/3'te oturum devamı kullanılmaz.
 - **HPACK huffman ENCODE yok** (decode var). Protokolde geçerli, ama h2 parmak
   izinde küçük bir sapma yaratır.
-- **key_share grupları:** x25519, secp256r1, secp384r1. Hibrit/post-kuantum
-  gruplar (X25519MLKEM768) ve secp521r1/ffdhe implemente edilmedi: bunlar için
-  key_share *gönderilmez*; profil supported_groups'ta ilan ediyorsa ve sunucu
-  HRR ile bunları isterse açık hata verilir.
+- **key_share grupları:** x25519, secp256r1, secp384r1 ve hibrit post-kuantum
+  X25519MLKEM768. X25519MLKEM768 yalnızca `chrome_131` ve `firefox_133`
+  profillerinde ve yalnızca kurulu `cryptography` ML-KEM sunuyorsa (47 ve üstü)
+  gönderilir; aksi halde supported_groups'tan da çıkarılır ve ClientHello gerçek
+  tarayıcıdan ayrışır. secp521r1/x448/ffdhe implemente edilmedi: bunlar için
+  key_share *gönderilmez*; profil supported_groups'ta ilan ediyorsa (Firefox,
+  Safari) ve sunucu HRR ile bunları isterse açık hata verilir.
+- **HTTP/3 deneyseldir:** proxy üzerinden ve `cert=` ile kullanılmaz, trio
+  altında çalışmaz, yanıt gövdesini tamamen okur (`stream=True` ile de), QUIC
+  içindeki ClientHello aioquic'indir (tarayıcı parmak izi yok). Yalnızca yerel
+  aioquic sunucusuyla test edildi.
 - `Session` thread-safe değildir; thread başına bir tane kullanın.
 - **`verify=False` yok** (bilinçli; yukarıya bakın).
 - `Timeout.write` senkron tarafta ayrı uygulanmıyor (soket `read` zaman aşımını
   kullanır); `AsyncSession` `write`'ı drain süresine uygular.
+- İç güvenlik incelemesinin açık bulguları (ör. açılmış gövde boyutuna sınır
+  yok, çerezlerde Public Suffix List yok) [docs/security-audit.md](docs/security-audit.md)'de.
 
 ## Modül yapısı
 
 ```
 fasthttpc/
 ├── session.py          # Sync HTTP istemcisi
+├── async_session.py    # Async istemci (asyncio / trio)
+├── _backend.py         # asyncio / trio (anyio) arka uç soyutlaması
+├── _api.py             # Ortak istek yardımcıları (params, timeout, hook'lar)
 ├── config.py           # Timeout, Limits, verify çözümleme
 ├── retry.py            # Retry politikası
-├── async_session.py    # Async istemci + plugin sistemi
+├── auth.py             # Basic, Digest, Bearer, .netrc, özel auth
+├── plugins.py          # Plugin arayüzü (Session ve AsyncSession)
+├── streaming.py        # Akış gövdesi kod çözücüleri
 ├── cookies.py          # RFC 6265 cookie jar (domain/path/Secure)
 ├── tls_crafter.py      # ClientHello oluşturucu
 ├── tls_tools.py        # TLS yardımcıları
@@ -344,16 +460,19 @@ fasthttpc/
 ├── buffer.py           # Adaptif alıcı buffer
 ├── cache.py            # Response cache
 ├── metrics.py          # İstek metrikleri
+├── multipart.py        # multipart/form-data
 ├── models/             # URL, Headers, Request, Response
-├── protocol/           # HTTP/1.1, HTTP/2, WebSocket, DoH
-├── security/           # TLS adapter, sertifika doğrulama
-└── transport/          # Connection pool, MockTransport
+├── protocol/           # HTTP/1.1, HTTP/2 (sync + async), WebSocket, DoH
+├── security/           # TLS 1.3/1.2 adapter, sertifika doğrulama, key_share, mTLS, oturum biletleri, legacy TLS
+├── tls13/              # Sans-IO TLS 1.3 çekirdeği (async yol)
+├── http3/              # Deneysel HTTP/3 (aioquic), Alt-Svc
+└── transport/          # Connection pool, proxy, Happy Eyeballs, MockTransport
 ```
 
 ## Testler
 
 ```bash
-pytest              # ağsız birim testler
+pytest              # ağsız testler (canlı HTTP/3 testleri FASTHTTPC_LIVE=1 olmadan atlanır)
 python smoke_test.py  # ağ gerektiren elle doğrulama
 ```
 
