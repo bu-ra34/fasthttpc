@@ -248,10 +248,9 @@ def test_goaway_marks_connection_unusable(pki, h3):
 
 
 def test_goaway_event_refuses_inflight(pki, h3):
-    from fasthttpc.http3.core import Http3RequestRefused, _Stream
-    GoAwayReceived = pytest.importorskip("aioquic.h3.events").__dict__.get("GoAwayReceived")
-    if GoAwayReceived is None:
-        pytest.skip("bu aioquic sürümü GoAwayReceived olayı sunmuyor")
+    # aioquic >= 1.8: aioquic'in kendi olayı; < 1.8 (Python 3.10'da en yenisi 1.3): fasthttpc'nin
+    # GOAWAY uyumluluk katmanının ürettiği olay (bkz. core._with_goaway_shim).
+    from fasthttpc.http3.core import GoAwayReceived, Http3RequestRefused, _Stream
     with Session(http3="force", verify=pki["ca"]) as s:
         s.get(url(h3))
         core = next(iter(s._h3._conns.values())).core
@@ -259,6 +258,71 @@ def test_goaway_event_refuses_inflight(pki, h3):
         core.h3.handle_event = lambda ev: [GoAwayReceived(stream_id=100)]
         core._h3_events(object())
         assert isinstance(st.error, Http3RequestRefused) and core.goaway_id == 100
+
+
+def _wait_core(conn, cond, timeout=5.0):
+    """Senkron bağlantıyı istek göndermeden sür (sunucunun kendiliğinden gönderdiği çerçeveler)."""
+    with conn._lock:
+        conn._run(cond, time.monotonic() + timeout, "test bekleme")
+
+
+def test_server_goaway_frame_marks_connection_unusable(pki, h3):
+    """Sunucudan GERÇEK GOAWAY çerçevesi: aioquic 1.3-1.7 bunu sessizce yutuyordu."""
+    with Session(http3="force", verify=pki["ca"]) as s:
+        r = s.get(url(h3, "/goaway"))           # akış 0; sunucu ardından GOAWAY(4) yollar
+        assert r.status_code == 200 and r.http_version == "HTTP/3"
+        conn = next(iter(s._h3._conns.values()))
+        _wait_core(conn, lambda: conn.core.goaway_id is not None)
+        assert conn.core.goaway_id == 4 and not conn.usable
+        assert s.get(url(h3)).http_version == "HTTP/3"      # yeni bağlantı kuruldu
+        assert next(iter(s._h3._conns.values())) is not conn
+
+
+def test_server_goaway_refuses_unprocessed_request_and_retries(pki, h3):
+    """Sunucu isteği işlemeden GOAWAY(akış) gönderir: istek reddedilir, yeni bağlantıda tekrarlanır."""
+    with Session(http3="force", verify=pki["ca"]) as s:
+        s.get(url(h3))                                     # akış 0
+        first = next(iter(s._h3._conns.values()))
+        r = s.get(url(h3, f"/refuse-once-sync-{id(s)}"))   # akış 4 -> GOAWAY(4), yanıt yok
+        assert r.status_code == 200 and r.http_version == "HTTP/3"
+        assert first.core.goaway_id == 4
+        assert next(iter(s._h3._conns.values())) is not first
+
+
+def test_server_goaway_refusal_async(pki, h3):
+    async def go():
+        async with AsyncSession(http3="force", verify=pki["ca"]) as s:
+            await s.get(url(h3))
+            first = next(iter(s._h3._conns.values()))
+            r = await s.get(url(h3, f"/refuse-once-async-{id(s)}"))
+            assert r.status_code == 200 and r.http_version == "HTTP/3"
+            assert first.core.goaway_id == 4
+            assert next(iter(s._h3._conns.values())) is not first
+    asyncio.run(go())
+
+
+@pytest.mark.parametrize("goaway_id", [2, 3])   # sunucu tek yönlü / sunucu kaynaklı akış: H3_ID_ERROR
+def test_server_goaway_with_invalid_id_closes_connection(pki, h3, goaway_id):
+    from fasthttpc.http3.core import Http3Error
+    with Session(http3="force", verify=pki["ca"]) as s:
+        with pytest.raises(Http3Error, match="kod=0x108"):     # H3_ID_ERROR ile kapatıldı
+            s.get(url(h3, f"/goaway={goaway_id}"))
+        conn = next(iter(s._h3._conns.values()))
+        assert conn.core.closed and conn.core.goaway_id is None and not conn.usable
+        assert s.get(url(h3)).http_version == "HTTP/3"      # yeni bağlantı kuruldu
+
+
+def test_server_goaway_id_must_not_increase(pki, h3):
+    from fasthttpc.http3.core import Http3Error
+    with Session(http3="force", verify=pki["ca"]) as s:
+        s.get(url(h3, "/goaway=8"))
+        conn = next(iter(s._h3._conns.values()))
+        _wait_core(conn, lambda: conn.core.goaway_id is not None)
+        assert conn.core.goaway_id == 8 and not conn.core.closed
+        conn.core.goaway_id = None              # yeniden kullanılabilir say: ikinci GOAWAY gelsin
+        with pytest.raises(Http3Error, match="kod=0x108"):     # 8 -> 12: artış, H3_ID_ERROR
+            s.get(url(h3, "/goaway=12"))
+        assert conn.core.closed and next(iter(s._h3._conns.values())) is conn
 
 
 def test_alt_svc_parse():
