@@ -19,13 +19,13 @@ from typing import (TYPE_CHECKING, Any, Generator, Iterable, Optional, TypedDict
                     Union)
 
 from .models.urls     import URL
-from .models.headers  import Headers
+from .models.headers  import Headers, check_header_field, check_request_line
 from .models.request  import Request
 from .models.response import Response, HTTPStatusError
 from .transport.connection_pool import ConnectionPool
 from .security.tls_adapter      import TLSAdapter
 from .security.alerts          import describe_alert
-from .protocol.http1_parser     import HTTP1Parser
+from .protocol.http1_parser     import HTTP1Parser, MAX_RESPONSE_HEADER_BYTES, parse_chunk_size
 from .protocol.http2_parser     import (Http2Connection, Http2StreamError, Http2ConnectionError,
                                          Http2RefusedError)
 from .metrics    import RequestMetrics
@@ -668,10 +668,10 @@ class Session:
             while nl == -1:
                 fill()
                 nl = buf.find(b"\r\n")
-            size_line = bytes(buf[:nl]).split(b";")[0].strip()
+            size_line = bytes(buf[:nl])
             del buf[:nl + 2]
             try:
-                chunk_size = int(size_line, 16)
+                chunk_size = parse_chunk_size(size_line)
             except ValueError:
                 raise ConnectionError(f"Geçersiz chunk boyutu: {size_line[:20]!r}") from None
 
@@ -698,6 +698,8 @@ class Session:
                 remaining -= take
             while len(buf) < 2:       # chunk sonu CRLF
                 fill()
+            if buf[:2] != b"\r\n":
+                raise ConnectionError("Chunked gövde bozuk: chunk verisinden sonra CRLF yok.")
             del buf[:2]
 
                                                                                
@@ -765,6 +767,12 @@ class Session:
                 cond = self._cache.build_conditional_headers(cache_entry)
                 for k, v in cond.items():
                     req.headers[k] = v
+
+        # Telde yazılmadan (bağlantı açılmadan) ÖNCE: CR/LF/NUL içeren başlık ya da
+        # bozuk metot/hedef, HTTP/1.1'de istek enjeksiyonuna yol açar (h2/h3'te malformed).
+        check_request_line(req.method, req.url.raw_path.decode("latin-1"))
+        for raw_k, raw_v in req.headers.raw:
+            check_header_field(raw_k, raw_v)
 
         if self._h3 is not None:
             h3_resp = self._h3_attempt(req, metrics, cache_entry, method, url)
@@ -872,6 +880,9 @@ class Session:
                     sep = header_acc.find(b"\r\n\r\n", search_from)
                     if sep != -1:
                         break
+                    if len(header_acc) > MAX_RESPONSE_HEADER_BYTES:
+                        raise ConnectionError(
+                            f"Yanıt başlık bloğu {MAX_RESPONSE_HEADER_BYTES} baytı aşıyor (CRLFCRLF yok).")
                 header_buf = bytes(header_acc)
 
                 if not header_buf:
