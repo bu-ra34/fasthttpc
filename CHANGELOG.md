@@ -46,6 +46,21 @@ bulgular ve açık maddeler `docs/security-audit.md`'de.
   edilir; `Headers` kopyası çoklu değerleri (Set-Cookie) ve sırayı korur.
 - `AsyncSession.pool_stats()`: `cert=` (mTLS) ile havuz/h2 anahtarlarına sertifika
   kimliği eklendiğinden anahtar sabit uzunlukta açılırken `ValueError` fırlatıyordu.
+- **HTTP/3 GOAWAY (aioquic < 1.8):** aioquic 1.3–1.7 sunucunun GOAWAY
+  çerçevesini sessizce yutuyordu (Python 3.10'daki en yeni sürüm 1.3). Bağlantı
+  kullanılmaya devam ediyor, sunucunun işlemediği istek zaman aşımına kadar
+  bekliyordu. Artık fasthttpc bu sürümlerde GOAWAY'i kendisi ayrıştırır
+  (aioquic 1.8 ile aynı denetimler: bozuk çerçeve H3_FRAME_ERROR, geçersiz ya da
+  artan ID H3_ID_ERROR); işlenmemiş istek yeni bağlantıda bir kez tekrarlanır.
+  Python 3.10'da atlanan GOAWAY testi artık koşuyor; gerçek GOAWAY çerçevesi
+  gönderen yerel sunucuyla regresyon testleri eklendi.
+
+### Testler ve dokümantasyon
+- **Canlı HTTP/3 testleri:** `tests/live/test_http3_live.py` (`live` işareti).
+  Gerçek sunuculara karşı Alt-Svc keşfi ve h3 kullanımı, gövde doğrulaması,
+  h3'e ulaşılamadığında h2'ye düşüş ve sertifika doğrulaması (badssl.com,
+  güvenilmeyen CA ile QUIC el sıkışması). `FASTHTTPC_LIVE=1` verilmedikçe
+  atlanır; CI ve `pytest -q` ağa çıkmaz. Kullanım: docs/testing.md.
 
 ## [0.6.0] — 2026-11-15
 
