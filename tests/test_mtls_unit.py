@@ -401,3 +401,31 @@ def test_cert_ile_http3_kullanilmaz(ca, tmp_path):
     s2 = Session(impersonate="chrome_131", http3=True)
     assert s2._h3 is not None
     s2.close()
+
+
+def test_async_pool_stats_mtls_anahtarlariyla_calisir(ca, tmp_path):
+    """Regresyon: cert= varken havuz/h2 anahtarlarına sertifika kimliği eklenir (5/4 öğe);
+    pool_stats() anahtarı sabit uzunlukta açtığı için ValueError fırlatıyordu."""
+    import asyncio
+    import time
+    from types import SimpleNamespace
+    from fasthttpc import AsyncSession
+    from fasthttpc.async_session import _Opened
+    from fasthttpc.models.urls import URL
+    c = _client(ca, "p256")
+    cp, kp = pki.write(tmp_path, "c", c)
+    os.chmod(kp, 0o600)
+
+    async def _a():
+        s = AsyncSession(impersonate="chrome_131", cert=(cp, kp))
+        canli = SimpleNamespace(at_eof=lambda: False, is_closing=lambda: False, close=lambda: None)
+        o = _Opened(canli, canli, "http/1.1", lambda: None,
+                    key=s._h1_key(URL("https://h1.test/"), None), last_used=time.perf_counter())
+        s._idle[o.key] = [o]
+        s._h2[s._origin_key(URL("https://h2.test/"), None)] = SimpleNamespace(usable=True)
+        assert s.pool_stats() == {"https://h1.test:443": {"idle": 1, "h2": 0},
+                                  "https://h2.test:443": {"idle": 0, "h2": 1}}
+        s._idle.clear()
+        s._h2.clear()
+        await s.close()
+    asyncio.run(_a())
