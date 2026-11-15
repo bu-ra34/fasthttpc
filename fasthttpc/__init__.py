@@ -60,7 +60,7 @@ from .plugins import Plugin, RetryPlugin, LoggingPlugin, RateLimitPlugin
 from .auth import Auth, BasicAuth, BearerAuth, DigestAuth
 from ._api import USE_CLIENT_DEFAULT
 
-__version__ = "0.6.0"
+__version__ = "0.6.1"
 __author__  = "Buğra"
 __all__ = [
     "Session",
