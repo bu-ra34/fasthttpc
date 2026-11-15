@@ -26,6 +26,7 @@ import asyncio
 
 from .transport.happy_eyeballs import CONNECTION_ATTEMPT_DELAY
 import sys
+from contextlib import AbstractAsyncContextManager
 from typing import Any, Awaitable, Callable, Optional
 
 from ._log import get_logger
@@ -113,7 +114,8 @@ async def wait_for(aw: Awaitable, timeout: Optional[float]) -> Any:
 
 
 # --------------------------------------------------------------------- ilkeller
-def Lock():
+def Lock() -> "AbstractAsyncContextManager[Any]":
+    """asyncio.Lock ya da (trio altında) anyio.Lock; ikisi de ``async with`` ile kullanılır."""
     return _anyio().Lock() if _is_trio() else asyncio.Lock()
 
 
@@ -526,6 +528,29 @@ class AnyioStream:
             await f.wait()
         if self._err is not None:
             raise self._err
+
+    def can_write_eof(self) -> bool:
+        """Yalnızca düz TCP akışında (anyio TLSStream ``send_eof`` desteklemez)."""
+        return not self._closing and isinstance(self._s, _anyio().abc.SocketStream)
+
+    def write_eof(self) -> None:
+        """Bekleyen veri gönderildikten sonra yazma yönünü kapatır (TCP FIN)."""
+        if not self.can_write_eof():
+            return
+        coro = self._send_eof()
+        try:
+            spawn(coro, name="fasthttpc-eof")
+        except RuntimeError:
+            coro.close()
+
+    async def _send_eof(self) -> None:
+        f = self._flusher
+        if f is not None:
+            await f.wait()
+        try:
+            await self._s.send_eof()
+        except Exception as e:  # noqa: BLE001
+            logger.debug("send_eof hatası yok sayıldı: %s", e)
 
     # ----------------------------------------------------------------- kapanış
     def is_closing(self) -> bool:
