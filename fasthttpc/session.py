@@ -266,8 +266,10 @@ class Session:
     fasthttpc senkron HTTP istemcisi.
 
     Args:
-        impersonate:     TLS fingerprint profili. ``"chrome_131"``, ``"firefox_120"``, ``"safari_17"``
-        max_connections: Connection pool boyutu.
+        impersonate:     TLS fingerprint profili: ``"chrome_131"`` (varsayılan), ``"firefox_133"``,
+                         ``"safari_18"`` (takma adlar: ``"chrome"``, ``"firefox"``, ``"firefox_120"``,
+                         ``"safari"``, ``"safari_17"``) ya da ``None`` (tarayıcı taklidi yok).
+        max_connections: Origin başına en fazla bağlantı (``limits`` verilmezse).
         timeout:         Zaman aşımı — float (saniye) veya :class:`Timeout` objesi.
         max_redirects:   Maksimum redirect sayısı.
         cache:           ``True`` → yerleşik cache, ``ResponseCache`` objesi → özel cache.
@@ -298,6 +300,13 @@ class Session:
                          değiştirilebilir). Öncelik: profilin tarayıcı
                          başlıkları < ``headers`` < istek başlıkları; değeri
                          ``None`` olan başlık varsayılanı kaldırır.
+        proxy / proxies: ``"http://..."`` / ``"socks5://..."`` ya da şema sözlüğü
+                         (``{"https": ...}``). Ortam değişkenleri okunmaz.
+        http3:           DENEYSEL, varsayılan ``False``. ``True`` (Alt-Svc keşfi, h2'ye
+                         düşüş), ``"force"`` ya da ``fasthttpc.http3.Http3Options``.
+                         ``fasthttpc[http3]`` (aioquic) gerektirir.
+        legacy_tls:      ``True`` -> TLS 1.2 CBC / statik RSA eski sunucu modu
+                         (varsayılan ``False``; TLS 1.0/1.1 hiçbir zaman).
 
     Örnek::
 

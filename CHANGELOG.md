@@ -2,6 +2,14 @@
 
 ## [Unreleased]
 
+### Dokümantasyon
+- README, README.tr ve mkdocs sayfaları koda göre güncellendi: HTTP/3 (deneysel,
+  yalnızca yerel testler), trio, TLS 1.3 PSK oturum devamı (varsayılan kapalı,
+  0-RTT yok), X25519MLKEM768 (Chrome/Firefox profilleri, `cryptography` >= 47),
+  mTLS, akış, auth/hook sayfaları; "yakında" bölümü kaldırıldı. Düz HTTP
+  olmaması, proxy ortam değişkenlerinin okunmaması ve trio altında HTTP/3'ün
+  çalışmaması bilinen sınırlara eklendi.
+
 ## [0.6.1] — 2026-11-16
 
 Kendi içimizde yapılan güvenlik incelemesi (bağımsız denetim değildir):

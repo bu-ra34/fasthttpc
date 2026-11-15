@@ -43,10 +43,14 @@ does **not** intercept TLS. The tests use `cloudflare-quic.com`, `quic.nginx.org
 | Test | What it checks |
 | --- | --- |
 | `test_alt_svc_discovery_then_h3` | `http3=True`: first request over TCP learns `Alt-Svc: h3`, the next one is `HTTP/3` |
-| `test_h3_force_*` | `http3="force"` GETs (sync and async); Cloudflare's `/cdn-cgi/trace` body must report `http=http/3` |
+| `test_h3_force_*` | `http3="force"` GETs (sync and async) against Cloudflare, nginx and Google; Cloudflare's `/cdn-cgi/trace` body must report `http=http/3`; repeated requests reuse one QUIC connection |
 | `test_fallback_to_h2_when_h3_unreachable` | Alt-Svc pointing at a dead UDP port: the request silently uses HTTP/2 and h3 is disabled for that origin |
 | `test_bad_certificates_rejected` | expired, wrong-host, self-signed and untrusted-root certificates are rejected |
 | `test_h3_rejects_chain_from_untrusted_ca` | the QUIC handshake rejects a real server whose root is not trusted (`verify=` set to an unrelated CA) |
+| `test_auto_mode_with_untrusted_ca_never_fetches` | in auto mode with an unrelated CA the request fails with a certificate error instead of falling back to an unverified fetch |
+
+These tests are not run in CI. So far HTTP/3 has only been verified against
+the local aioquic server of the offline suite.
 
 How to read failures:
 

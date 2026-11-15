@@ -13,6 +13,8 @@ with Session(legacy_tls=True) as s:       # AsyncSession(legacy_tls=True) works 
 ```
 
 `legacy_tls` is a boolean parameter of `Session` / `AsyncSession` (not a profile).
+It applies to fasthttpc's own TLS stack: with `AsyncSession(impersonate=None)`,
+which uses Python's `ssl` module, the flag has no effect.
 
 ## What it enables (TLS 1.2 only)
 
