@@ -105,3 +105,98 @@ def test_shutdown_and_drain_sinirli_ve_hatasiz():
     shutdown_and_drain(a, max_wait=0.2)         # eş kapalı/kırık: hata fırlatmaz
     a.close()
     shutdown_and_drain(a, max_wait=0.2)         # kapalı soket: hata fırlatmaz
+
+
+def _run_backend(backend, coro_fn, timeout=8):
+    import asyncio
+    if backend == "asyncio":
+        return asyncio.run(asyncio.wait_for(coro_fn(), timeout))
+    trio = pytest.importorskip("trio")
+    anyio = pytest.importorskip("anyio")
+
+    async def main():
+        with anyio.fail_after(timeout):
+            return await coro_fn()
+    return trio.run(main)
+
+
+@pytest.mark.parametrize("backend", ["asyncio", "trio"])
+def test_async_fatal_alert_gonderilir_ve_kapanis_rst_degil_fin(pki, files, monkeypatch, backend):
+    """Senkron testin async (AsyncTLSStream: asyncio + trio) karşılığı: el sıkışma hatasında
+    fatal alert gönderilir ve okunmamış veri olsa da kapanış RST değil FIN olur."""
+    from fasthttpc.tls13 import AsyncTLSStream, TLSError
+
+    gercek = tls12.verify_server_key_exchange
+
+    def yavas(*a, **k):
+        time.sleep(0.25)
+        return gercek(*a, **k)
+    monkeypatch.setattr(tls12, "verify_server_key_exchange", yavas)
+    srv = Fake12Server(pki, tamper={"bad_ske_sig"})
+    ls = socket.socket()
+    ls.bind(("127.0.0.1", 0))
+    ls.listen(1)
+    sarmal = {}
+
+    def run():
+        c, _ = ls.accept()
+        sarmal["s"] = _GecikmeliSoket(c)
+        srv.serve(sarmal["s"])
+        ls.close()
+    t = threading.Thread(target=run, daemon=True)
+    t.start()
+    port = ls.getsockname()[1]
+
+    async def client():
+        await AsyncTLSStream.connect("127.0.0.1", port, "chrome_131", server_hostname=HOST,
+                                     ca_path=files[0])
+
+    with pytest.raises(TLSError):
+        _run_backend(backend, client)
+    t.join(10)
+    assert srv.alerts and srv.alerts[0] == bytes([2, tls12.AL_DECRYPT_ERROR])
+    assert sarmal["s"].kapanis == "FIN", f"eş taraf {sarmal['s'].kapanis} gördü (RST: okunmamış veriyle close)"
+
+
+@pytest.mark.parametrize("backend", ["asyncio", "trio"])
+def test_async_send_and_drain_sinirli_ve_hatasiz(backend):
+    """async_send_and_drain: veriyi gönderir, FIN yollar, kapatmayan eşte sınırlı bekler,
+    kırık akışta hata fırlatmaz."""
+    from fasthttpc import _backend as B
+    from fasthttpc.transport.lingering import async_send_and_drain
+    ls = socket.socket()
+    ls.bind(("127.0.0.1", 0))
+    ls.listen(1)
+    port = ls.getsockname()[1]
+    sonuc = {}
+
+    def es():
+        c, _ = ls.accept()
+        c.settimeout(5)
+        c.sendall(b"y" * 1000)                  # istemcide okunmamış veri
+        buf = b""
+        while True:
+            d = c.recv(65536)
+            if not d:
+                break
+            buf += d
+        sonuc["alinan"] = buf                    # FIN görüldü (EOF)
+        time.sleep(0.6)                          # kapatmadan bekle: istemci sınırlı beklemeli
+        c.close()
+        ls.close()
+    t = threading.Thread(target=es, daemon=True)
+    t.start()
+
+    async def client():
+        reader, writer = await B.open_connection("127.0.0.1", port)
+        t0 = time.perf_counter()
+        await async_send_and_drain(reader, writer, b"\x15\x03\x03\x00\x02\x02\x33", max_wait=0.2)
+        sure = time.perf_counter() - t0
+        writer.close()
+        await async_send_and_drain(reader, writer, b"x", max_wait=0.2)   # kapanan akış: hatasız
+        return sure
+
+    sure = _run_backend(backend, client)
+    t.join(5)
+    assert sonuc["alinan"] == b"\x15\x03\x03\x00\x02\x02\x33"
+    assert 0.15 < sure < 1.5
