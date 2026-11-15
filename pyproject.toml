@@ -90,8 +90,16 @@ strict = true
 # not-yet-clean modules do not fail the run.
 follow_imports = "silent"
 files = [
+    "fasthttpc/models/__init__.py",
     "fasthttpc/models/headers.py",
+    "fasthttpc/models/request.py",
+    "fasthttpc/models/response.py",
     "fasthttpc/models/urls.py",
+    "fasthttpc/session.py",
+    "fasthttpc/async_session.py",
+    "fasthttpc/_api.py",
+    "fasthttpc/plugins.py",
+    "fasthttpc/streaming.py",
     "fasthttpc/config.py",
     "fasthttpc/retry.py",
     "fasthttpc/cookies.py",
