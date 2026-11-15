@@ -44,7 +44,7 @@ _HEX_DIGITS = frozenset(b"0123456789abcdefABCDEF")
 MAX_RESPONSE_HEADER_BYTES = 256 * 1024
 
 
-def parse_chunk_size(line: bytes) -> int:
+def parse_chunk_size(line: "bytes | bytearray") -> int:
     """``chunk-size [; chunk-ext]`` satırını KATI biçimde ayrıştırır (RFC 9112 §7.1).
 
     Python'un ``int(x, 16)``'sı ``0x10``, ``+1``, ``-1``, ``1_0`` ve çevreleyen boşlukları da
