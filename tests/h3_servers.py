@@ -16,7 +16,8 @@ from cryptography.hazmat.primitives.asymmetric import ec
 from cryptography.x509.oid import NameOID
 
 from aioquic.asyncio import QuicConnectionProtocol, serve
-from aioquic.h3.connection import H3Connection
+from aioquic.buffer import encode_uint_var
+from aioquic.h3.connection import FrameType, H3Connection, encode_frame
 from aioquic.h3.events import DataReceived, HeadersReceived
 from aioquic.quic.configuration import QuicConfiguration
 
@@ -59,6 +60,9 @@ def make_leaf(tmp_path, ca_key, ca_cert, names=("localhost",), tag="leaf"):
     return str(cf), str(kf)
 
 
+_REFUSED: "set[str]" = set()     # /refuse-once yolları: yalnız İLK istek GOAWAY ile reddedilir
+
+
 class _H3Server(QuicConnectionProtocol):
     def __init__(self, *a, **kw):
         super().__init__(*a, **kw)
@@ -78,12 +82,27 @@ class _H3Server(QuicConnectionProtocol):
             if getattr(ev, "stream_ended", False):
                 self._respond(ev.stream_id)
 
+    def _send_goaway(self, goaway_id):
+        """Ham GOAWAY çerçevesi (aioquic sunucu tarafında GOAWAY gönderme API'si sunmuyor)."""
+        self._http._quic.send_stream_data(self._http._local_control_stream_id,
+                                          encode_frame(FrameType.GOAWAY, encode_uint_var(goaway_id)))
+
     def _respond(self, sid):
         r = self._req.pop(sid)
         h = r["headers"]
         path = h[b":path"].decode()
         method = h[b":method"].decode()
         extra = []
+        if path.startswith("/refuse-once") and path not in _REFUSED:
+            # Zarif kapanış: bu isteği İŞLEMEDEN GOAWAY(sid) gönder (yanıt yok).
+            _REFUSED.add(path)
+            self._send_goaway(sid)
+            self.transmit()
+            return
+        if path.startswith("/goaway"):
+            # Yanıtı ver, ardından GOAWAY(id) (varsayılan: sonraki istemci akışı).
+            gid = int(path.split("=")[1]) if "=" in path else sid + 4
+            self._send_goaway(gid)
         if path.startswith("/big"):
             body = b"x" * int(path.split("=")[1])
         elif path.startswith("/chunks"):
