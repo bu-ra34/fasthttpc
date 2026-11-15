@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [0.6.1] — 2026-11-16
+
 Kendi içimizde yapılan güvenlik incelemesi (bağımsız denetim değildir):
 bulgular ve açık maddeler `docs/security-audit.md`'de.
 
