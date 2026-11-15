@@ -88,3 +88,26 @@ def test_str_donusu_yeniden_ayristirilabilir():
 
 def test_bos_yol_koke_cevrilir():
     assert URL("https://a.com").path == "/"
+
+
+def test_headers_kopyasi_coklu_degerleri_ve_yazimi_korur():
+    h = Headers()
+    h.add("Set-Cookie", "a=1")
+    h.add("Set-Cookie", "b=2")
+    h["X-Ozel"] = "v"
+    kopya = Headers(h)
+    assert kopya.get_list("set-cookie") == ["a=1", "b=2"]
+    assert kopya.raw == h.raw
+    kopya["X-Ozel"] = "degisti"          # bağımsız kopya
+    assert h["x-ozel"] == "v"
+
+
+def test_dict_disi_mapping_basliklari_yok_sayilmaz():
+    # Regresyon: Headers yalnızca dict'e bakıyordu; Headers/MappingProxyType gibi
+    # Mapping'ler sessizce düşüyordu (Session(headers=Headers(...)) -> başlık yok).
+    import types
+    from fasthttpc import Session
+
+    assert dict(Headers(types.MappingProxyType({"X-A": "1"}))) == {"x-a": "1"}
+    with Session(headers=Headers({"X-Oturum": "1"})) as s:
+        assert s.headers["x-oturum"] == "1"

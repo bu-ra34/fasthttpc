@@ -1,5 +1,6 @@
                              
-from collections.abc import MutableMapping
+from collections.abc import Mapping, MutableMapping
+import re
 import typing
 
 # HTTP header adları ve değerleri RFC 7230 §3.2.4 gereği ISO-8859-1 (latin-1)
@@ -10,16 +11,52 @@ import typing
 # olağan bir senaryodur ve ascii bunu kaldıramaz.
 _HDR_ENCODING = "latin-1"
 
+# RFC 9110 §5.1 (field-name = token) ve §5.5 (field-value: CR/LF/NUL YASAK).
+# HTTP/2-3 pseudo-header'ları (":method" vb.) tek ':' önekiyle izinlidir.
+_TOKEN_RE = re.compile(r"^:?[!#$%&'*+\-.^_`|~0-9A-Za-z]+$")
+_BAD_VALUE_RE = re.compile(r"[\r\n\x00]")
+_BAD_TARGET_RE = re.compile(r"[\x00-\x1f\x7f]")
+
+
+def check_header_field(name: "str | bytes", value: "str | bytes") -> None:
+    """Giden bir başlığı telde yazmadan önce doğrular; geçersizse ``ValueError``.
+
+    CR/LF/NUL içeren değer ya da token olmayan ad, HTTP/1.1'de başlık/istek
+    enjeksiyonuna (request smuggling) yol açar; HTTP/2-3'te de RFC 9113 §8.2.1 /
+    RFC 9114 §4.2 gereği "malformed" sayılır. requests/httpx de bunları reddeder.
+    """
+    n = name.decode(_HDR_ENCODING) if isinstance(name, bytes) else str(name)
+    v = value.decode(_HDR_ENCODING) if isinstance(value, bytes) else str(value)
+    if not _TOKEN_RE.match(n):
+        raise ValueError(f"Geçersiz HTTP başlık adı: {n!r}")
+    if _BAD_VALUE_RE.search(v):
+        raise ValueError(f"HTTP başlık değeri CR/LF/NUL içeremez ({n!r}): {v!r}")
+
+
+def check_request_line(method: str, target: str) -> None:
+    """İstek satırının (metot + hedef) enjeksiyona açık olmadığını doğrular."""
+    if not _TOKEN_RE.match(method) or method.startswith(":"):
+        raise ValueError(f"Geçersiz HTTP metodu: {method!r}")
+    if not target or _BAD_TARGET_RE.search(target):
+        raise ValueError(f"İstek hedefi kontrol karakteri (CR/LF/NUL vb.) içeremez: {target!r}")
+
 
 class Headers(MutableMapping[str, str]):
     """
     HTTP Header'ları için case-insensitive, sıralı multi-dict yapısı.
     """
-    def __init__(self, headers: typing.Optional[typing.Union[dict[typing.Any, typing.Any], list[typing.Any]]] = None):
+    def __init__(self, headers: typing.Optional[typing.Union[
+            "Headers", Mapping[typing.Any, typing.Any], list[typing.Any]]] = None):
                                      
         self._list: list[tuple[bytes, bytes, bytes]] = []
         
-        if isinstance(headers, dict):
+        if isinstance(headers, Headers):
+            # Kopya: çoklu değerler (Set-Cookie...) ve özgün yazım/sıra korunur.
+            self._list = list(headers._list)
+        elif isinstance(headers, Mapping):
+            # dict dışındaki Mapping'ler de (MappingProxyType, httpx/requests başlık
+            # nesneleri...) kabul edilir; eskiden yalnızca dict'e bakıldığı için bunlar
+            # SESSİZCE yok sayılıyordu (ör. ``Session(headers=Headers(...))``).
             for k, v in headers.items():
                 self[k] = v
         elif isinstance(headers, list):
