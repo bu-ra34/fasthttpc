@@ -1,5 +1,5 @@
                              
-from collections.abc import MutableMapping
+from collections.abc import Mapping, MutableMapping
 import typing
 
 # HTTP header adları ve değerleri RFC 7230 §3.2.4 gereği ISO-8859-1 (latin-1)
@@ -15,11 +15,18 @@ class Headers(MutableMapping[str, str]):
     """
     HTTP Header'ları için case-insensitive, sıralı multi-dict yapısı.
     """
-    def __init__(self, headers: typing.Optional[typing.Union[dict[typing.Any, typing.Any], list[typing.Any]]] = None):
+    def __init__(self, headers: typing.Optional[typing.Union[
+            "Headers", Mapping[typing.Any, typing.Any], list[typing.Any]]] = None):
                                      
         self._list: list[tuple[bytes, bytes, bytes]] = []
         
-        if isinstance(headers, dict):
+        if isinstance(headers, Headers):
+            # Kopya: çoklu değerler (Set-Cookie...) ve özgün yazım/sıra korunur.
+            self._list = list(headers._list)
+        elif isinstance(headers, Mapping):
+            # dict dışındaki Mapping'ler de (MappingProxyType, httpx/requests başlık
+            # nesneleri...) kabul edilir; eskiden yalnızca dict'e bakıldığı için bunlar
+            # SESSİZCE yok sayılıyordu (ör. ``Session(headers=Headers(...))``).
             for k, v in headers.items():
                 self[k] = v
         elif isinstance(headers, list):

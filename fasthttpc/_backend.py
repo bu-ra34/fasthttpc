@@ -26,6 +26,7 @@ import asyncio
 
 from .transport.happy_eyeballs import CONNECTION_ATTEMPT_DELAY
 import sys
+from contextlib import AbstractAsyncContextManager
 from typing import Any, Awaitable, Callable, Optional
 
 from ._log import get_logger
@@ -113,7 +114,8 @@ async def wait_for(aw: Awaitable, timeout: Optional[float]) -> Any:
 
 
 # --------------------------------------------------------------------- ilkeller
-def Lock():
+def Lock() -> "AbstractAsyncContextManager[Any]":
+    """asyncio.Lock ya da (trio altında) anyio.Lock; ikisi de ``async with`` ile kullanılır."""
     return _anyio().Lock() if _is_trio() else asyncio.Lock()
 
 
