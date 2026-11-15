@@ -12,12 +12,46 @@ import io
 import json as jsonlib
 import re
 import time
-from typing import Optional, List
+from typing import (
+    TYPE_CHECKING, Any, AsyncIterable, AsyncIterator, Callable, Iterable, Iterator,
+    List, Optional, Protocol, TypeVar,
+)
 from .headers import Headers
 from ..streaming import (
     IncrementalDecoder, LineSplitter, Rechunker, TextRechunker,
     StreamConsumed, StreamClosed, ResponseNotRead,
 )
+
+if TYPE_CHECKING:
+    from typing_extensions import Buffer   # yalnızca tip: collections.abc.Buffer 3.12+
+
+    from .request import Request
+    from ..metrics import RequestMetrics
+
+_T = TypeVar("_T")
+
+
+class _Chunker(Protocol[_T]):
+    """``Rechunker`` (bytes) / ``TextRechunker`` (str) ortak arayüzü."""
+
+    def feed(self, data: _T) -> "list[_T]": ...
+    def flush(self) -> "list[_T]": ...
+
+
+class BodyStream(Protocol):
+    """Senkron akış gövdesi kaynağı (session ``_H1BodyStream``/``_H2BodyStream``)."""
+
+    def read_chunk(self) -> bytes: ...
+    def close(self) -> None: ...
+
+
+class AsyncBodyStream(Protocol):
+    """Async akış gövdesi kaynağı (async_session ``_AsyncH1Stream``/``_AsyncH2Stream``)."""
+
+    async def read_chunk(self) -> bytes: ...
+    def close_nowait(self) -> None: ...
+    async def aclose(self) -> None: ...
+
 
 _CHARSET_RE = re.compile(r"""charset\s*=\s*["']?([^\s;"']+)""", re.IGNORECASE)
 
@@ -30,7 +64,9 @@ class _Text(str):
     """``Response.text`` değeri: hem ``str`` (requests/httpx uyumu: ``r.text``)
     hem çağrılabilir (eski API: ``r.text()``, ``r.text(encoding="latin-1")``)."""
 
-    def __new__(cls, value: str, body: bytes = b""):
+    _body: bytes
+
+    def __new__(cls, value: str, body: bytes = b"") -> "_Text":
         self = super().__new__(cls, value)
         self._body = body
         return self
@@ -40,7 +76,7 @@ class _Text(str):
             return str(self)
         return self._body.decode(encoding, errors=errors)
 
-    def __reduce__(self):
+    def __reduce__(self) -> "tuple[type[_Text], tuple[str, bytes]]":
         return (_Text, (str(self), self._body))
 
 
@@ -79,15 +115,19 @@ class Response:
         http_version: Yanıtın taşındığı protokol ("HTTP/1.1" veya "HTTP/2")
     """
 
+    # İstek metrikleri: yalnızca ağ yolunda atanır (mock/transport yanıtında YOK;
+    # ``hasattr(r, "metrics")`` ile denetlenir), bu yüzden sınıfta varsayılanı yoktur.
+    metrics: "RequestMetrics"
+
     def __init__(
         self,
         status_code: int,
-        headers: "dict | Headers | None" = None,
+        headers: "dict[str, str] | list[tuple[str, str]] | Headers | None" = None,
         body: bytes = b"",
-        request=None,
+        request: "Request | None" = None,
         elapsed: float = 0.0,
-        stream=None,
-        astream=None,
+        stream: "BodyStream | None" = None,
+        astream: "AsyncBodyStream | None" = None,
     ):
         self.status_code: int              = status_code
         self.headers: Headers              = headers if isinstance(headers, Headers) else Headers(headers)
@@ -95,14 +135,14 @@ class Response:
         # ``_body`` ilk ``content``/``body`` erişiminde doldurulur.
         self._stream                       = stream
         self._astream                      = astream
-        self._body                         = None if (stream or astream) else body
+        self._body: Optional[bytes]        = None if (stream or astream) else body
         self._consumed                     = False
         self._closed                       = False
-        self._decoder                      = None
-        self._raw_iter                     = None
-        self.request                       = request
+        self._decoder: Optional[IncrementalDecoder] = None
+        self._raw_iter: Optional[_RawReader] = None
+        self.request: "Request | None"     = request
         self.history: List["Response"]     = []
-        self.next                          = None   # allow_redirects=False: izlenecek istek (requests ``r.next``)
+        self.next: "Request | None"        = None   # allow_redirects=False: izlenecek istek (requests ``r.next``)
         self.elapsed                       = elapsed
         self._reason: str                  = ""
         self._url: Optional[str]           = None
@@ -110,7 +150,7 @@ class Response:
         self.http_version: str             = "HTTP/1.1"   # "HTTP/2" ise h2 üzerinden geldi
         # TLS el sıkışması özeti (sürüm, suite, EMS/EtM/güvenli renegotiation görünürlüğü); düz
         # HTTP/mock taşıma ise None. Bkz. security/tls12_legacy.tls_info.
-        self.tls_info: Optional[dict]      = None
+        self.tls_info: Optional[dict[str, Any]] = None
 
                                                                               
 
@@ -119,6 +159,7 @@ class Response:
         """Gövde (bytes). Akış modunda ilk erişimde KALAN gövdeyi okur ve açar."""
         if self._body is None:
             self._load()
+        assert self._body is not None   # _load ya doldurur ya da fırlatır
         return self._body
 
     @body.setter
@@ -167,7 +208,7 @@ class Response:
         return str(self.request.url) if self.request is not None else ""
 
     @url.setter
-    def url(self, value) -> None:
+    def url(self, value: object) -> None:
         self._url = None if value is None else str(value)
 
     @property
@@ -214,7 +255,7 @@ class Response:
             self._decoder = IncrementalDecoder(self.headers.get("content-encoding", "") or "")
         return self._decoder
 
-    def _raw_chunks(self):
+    def _raw_chunks(self) -> Iterator[bytes]:
         """Akıştan HAM (Content-Encoding açılmamış) parçalar; senkron üreteç."""
         self._check_sync()
         if self._body is not None and self._stream is None:
@@ -226,6 +267,7 @@ class Response:
         if self._closed:
             raise StreamClosed("Yanıt gövde okunmadan kapatıldı.")
         st = self._stream
+        assert st is not None   # _body None ise akış modundayız
         while True:
             c = st.read_chunk()
             if not c:
@@ -233,7 +275,7 @@ class Response:
                 return
             yield c
 
-    def _decoded(self):
+    def _decoded(self) -> Iterator[bytes]:
         """Açılmış parçalar (senkron üreteç)."""
         if self._body is not None:
             if self._body:
@@ -249,35 +291,36 @@ class Response:
             yield tail
 
     @staticmethod
-    def _drive(gen, rc):
+    def _drive(gen: Iterable[_T], rc: _Chunker[_T]) -> Iterator[_T]:
         for c in gen:
             yield from rc.feed(c)
         yield from rc.flush()
 
-    def iter_raw(self, chunk_size: "int | None" = None):
+    def iter_raw(self, chunk_size: "int | None" = None) -> Iterator[bytes]:
         """HAM (sıkıştırması açılmamış) gövde parçaları. Akışsız yanıtta gövde
         zaten açılmış olduğundan olduğu gibi döner."""
         return self._drive(self._raw_chunks(), Rechunker(chunk_size))
 
-    def iter_bytes(self, chunk_size: "int | None" = None):
+    def iter_bytes(self, chunk_size: "int | None" = None) -> Iterator[bytes]:
         """Content-Encoding açılmış gövde parçaları (``chunk_size=None``: geldiği gibi)."""
         return self._drive(self._decoded(), Rechunker(chunk_size))
 
-    def iter_content(self, chunk_size: "int | None" = 1, decode_unicode: bool = False):
+    def iter_content(self, chunk_size: "int | None" = 1,
+                     decode_unicode: bool = False) -> "Iterator[bytes] | Iterator[str]":
         """requests uyumlu: açılmış bayt (``decode_unicode=True`` ise ``str``) parçaları."""
         if decode_unicode:
             return self.iter_text(chunk_size)
         return self.iter_bytes(chunk_size)
 
-    def _text_decoder(self):
+    def _text_decoder(self) -> codecs.IncrementalDecoder:
         try:
             return codecs.getincrementaldecoder(self.encoding)(errors="replace")
         except LookupError:
             return codecs.getincrementaldecoder("utf-8")(errors="replace")
 
-    def iter_text(self, chunk_size: "int | None" = None):
+    def iter_text(self, chunk_size: "int | None" = None) -> Iterator[str]:
         """Gövde ``str`` parçaları (çok baytlı karakterler parça sınırında bölünmez)."""
-        def gen():
+        def gen() -> Iterator[str]:
             dec = self._text_decoder()
             for c in self._decoded():
                 t = dec.decode(c)
@@ -289,7 +332,7 @@ class Response:
         return self._drive(gen(), TextRechunker(chunk_size))
 
     def iter_lines(self, chunk_size: int = 512, decode_unicode: bool = False,
-                   delimiter: "bytes | None" = None):
+                   delimiter: "bytes | None" = None) -> "Iterator[bytes | str]":
         """Satır satır gövde; tamamlanan her satır gövdenin kalanı beklenmeden
         HEMEN verilir (SSE). ``chunk_size`` yalnızca uyumluluk içindir.
         ``decode_unicode=True`` -> ``str``."""
@@ -301,7 +344,7 @@ class Response:
         for ln in splitter.flush():
             yield conv(ln)
 
-    def _line_conv(self, decode_unicode: bool):
+    def _line_conv(self, decode_unicode: bool) -> "Callable[[bytes], bytes | str]":
         if not decode_unicode:
             return lambda b: b
         enc = self.encoding
@@ -312,7 +355,7 @@ class Response:
         return lambda b: b.decode(enc, errors="replace")
 
     @property
-    def raw(self):
+    def raw(self) -> "_RawReader":
         """Okunabilir HAM gövde (``read(n)``, ``readinto``, ``close``)."""
         if self._raw_iter is None:
             self._raw_iter = _RawReader(self)
@@ -333,10 +376,10 @@ class Response:
         elif self._astream is not None:
             self._astream.close_nowait()
 
-    def __enter__(self):
+    def __enter__(self) -> "Response":
         return self
 
-    def __exit__(self, *exc):
+    def __exit__(self, *exc: object) -> None:
         self.close()
 
     # -- async ---------------------------------------------------------
@@ -344,7 +387,7 @@ class Response:
         if self._stream is not None:
             raise RuntimeError("Senkron akış yanıtı: iter_* kullanın.")
 
-    async def _araw_chunks(self):
+    async def _araw_chunks(self) -> AsyncIterator[bytes]:
         self._acheck()
         if self._astream is None:
             if self._body:
@@ -362,7 +405,7 @@ class Response:
                 return
             yield c
 
-    async def _adecoded(self):
+    async def _adecoded(self) -> AsyncIterator[bytes]:
         if self._body is not None:
             if self._body:
                 yield self._body
@@ -377,7 +420,7 @@ class Response:
             yield tail
 
     @staticmethod
-    async def _adrive(agen, rc):
+    async def _adrive(agen: AsyncIterable[_T], rc: _Chunker[_T]) -> AsyncIterator[_T]:
         async for c in agen:
             for o in rc.feed(c):
                 yield o
@@ -397,14 +440,14 @@ class Response:
             self._body = b"".join(parts)
         return self._body
 
-    def aiter_raw(self, chunk_size: "int | None" = None):
+    def aiter_raw(self, chunk_size: "int | None" = None) -> AsyncIterator[bytes]:
         return self._adrive(self._araw_chunks(), Rechunker(chunk_size))
 
-    def aiter_bytes(self, chunk_size: "int | None" = None):
+    def aiter_bytes(self, chunk_size: "int | None" = None) -> AsyncIterator[bytes]:
         return self._adrive(self._adecoded(), Rechunker(chunk_size))
 
-    def aiter_text(self, chunk_size: "int | None" = None):
-        async def gen():
+    def aiter_text(self, chunk_size: "int | None" = None) -> AsyncIterator[str]:
+        async def gen() -> AsyncIterator[str]:
             dec = self._text_decoder()
             async for c in self._adecoded():
                 t = dec.decode(c)
@@ -416,7 +459,7 @@ class Response:
         return self._adrive(gen(), TextRechunker(chunk_size))
 
     async def aiter_lines(self, decode_unicode: bool = True,
-                          delimiter: "bytes | None" = None):
+                          delimiter: "bytes | None" = None) -> "AsyncIterator[bytes | str]":
         """Satır satır (async). httpx gibi varsayılan ``str``; ``decode_unicode=False`` -> bytes."""
         splitter = LineSplitter(delimiter)
         conv = self._line_conv(decode_unicode)
@@ -435,13 +478,13 @@ class Response:
         elif self._stream is not None:
             self._stream.close()
 
-    async def __aenter__(self):
+    async def __aenter__(self) -> "Response":
         return self
 
-    async def __aexit__(self, *exc):
+    async def __aexit__(self, *exc: object) -> None:
         await self.aclose()
 
-    def json(self, **kwargs):
+    def json(self, **kwargs: Any) -> Any:
         """
         Yanıt gövdesini JSON olarak parse eder ve döner.
 
@@ -541,14 +584,15 @@ class _RawReader(io.RawIOBase):
     def readable(self) -> bool:
         return True
 
-    def readinto(self, b) -> int:
+    def readinto(self, b: "Buffer") -> int:
         if not self._left:
             try:
                 self._left = next(self._it)
             except StopIteration:
                 return 0
-        n = min(len(b), len(self._left))
-        b[:n] = self._left[:n]
+        mv = memoryview(b).cast("B")
+        n = min(len(mv), len(self._left))
+        mv[:n] = self._left[:n]
         self._left = self._left[n:]
         return n
 
