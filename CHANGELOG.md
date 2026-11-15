@@ -1,5 +1,15 @@
 # Changelog
 
+## [Unreleased]
+
+### Düzeltmeler
+- **Async yolda el sıkışma hatasında TLS alert:** `AsyncTLSStream` (asyncio ve
+  trio) el sıkışma başarısız olduğunda çekirdeğin kuyruğa aldığı fatal alert'i
+  artık sunucuya göndermeden kapatmıyor; senkron yolla aynı alert kodları
+  (ör. bozuk SKE imzası → `decrypt_error`). Gönderim best-effort'tur, asıl hatayı
+  maskelemez. Ardından RST yerine FIN + kısa, sınırlı boşaltma
+  (`transport.lingering.async_send_and_drain`); trio akışına `write_eof` eklendi.
+
 ## [0.6.0] — 2026-11-15
 
 requests/httpx'e göre kalan on eksik kapatıldı: akış, mTLS, auth, senkron
