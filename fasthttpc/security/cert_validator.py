@@ -17,6 +17,7 @@ import os
 import struct
 import functools
 import datetime
+import ipaddress
 import warnings
 
 # cryptography import'undan ÖNCE (bkz. __init__.py'deki açıklama).
@@ -113,6 +114,9 @@ def _parse_tls13_certificate_message(hs_payload: bytes) -> list[bytes]:
         raise CertificateValidationError("Certificate mesajı boş.")
 
     cert_request_ctx_len = body[0]
+    if cert_request_ctx_len != 0:
+        # RFC 8446 §4.4.2: sunucu kimlik doğrulamasında certificate_request_context BOŞ olmalı.
+        raise CertificateValidationError("Certificate mesajında boş olmayan certificate_request_context.")
     offset = 1 + cert_request_ctx_len
 
     if len(body) < offset + 3:
@@ -121,6 +125,8 @@ def _parse_tls13_certificate_message(hs_payload: bytes) -> list[bytes]:
     cert_list_len = struct.unpack("!I", b"\x00" + body[offset:offset + 3])[0]
     offset += 3
     cert_list_end = offset + cert_list_len
+    if cert_list_end != len(body):
+        raise CertificateValidationError("Certificate listesi uzunluğu mesajla uyuşmuyor.")
 
     certs: list[bytes] = []
     while offset < cert_list_end:
@@ -138,6 +144,8 @@ def _parse_tls13_certificate_message(hs_payload: bytes) -> list[bytes]:
             raise CertificateValidationError("Certificate extensions uzunluğu okunamadı.")
         ext_len = struct.unpack("!H", body[offset:offset + 2])[0]
         offset += 2 + ext_len
+        if offset > cert_list_end:
+            raise CertificateValidationError("Certificate extensions alanı listenin dışına taşıyor.")
 
     if not certs:
         raise CertificateValidationError("Sunucu hiç sertifika göndermedi.")
@@ -230,6 +238,21 @@ def _validity_error(leaf) -> str | None:
     return None
 
 
+def _subject_for(hostname: str):
+    """Doğrulanacak sunucu kimliği: IP literal'i ise ``IPAddress``, değilse ``DNSName``.
+
+    RFC 9525 §6.2 / RFC 5280 §4.2.1.6: IP adresiyle bağlanılan sunucu, sertifikanın
+    iPAddress SAN'ıyla eşleşmelidir. IP'yi DNSName olarak doğrulamak hem doğru IP SAN'lı
+    sertifikaları reddeder hem de dNSName="1.2.3.4" içeren (kurallara aykırı) bir
+    sertifikayı kabul ederdi.
+    """
+    host = hostname[1:-1] if hostname.startswith("[") and hostname.endswith("]") else hostname
+    try:
+        return x509.IPAddress(ipaddress.ip_address(host))
+    except ValueError:
+        return x509.DNSName(hostname)
+
+
 def validate_server_certificate(hs_payload: bytes, hostname: str, ca_path: str | None = None):
     """
     Sunucudan gelen TLS 1.3 Certificate mesajını doğrular:
@@ -268,7 +291,7 @@ def validate_server_certificate(hs_payload: bytes, hostname: str, ca_path: str |
 
     try:
         builder = PolicyBuilder().store(trust_store).max_chain_depth(32)
-        verifier = builder.build_server_verifier(x509.DNSName(hostname))
+        verifier = builder.build_server_verifier(_subject_for(hostname))
         verifier.verify(leaf, intermediates)
     except VerificationError as e:
         validity = _validity_error(leaf)

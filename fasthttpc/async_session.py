@@ -23,14 +23,14 @@ import threading
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, AsyncGenerator, Callable, Iterable, Optional, Union
 from .models.urls     import URL
-from .models.headers  import Headers
+from .models.headers  import Headers, check_header_field, check_request_line
 from .fingerprint     import drop_h2_only_defaults, merge_default_headers, order_h1
 from .models.response import AsyncBodyStream, Response, HTTPStatusError
 from .metrics         import RequestMetrics
 from .cache           import ResponseCache
 from .cookies         import CookieJar
 from .multipart       import encode_multipart
-from .protocol.http1_parser import HTTP1Parser
+from .protocol.http1_parser import HTTP1Parser, MAX_RESPONSE_HEADER_BYTES, parse_chunk_size
 from .models.request  import Request
 from .config          import Limits, Timeout, resolve_verify
 from .retry           import Retry
@@ -817,6 +817,11 @@ class AsyncSession:
 
         ``(status, Headers, body_raw, send_time, http_version)`` döner.
         """
+        # Telde yazılmadan (bağlantı açılmadan) ÖNCE: CR/LF/NUL içeren başlık ya da
+        # bozuk metot/hedef, HTTP/1.1'de istek enjeksiyonuna yol açar (h2/h3'te malformed).
+        check_request_line(method, u.raw_path.decode("latin-1"))
+        for k, v in req_headers.items():
+            check_header_field(k, str(v))
         if self._h3 is not None:
             if proxy is not None or self._rotator is not None:
                 if self._h3.state.force:
@@ -975,7 +980,7 @@ class AsyncSession:
             while True:
                 nl = await need_line()
                 try:
-                    sz = int(bytes(buf[:nl]).split(b";")[0].strip(), 16)
+                    sz = parse_chunk_size(buf[:nl])
                 except ValueError:
                     raise ConnectionError("Geçersiz chunk boyutu.") from None
                 del buf[:nl + 2]
@@ -1004,6 +1009,8 @@ class AsyncSession:
                     if not c:
                         raise ConnectionResetError("Chunked gövde yarıda kesildi.")
                     buf.extend(c)
+                if buf[:2] != b"\r\n":
+                    raise ConnectionError("Chunked gövde bozuk: chunk verisinden sonra CRLF yok.")
                 del buf[:2]
 
         if framing == "length":
@@ -1079,6 +1086,9 @@ class AsyncSession:
                 sep = hdr_acc.find(b"\r\n\r\n", search_from)
                 if sep != -1:
                     break
+                if len(hdr_acc) > MAX_RESPONSE_HEADER_BYTES:
+                    raise ConnectionError(
+                        f"Yanıt başlık bloğu {MAX_RESPONSE_HEADER_BYTES} baytı aşıyor (CRLFCRLF yok).")
             hdr_buf = bytes(hdr_acc)
             if sep == -1:
                 raise ConnectionResetError("Sunucu yanıt başlıkları tamamlanmadan bağlantıyı kesti.")

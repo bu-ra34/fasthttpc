@@ -24,6 +24,9 @@ Yollar (sorgu parametreleri ``?k=v``):
   /close           ``Connection: close`` ile yanıt
   /http10          HTTP/1.0, Content-Length'siz, kapanışla biten yanıt
   /once            bu bağlantıda ilk istek yanıtlanır, sonra sunucu bağlantıyı kapatır
+  /hdrflood        CRLF CRLF göndermeden ~512 KB başlık akıtır, sonra bağlantıyı açık tutar
+  /chunk0x         chunked; boyut satırı ``0x5`` (gevşek int(x, 16) kabul eder, RFC reddeder)
+  /chunknocrlf     chunked; chunk verisinden sonra CRLF yerine ``XX``
 """
 from __future__ import annotations
 
@@ -366,6 +369,27 @@ class YerelSunucu:
             return False
         elif yol == "/http10":
             self._gonder(s, "200 OK", [], b"http10-govde", cl=False, surum="HTTP/1.0")
+            return False
+        elif yol == "/hdrflood":
+            # Güvenlik denetimi (F5): başlık bloğu hiç bitmez; istemci sınırsız biriktirmemeli.
+            s.sendall(b"HTTP/1.1 200 OK\r\n")
+            satir = b"X-Dolgu: " + b"a" * 1000 + b"\r\n"
+            try:
+                for _ in range(512):
+                    s.sendall(satir)
+                time.sleep(3)
+            except (OSError, ssl.SSLError):
+                pass
+            return False
+        elif yol == "/chunk0x":
+            # Güvenlik denetimi (F4): "0x5" geçerli bir chunk-size DEĞİL (yalnızca HEXDIG).
+            self._gonder(s, "200 OK", [("Transfer-Encoding", "chunked")],
+                         b"0x5\r\nhello\r\n0\r\n\r\n", cl=False)
+            return False
+        elif yol == "/chunknocrlf":
+            # Güvenlik denetimi (F4): chunk verisinden sonra CRLF zorunlu.
+            self._gonder(s, "200 OK", [("Transfer-Encoding", "chunked")],
+                         b"5\r\nhelloXX0\r\n\r\n", cl=False)
             return False
         elif yol == "/once":
             self._gonder(s, "200 OK", [("X-Id", q.get("i", ""))], q.get("i", "").encode())

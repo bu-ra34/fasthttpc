@@ -15,6 +15,7 @@ Max-Age/Expires kurallarını uygular. Amaç tam bir tarayıcı uyumluluğu değ
 """
 from __future__ import annotations
 
+import ipaddress
 import threading
 import time
 from dataclasses import dataclass, field
@@ -49,6 +50,30 @@ def _domain_matches(request_host: str, cookie_domain: str, host_only: bool) -> b
         return False
     # Alt alan adı eşleşmesi: 'a.example.com' <- '.example.com'
     return request_host.endswith("." + cookie_domain)
+
+
+def _is_ip(host: str) -> bool:
+    try:
+        ipaddress.ip_address(host.strip("[]"))
+        return True
+    except ValueError:
+        return False
+
+
+def _domain_attr_allowed(host: str, declared: str) -> bool:
+    """``Domain=`` özniteliği çerezi alan-geneli (host-only olmayan) yapabilir mi?
+
+    RFC 6265 §5.3 adım 5-6: öznitelik istek host'unu domain-match etmeli; IP adresi
+    olan host'ta alan-geneli çerez olmaz (``Domain=0.1`` '10.0.0.1'den '9.0.0.1'e
+    sızardı); tek etiketli bir değer (``com``, ``local``) genel sonek kabul edilir —
+    aksi halde ``Domain=com`` ile konan çerez TÜM ``.com`` sitelerine giderdi.
+    Tam Public Suffix List (``co.uk``, ``github.io``) uygulanmaz; bkz. docs/security-audit.md.
+    """
+    if not declared or _is_ip(host):
+        return False
+    if host != declared and not host.endswith("." + declared):
+        return False
+    return "." in declared
 
 
 def _path_matches(request_path: str, cookie_path: str) -> bool:
@@ -99,11 +124,11 @@ def parse_set_cookie(header_value: str, request_host: str, request_path: str) ->
         val = val.strip()
 
         if key == "domain" and val:
-            declared = val.lstrip(".").lower()
+            declared = val.lstrip(".").lower().rstrip(".")
             # Sunucu yalnızca kendi alan adı veya üst alanı için çerez
             # koyabilir; 'evil.com' 'bank.com' için çerez ayarlayamaz.
-            host = request_host.lower()
-            if host == declared or host.endswith("." + declared):
+            host = request_host.lower().rstrip(".")
+            if _domain_attr_allowed(host, declared):
                 cookie.domain = declared
                 cookie.host_only = False
         elif key == "path" and val.startswith("/"):
