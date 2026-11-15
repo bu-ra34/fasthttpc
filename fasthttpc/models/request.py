@@ -2,12 +2,16 @@
 import json as jsonlib
 import os
 import uuid
+from typing import TYPE_CHECKING, Any
 from urllib.parse import urlencode
 from .urls import URL
 from .headers import Headers
 
+if TYPE_CHECKING:
+    from ..timeout import Timeout
 
-def _build_multipart(files: dict, data: dict | None = None) -> tuple[bytes, str]:
+
+def _build_multipart(files: dict[str, Any], data: dict[str, Any] | None = None) -> tuple[bytes, str]:
     """
     files: {"field": ("filename", file_obj, "mime/type")}
            veya {"field": file_obj}  (kısa form)
@@ -55,16 +59,16 @@ class Request:
         self,
         method: str,
         url: "str | URL",
-        data: "dict | bytes | str | None" = None,
-        json: "dict | list | None" = None,
-        headers: "dict | Headers | None" = None,
-        files: "dict | None" = None,
+        data: "dict[str, Any] | bytes | str | None" = None,
+        json: "dict[str, Any] | list[Any] | None" = None,
+        headers: "dict[str, str] | list[tuple[str, str]] | Headers | None" = None,
+        files: "dict[str, Any] | None" = None,
     ):
         self.method = method.upper()
         self.url = url if isinstance(url, URL) else URL(url)
         self.headers = headers if isinstance(headers, Headers) else Headers(headers)
         self.body = b""
-        self.timeout = None   # gönderim sırasında etkin Timeout (transport/hook'lar okuyabilir)
+        self.timeout: "Timeout | None" = None   # gönderim sırasında etkin Timeout (transport/hook'lar okuyabilir)
 
         if files is not None:
                                                                   

@@ -18,12 +18,17 @@ import netrc as _netrc
 import os
 import re
 import threading
-from typing import Callable, Generator, Optional
+from typing import TYPE_CHECKING, Callable, Generator, Optional
+
+if TYPE_CHECKING:
+    from .models.request import Request
+    from .models.response import Response
 
 __all__ = ["Auth", "BasicAuth", "BearerAuth", "DigestAuth", "FunctionAuth",
            "resolve_auth", "netrc_credentials"]
 
-AuthFlow = Generator["object", "object", None]
+# httpx tarzı akış: istek verir (yield), yanıtı alır (send).
+AuthFlow = Generator["Request", "Response", None]
 
 
 class Auth:
