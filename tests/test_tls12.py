@@ -741,6 +741,60 @@ def test_async_sahte_sunucu_reddedilir(pki, files, tamper, match):
     t.join(5)
 
 
+def _run_async_backend(backend, coro_fn, timeout=15):
+    """``coro_fn``'i asyncio ya da trio altında (anyio zaman aşımıyla) çalıştırır."""
+    if backend == "asyncio":
+        return asyncio.run(asyncio.wait_for(coro_fn(), timeout))
+    trio = pytest.importorskip("trio")
+    anyio = pytest.importorskip("anyio")
+
+    async def main():
+        with anyio.fail_after(timeout):
+            return await coro_fn()
+    return trio.run(main)
+
+
+@pytest.mark.parametrize("backend", ["asyncio", "trio"])
+@pytest.mark.parametrize("tamper,alert", [
+    ("bad_ske_sig", tls12.AL_DECRYPT_ERROR),
+    ("out_of_order", tls12.AL_UNEXPECTED_MESSAGE),
+    ("cbc_suite", tls12.AL_INSUFFICIENT_SECURITY),
+])
+def test_async_reddedilen_baglantida_fatal_alert_gonderilir(pki, files, backend, tamper, alert):
+    """Senkron test_fake_reddedilen_baglantida_fatal_alert_gonderilir'in async karşılığı:
+    async yol da doğrulama hatasında sunucuya (senkron yolla AYNI kodlu) fatal alert yollar."""
+    srv = Fake12Server(pki, tamper={tamper})
+    port, t, ls = serve_fake_in_thread(srv)
+
+    async def main():
+        await _async_negotiate(port, files[0])
+
+    with pytest.raises(TLSError):
+        _run_async_backend(backend, main)
+    t.join(5)
+    ls.close()
+    assert srv.alerts and srv.alerts[0] == bytes([2, alert])
+
+
+def test_async_ve_senkron_ayni_alert_kodunu_gonderir(pki, files):
+    """Aynı hata için iki yolun gönderdiği fatal alert birebir aynı olmalı."""
+    got = []
+    for use_async in (False, True):
+        srv = Fake12Server(pki, tamper={"bad_ske_sig"})
+        port, t, ls = serve_fake_in_thread(srv)
+        with pytest.raises(ConnectionError):
+            if use_async:
+                async def main():
+                    await _async_negotiate(port, files[0])
+                asyncio.run(asyncio.wait_for(main(), 15))
+            else:
+                _connect(port, files[0])
+        t.join(5)
+        ls.close()
+        got.append(srv.alerts[:1])
+    assert got[0] == got[1] == [bytes([2, tls12.AL_DECRYPT_ERROR])]
+
+
 def test_async_sahte_sunucu_kabul_ve_hello_request(pki, files):
     srv = Fake12Server(pki, suite=0xC030, split_flight=True, tamper={"hello_request"})
     port, t, ls = serve_fake_in_thread(srv)
