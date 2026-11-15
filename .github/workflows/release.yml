@@ -1,6 +1,7 @@
 name: Release
 
-# Tag push `v*`  -> build, publish to PyPI (Trusted Publishing), GitHub Release.
+# Tag push `v*` (or publishing a release in the GitHub UI, which creates the tag)
+#   -> build, publish to PyPI (Trusted Publishing), GitHub Release (created or updated).
 # workflow_dispatch -> build and publish to TestPyPI (dry run of the pipeline).
 # No tokens or secrets: PyPI/TestPyPI trust this workflow via OIDC.
 # One-time setup: add a "trusted publisher" for this repo/workflow on pypi.org
@@ -70,10 +71,17 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release create "${GITHUB_REF_NAME}" dist/* \
-            --title "${GITHUB_REF_NAME}" \
-            --notes-file release-notes.md \
-            --verify-tag
+          # The tag may come from a release created in the GitHub UI: then the release already
+          # exists, so attach the built files and notes to it instead of failing.
+          if gh release view "${GITHUB_REF_NAME}" >/dev/null 2>&1; then
+            gh release upload "${GITHUB_REF_NAME}" dist/* --clobber
+            gh release edit "${GITHUB_REF_NAME}" --notes-file release-notes.md
+          else
+            gh release create "${GITHUB_REF_NAME}" dist/* \
+              --title "${GITHUB_REF_NAME}" \
+              --notes-file release-notes.md \
+              --verify-tag
+          fi
 
   publish-testpypi:
     if: github.event_name == 'workflow_dispatch'
