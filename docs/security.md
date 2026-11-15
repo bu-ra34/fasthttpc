@@ -15,7 +15,8 @@ downgrade sentinels and rejects weak suites.
 
 ## Not covered
 
-- No independent audit; the stack is young.
+- No independent third-party audit; the stack is young. An internal review and
+  its open items are in [Security review (2026-11)](security-audit.md).
 - Constant-time behaviour is only as good as `cryptography`/OpenSSL primitives;
   protocol logic is pure Python.
 - Fingerprint impersonation is not an anti-detection guarantee.
