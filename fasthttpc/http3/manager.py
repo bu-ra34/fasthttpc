@@ -4,7 +4,7 @@ from __future__ import annotations
 import asyncio
 import threading
 import time
-from typing import Optional
+from typing import Any, Optional
 
 from ..models.headers import Headers
 from ..protocol.http1_parser import HTTP1Parser
@@ -106,7 +106,9 @@ class SyncHttp3:
                 self._conns[origin] = c
             return c
 
-    def exchange(self, host, port, method, path, headers, body, timeout):
+    def exchange(self, host: str, port: int, method: str, path: str,
+                 headers: "list[tuple[str, str]]", body: bytes,
+                 timeout: Optional[float]) -> "tuple[int, Headers, bytes] | None":
         origin = (host, port)
         target = self.state.target_for(host, port)
         if target is None:
@@ -163,7 +165,9 @@ class AsyncHttp3:
                 self._conns[origin] = c
             return c
 
-    async def exchange(self, host, port, method, path, headers, body, timeout, *, stream: bool = False):
+    async def exchange(self, host: str, port: int, method: str, path: str,
+                       headers: "list[tuple[str, str]]", body: bytes, timeout: Optional[float],
+                       *, stream: bool = False) -> "tuple[int, Headers, Any] | None":
         """(status, Headers, body) | None. ``stream=True`` -> body bir async iteratördür."""
         origin = (host, port)
         target = self.state.target_for(host, port)

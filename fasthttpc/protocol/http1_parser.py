@@ -36,6 +36,28 @@ if _ZSTD:
     _DECOMPRESS_ERRORS += (_zstd.ZstdError,)
 
 
+_HEX_DIGITS = frozenset(b"0123456789abcdefABCDEF")
+
+#: Yanıt başlık bloğu (status satırı + başlıklar) için üst sınır. Kötü niyetli ya da
+#: bozuk bir sunucu CRLFCRLF göndermeden sınırsız veri akıtarak belleği tüketemesin
+#: (HTTP/2 tarafındaki HPACK_MAX_HEADER_LIST_SIZE ile aynı mertebe).
+MAX_RESPONSE_HEADER_BYTES = 256 * 1024
+
+
+def parse_chunk_size(line: "bytes | bytearray") -> int:
+    """``chunk-size [; chunk-ext]`` satırını KATI biçimde ayrıştırır (RFC 9112 §7.1).
+
+    Python'un ``int(x, 16)``'sı ``0x10``, ``+1``, ``-1``, ``1_0`` ve çevreleyen boşlukları da
+    kabul eder; böyle gevşek ayrıştırma, aynı baytları farklı okuyan bir aracı (proxy) ile
+    çerçeveleme uyuşmazlığına (response splitting / desync) zemin hazırlar. Yalnızca
+    1-16 onaltılık rakam kabul edilir; aksi halde ``ValueError``.
+    """
+    size = bytes(line).split(b";", 1)[0].rstrip(b" \t")
+    if not size or len(size) > 16 or any(c not in _HEX_DIGITS for c in size):
+        raise ValueError(f"Geçersiz chunk boyutu: {bytes(line)[:20]!r}")
+    return int(size, 16)
+
+
 class HTTP1Parser:
     """Ham HTTP/1.1 bayt akışını Response nesnesine dönüştüren protokol ayrıştırıcısı."""
 
@@ -159,9 +181,8 @@ class HTTP1Parser:
             reader.skip(2)        
 
                                             
-            size_line = size_line.split(b";")[0].strip()
             try:
-                chunk_size = int(size_line, 16)
+                chunk_size = parse_chunk_size(size_line)
             except ValueError:
                 break
 
