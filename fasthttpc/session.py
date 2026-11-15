@@ -771,8 +771,8 @@ class Session:
         # Telde yazılmadan (bağlantı açılmadan) ÖNCE: CR/LF/NUL içeren başlık ya da
         # bozuk metot/hedef, HTTP/1.1'de istek enjeksiyonuna yol açar (h2/h3'te malformed).
         check_request_line(req.method, req.url.raw_path.decode("latin-1"))
-        for k, v in req.headers.raw:
-            check_header_field(k, v)
+        for raw_k, raw_v in req.headers.raw:
+            check_header_field(raw_k, raw_v)
 
         if self._h3 is not None:
             h3_resp = self._h3_attempt(req, metrics, cache_entry, method, url)
