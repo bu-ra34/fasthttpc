@@ -2,6 +2,24 @@
 
 ## [Unreleased]
 
+Kendi içimizde yapılan güvenlik incelemesi (bağımsız denetim değildir):
+bulgular ve açık maddeler `docs/security-audit.md`'de.
+
+### Güvenlik
+- IP adresiyle bağlanılan host'larda sertifika artık iPAddress SAN'ı ile
+  doğrulanıyor. Eskiden IP, DNS adı gibi eşleniyordu: IP'yi dNSName olarak
+  yazan sertifika kabul ediliyor, doğru IP SAN'lı sertifika reddediliyordu (FHC-01).
+- Giden başlık adı/değeri, çerez değeri, metot ve istek hedefi telde
+  yazılmadan önce doğrulanıyor. CR/LF/NUL içeren değer `ValueError` veriyor;
+  eskiden HTTP/1.1'de başlık/istek enjeksiyonu mümkündü (FHC-02).
+- Çerez `Domain=` özniteliği artık tek etiketli genel soneke (`com`) ya da
+  IP host'larda yayılamıyor; böyle çerezler host-only kalıyor (FHC-03).
+- Chunked gövdede chunk boyutu katı ayrıştırılıyor (`0x5`, `-1`, `+5`
+  reddediliyor) ve chunk sonundaki CRLF denetleniyor (FHC-04).
+- HTTP/1.1 yanıt başlık bloğu 256 KiB ile sınırlandı (FHC-05).
+- TLS 1.3 Certificate mesajında boş olmayan `certificate_request_context` ve
+  liste sonrası artık bayt reddediliyor (FHC-06).
+
 ### Tip denetimi
 - mypy (strict) kapsamı genişletildi: `session.py`, `async_session.py`,
   `models/request.py`, `models/response.py`, `models/__init__.py`, `streaming.py`,
