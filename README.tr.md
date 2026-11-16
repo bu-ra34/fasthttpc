@@ -50,7 +50,7 @@ pytest        # ağ gerektirmez (canlı testler FASTHTTPC_LIVE=1 olmadan atlanı
 
 | Alan | Destek |
 |---|---|
-| Protokoller | HTTP/1.1 (keep-alive, chunked), HTTP/2 (akış kontrolü, GOAWAY; eşzamanlı akışlar `AsyncSession`'da), WebSocket (`ws://`, `wss://`), HTTP/3 (**deneysel**, isteğe bağlı, aşağıya bakın) |
+| Protokoller | HTTP/1.1 (keep-alive, chunked; düz `http://` dahil), HTTP/2 (akış kontrolü, GOAWAY; eşzamanlı akışlar `AsyncSession`'da), WebSocket (`ws://`, `wss://`), HTTP/3 (**deneysel**, isteğe bağlı, aşağıya bakın) |
 | TLS | Kendi TLS 1.3'ümüz (HelloRetryRequest; key_share x25519, secp256r1, secp384r1 ve `cryptography` ML-KEM sunuyorsa hibrit post-kuantum X25519MLKEM768) ve TLS 1.2'nin güvenli bir alt kümesi (ECDHE + AEAD, EMS zorunlu). TLS 1.3 PSK oturum devamı var ama varsayılan kapalı; 0-RTT yok |
 | Sunucu doğrulaması | Zincir + hostname, CertificateVerify, Finished, hepsi zorunlu; `verify=` ile özel CA bundle |
 | İstemci sertifikası | `cert=` (mTLS): PEM, şifreli PKCS#8 veya PKCS#12; RSA >= 2048, P-256, P-384, Ed25519; TLS 1.3 ve TLS 1.2 |
@@ -58,7 +58,7 @@ pytest        # ağ gerektirmez (canlı testler FASTHTTPC_LIVE=1 olmadan atlanı
 | Async | `AsyncSession` asyncio altında ya da anyio üzerinden trio altında (`fasthttpc[trio]`); aynı parmak izi ve gerçek HTTP/2 multiplexing |
 | Akış | `stream=True` / `s.stream(...)`; `iter_bytes`, `iter_text`, `iter_lines`, `iter_raw` ve async `aiter_*` karşılıkları; HTTP/1.1 ve HTTP/2 |
 | Auth ve hook'lar | Basic, Digest (RFC 7616), Bearer, `.netrc`, özel auth (requests veya httpx tarzı); requests tarzı `hooks=`, httpx tarzı `event_hooks=`; `Session` ve `AsyncSession`'da plugin'ler |
-| Proxy | HTTP CONNECT (+Basic), SOCKS5 (RFC 1929), rotasyon; TLS her zaman tünelin içinde kurulur |
+| Proxy | HTTP CONNECT (+Basic), SOCKS5 (RFC 1929), rotasyon; `trust_env=True` ile `HTTP_PROXY`/`HTTPS_PROXY`/`ALL_PROXY`/`NO_PROXY`; TLS her zaman tünelin içinde kurulur |
 | Zaman aşımı / sınır / yeniden deneme | `Timeout` (`total` dahil), `Limits`, urllib3 tarzı `Retry` (`Retry-After` ile) |
 | Çerez, cache, yönlendirme | RFC 6265 cookie jar, response cache, yönlendirme geçmişi |
 | DNS | İsteğe bağlı DNS-over-HTTPS çözücü; çok adresli host'larda Happy Eyeballs (RFC 8305) |
@@ -118,6 +118,13 @@ Sertifika doğrulamayı kapatmanın bir yolu yoktur; bu kasıtlıdır.
 kullanmaz: Python'un `ssl` modülünü `ssl.create_default_context()` ile kullanır;
 orada da sertifika zinciri ve hostname her zaman doğrulanır.
 
+`http://` adresleri düz metin HTTP/1.1 ile gider (requests/httpx gibi); bu
+isteklerde ne kimlik doğrulama ne gizlilik vardır. `https://` → `http://`
+yönlendirmesi izlenir ama o adımda HİÇBİR kimlik bilgisi (`Authorization`,
+`Proxy-Authorization`, `auth=`, `.netrc`, `kullanici:parola@`) ve `Secure` çerez
+gönderilmez; düz HTTP yanıtı `Secure` çerez koyamaz, var olanın üzerine yazamaz.
+HSTS yoktur: `http://` adresi sizin yerinize `https://`'e yükseltilmez.
+
 ### `verify`: özel CA bundle
 
 Kurumsal ağlarda (iç CA, TLS denetleyen proxy) kendi CA'nızı verebilirsiniz:
@@ -139,6 +146,13 @@ with Session(verify="/etc/kurum/ca.pem") as s:   # yalnızca bu CA'lara güvenil
 
 `AsyncSession(verify=...)` da aynı kuralları uygular (`impersonate=None` ile
 stdlib `ssl`'e `cafile` olarak iletilir).
+
+`trust_env=True` (varsayılan) ve `verify=True` iken `REQUESTS_CA_BUNDLE`,
+`SSL_CERT_FILE` ya da `CURL_CA_BUNDLE` (bu sırayla) bir PEM dosyası gösteriyorsa
+güven kökü o dosyadır (`verify="yol"` ile aynı anlam; requests/httpx gibi).
+Bu yalnızca HANGİ CA'lara güvenileceğini değiştirir, doğrulama kapanmaz. Açık
+`verify="yol"` her zaman önceliklidir; dosya yoksa değişkenin adıyla
+`FileNotFoundError`. `SSL_CERT_DIR` desteklenmez.
 
 ## Hızlı başlangıç
 
@@ -186,8 +200,10 @@ de çalışır).
   desteklenmez (bkz. Güvenlik modeli). `proxies={...}` sözlüğü requests ile aynı
   biçimdedir ama yalnızca oturum düzeyindedir. `timeout=`, `params=`, `auth=`,
   `cookies=`, `hooks=` ve `stream=True` istek başına da verilebilir.
-- Proxy ortam değişkenleri (`HTTPS_PROXY` ...) okunmaz; `trust_env` yalnızca
-  `.netrc`'yi etkiler.
+- `trust_env=True` (varsayılan, requests gibi) iken proxy ortam değişkenleri
+  okunur (bkz. Proxy); `trust_env=False` hepsini (ve `.netrc`'yi) kapatır.
+- `http://` adresleri artık (requests/httpx gibi) düz HTTP/1.1 ile istenir;
+  0.6.2'ye kadar TLS ile isteniyordu.
 
 ### Timeout ve Limits
 
@@ -325,7 +341,22 @@ with Session(proxies={"https": "socks5://u:p@127.0.0.1:1080"}) as s:
 
 TLS (ve parmak izi) her zaman tünelin İÇİNDE fasthttpc'nin kendi TLS yığınıyla
 kurulur (`AsyncSession(impersonate=None)` ile stdlib `ssl`); proxy yalnızca TCP
-baytlarını taşır.
+baytlarını taşır. Düz `http://` hedefler HTTP proxy'sine CONNECT'siz, mutlak
+biçimli istekle (`GET http://host/yol HTTP/1.1`, `Proxy-Authorization` dahil)
+gider; SOCKS5'te tünelin içinde düz HTTP konuşulur.
+
+**Ortam değişkenleri** (`trust_env=True`, varsayılan; requests/httpx gibi):
+`proxy=`/`proxies=` verilmemişse `http://` için `HTTP_PROXY`, `https://` için
+`HTTPS_PROXY`, ikisi de yoksa `ALL_PROXY` kullanılır (küçük harfli adlar
+önceliklidir; şemasız değer `http://` sayılır). `NO_PROXY` virgülle ayrılmış
+liste: `*`, host (`example.com` alt alan adlarını da kapsar; `.example.com`,
+`*.example.com` aynı), IP, CIDR (`10.0.0.0/8`, yalnızca IP hedefe), port
+(`host:8080`, `[::1]:8080`). Açık `proxy=`/`proxies=` ortamı tamamen ezer;
+`proxies={}` "proxy yok" demektir; `trust_env=False` ortamı hiç okumaz.
+Değişkenler oturum kurulurken okunur. Desteklenmeyen şema (ör. `https://`
+proxy, `socks4://`) sessizce yok sayılmaz: o proxy kullanılacağı istekte
+değişkenin adını içeren `ValueError` verilir. CGI ortamında (`REQUEST_METHOD`
+tanımlı) büyük harfli `HTTP_PROXY` okunmaz (httpoxy).
 
 ### Logging
 
@@ -399,10 +430,8 @@ verir veya belgelenmiştir:
   kullanımdaki bağlantıları sınırlar; boştaki keep-alive bağlantılar slot
   tutmaz ve `max_keepalive_connections` (varsayılan `max_connections`) ile
   sınırlıdır. Async'te `keepalive_expiry=0` keep-alive'ı kapatır.
-- Proxy ortam değişkenleri (`HTTP_PROXY`, `HTTPS_PROXY`, `NO_PROXY`) okunmaz.
-- **Düz HTTP yok:** `http://` adresleri de TLS ile istenir (adreste port yoksa
-  80'e), bu yüzden yalnızca düz HTTP konuşan sunuculara ulaşılamaz. `ws://`
-  WebSocket'leri düz TCP kullanır.
+- **Düz HTTP yalnızca HTTP/1.1:** `http://` için h2c (düz HTTP/2) ve HTTP/3
+  yoktur; HSTS uygulanmaz (`http://` adresi `https://`'e yükseltilmez).
 - HTTP/2'de (senkron ve async) sunucu PUSH_PROMISE'i protokol hatasıdır (ENABLE_PUSH=0 ilan
   edilir); PRIORITY frame'i gönderilmez, gelirse yok sayılır (HEADERS'ın öncelik
   alanı profili izler).

@@ -79,6 +79,58 @@
 ### Dokümantasyon
 - README, README.tr, kurulum, zaman aşımı, akış, sınırlar ve API sayfaları
   güncellendi.
+### Davranış değişikliği
+- **`http://` artık düz HTTP:** `http://` adresleri requests/httpx gibi TLS'siz,
+  düz TCP üzerinden HTTP/1.1 ile istenir (h2c ve HTTP/3 yok); 0.6.2'ye kadar TLS
+  ile (port 80'e) isteniyordu ve yalnızca düz HTTP konuşan sunuculara
+  ulaşılamıyordu. `Session` ve `AsyncSession` aynı; HTTP/1.1 başlık sırası
+  profili izler (TLS parmak izi düz HTTP'de söz konusu değildir).
+  `resp.tls_info` düz HTTP'de `None`'dır. Aynı host:port'taki `http://` ve
+  `https://` bağlantıları paylaşılmaz.
+- **Proxy ortam değişkenleri okunuyor:** `trust_env=True` (varsayılan) iken ve
+  `proxy=`/`proxies=` verilmemişse `HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY` ve
+  `NO_PROXY` (küçük harfli biçimleri önceliklidir) kullanılır. `HTTPS_PROXY`
+  tanımlı bir ortamda istekler artık o proxy'den geçer; eski davranış için
+  `trust_env=False` ya da `proxies={}`.
+- **CA bundle ortam değişkenleri:** `trust_env=True` ve `verify=True` iken
+  `REQUESTS_CA_BUNDLE`, `SSL_CERT_FILE` ya da `CURL_CA_BUNDLE` bir PEM
+  gösteriyorsa güven kökü odur (`verify="yol"` ile aynı anlam; doğrulama
+  kapanmaz, açık `verify="yol"` kazanır). Dosya yoksa değişkenin adıyla
+  `FileNotFoundError`.
+- HTTP/1.1 `Host` başlığı varsayılan olmayan portu içerir (`host:8080`).
+
+### Eklenenler
+- `NO_PROXY`: `*`, host ve alt alan adları (`example.com`, `.example.com`,
+  `*.example.com`), IP, CIDR (`10.0.0.0/8`, `fd00::/8`) ve port
+  (`host:8080`, `[::1]:8080`). Açık `proxy=`/`proxies=` ortamı tamamen ezer
+  (httpx gibi), `proxies={}` "proxy yok" demektir. Değişkenler oturum
+  kurulurken okunur. CGI ortamında büyük harfli `HTTP_PROXY` yok sayılır
+  (httpoxy).
+- Desteklenmeyen ortam proxy'si (`https://` proxy, `socks4://` ...) sessizce
+  yok sayılmaz: kullanılacağı istekte değişkenin adını içeren `ValueError`.
+- Proxy üzerinden düz HTTP: HTTP proxy'sine CONNECT'siz, mutlak biçimli istek
+  (`GET http://host/yol HTTP/1.1`, `Proxy-Authorization` dahil); SOCKS5'te
+  tünelin içinde düz HTTP. `https://` hedefler CONNECT tünelini kullanmaya
+  devam eder.
+- `fasthttpc.transport.proxy`: `environ_proxies`, `proxy_bypass`,
+  `select_proxy`; `fasthttpc.config.environ_ca_bundle`.
+
+### Güvenlik
+- `https://` → `http://` yönlendirmesi requests gibi izlenir ama o adımda
+  hiçbir kimlik bilgisi gitmez: `Authorization`, `Proxy-Authorization`,
+  `Cookie` başlıkları, `auth=`, URL'deki `kullanici:parola@` ve (requests'ten
+  farklı olarak) `.netrc` kimliği. `Secure` çerezler `http://` üzerinden
+  gönderilmez.
+- Düz HTTP yanıtı `Secure` çerez koyamaz, aynı adlı `Secure` çerezin üzerine
+  yazamaz ve onu silemez (RFC 6265bis §5.7).
+- Düz HTTP yanıtındaki `Alt-Svc` kaydedilmez; HTTP/3 yalnızca `https://` için
+  kullanılır (`http3="force"` olsa da `http://` düz HTTP/1.1 ile gider).
+- HSTS uygulanmaz (belgelendi).
+
+### Dokümantasyon
+- README, README.tr, `proxy.md`, `limits.md`, `security.md`,
+  `security-audit.md`, `migration-requests.md`, `migration-httpx.md` ve
+  auth/hook sayfası yeni davranışa göre güncellendi.
 
 ## [0.6.2] — 2026-11-16
 
