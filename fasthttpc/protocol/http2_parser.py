@@ -1213,6 +1213,13 @@ class Http2Connection:
         self._dbg(f"gelen frame: {frame!r}")
         stream_id = st.stream_id
 
+        if frame.type == FrameType.PUSH_PROMISE:
+            # ENABLE_PUSH=0 ilan ettik: PUSH_PROMISE bağlantı hatasıdır
+            # (RFC 9113 §6.6, §8.4). Başlık bloğu decode edilmeden yutulsaydı
+            # HPACK dinamik tablosu sunucuyla senkronunu yitirirdi.
+            self._send_goaway(1)
+            raise Http2ConnectionError("PROTOCOL_ERROR: ENABLE_PUSH=0 iken PUSH_PROMISE alındı")
+
         if frame.stream_id != 0 and frame.stream_id != stream_id:
             self._dbg(f"  -> beklenmeyen stream_id, yutuluyor (bizim stream={stream_id})")
             self._foreign_frame(frame)
@@ -1283,7 +1290,7 @@ class Http2Connection:
                 # Tüketici bu veriyi isteyince (frame ancak o zaman okunur) pencere açılır.
                 self._send_window_updates(stream_id, raw_len)
             return data
-        # PRIORITY, PUSH_PROMISE vb. bu minimal modelde yok sayılır
+        # PRIORITY ve bilinmeyen frame türleri yok sayılır (RFC 9113 §4.1)
         return b""
 
 
