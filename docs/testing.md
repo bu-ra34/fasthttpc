@@ -99,6 +99,13 @@ The tests account for that as follows:
   CI run shows resets for some profiles and EMS refusals for others, the
   ClientHello of the reset profiles is the suspect; if every profile and the
   stdlib control are reset, `badssl.com` is dropping connections.
+- The 2026-11-16 CI run settled it: resets hit every profile, including
+  `chrome_131` and `default`, at random, and Python's own `ssl` module was reset
+  by the same hosts; each profile also got the expected EMS refusal on other
+  hosts in the same run. `badssl.com` drops connections from GitHub runners
+  intermittently. The `badssl`-marked tests therefore run in a separate workflow
+  step with `continue-on-error`: they still run and their results stay visible,
+  but they do not fail the job. Their assertions are unchanged.
 - Certificate validation on the TCP path is tested against servers that
   negotiate TLS 1.3 (`test_tcp_rejects_chain_from_untrusted_ca`,
   `test_tcp_rejects_hostname_mismatch`), each with a control request that
