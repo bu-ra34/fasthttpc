@@ -27,7 +27,7 @@ Post-quantum key exchange (X25519MLKEM768) is only offered when the installed
 ```python
 from fasthttpc import Session
 
-with Session(impersonate="chrome_131") as s:
+with Session(impersonate="chrome_158") as s:
     r = s.get("https://httpbin.org/get")
     print(r.status_code, r.ok, r.elapsed)
     print(r.headers["content-type"])

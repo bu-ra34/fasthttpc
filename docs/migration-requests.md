@@ -22,7 +22,7 @@
 
 Differences to know: `verify`, `cert` and `proxies` are session-level, not per
 request; `Session` is not thread-safe; `Session()` impersonates Chrome by default
-(`impersonate="chrome_131"`).
+(`impersonate="chrome_158"`).
 
 Proxies and redirects: an explicit `proxies=` dict replaces the environment
 completely (requests fills missing schemes from `HTTP_PROXY`/`HTTPS_PROXY`;

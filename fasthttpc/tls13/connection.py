@@ -641,7 +641,8 @@ class TLSClientConnection:
         if hs_type == HS_ENCRYPTED_EXTENSIONS:
             self.alpn = parse_alpn(msg)
             self._send_client_ee = alps_accepted(
-                getattr(self._imp, "alps_advertised", False), msg, self.alpn)
+                getattr(self._imp, "alps_advertised", False), msg, self.alpn,
+                self._imp.alps_codepoint)
             limit = parse_record_size_limit(msg)
             if limit:
                 if limit < 64:  # RFC 8449 §4: 64'ten küçük değer illegal_parameter
@@ -722,7 +723,7 @@ class TLSClientConnection:
             # ALPS kabul edildi: istemci EncryptedExtensions Finished'tan ÖNCE
             # gider, transcript'e girer (application secret'lar ise SERVER
             # Finished'a kadar olan th_sf'ten türer).
-            cee = build_client_encrypted_extensions()
+            cee = build_client_encrypted_extensions(codepoint=self._imp.alps_codepoint)
             self._seal(cee, CT_HANDSHAKE)
             self._transcript += cee
         if self._cert_req is not None:

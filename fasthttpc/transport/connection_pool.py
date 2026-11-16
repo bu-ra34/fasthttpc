@@ -304,7 +304,7 @@ class ConnectionPool:
         hosts: list[str],
         count: int = 2,
         tls_negotiate_fn=None,
-        impersonate: str = "chrome_131",
+        impersonate: str = "chrome_158",
     ) -> dict[str, int]:
         """
         Verilen host listesi için paralel TCP (+TLS) bağlantıları önceden kurar.

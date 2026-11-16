@@ -6,10 +6,12 @@
   on process-wide with `fasthttpc.security.session_tickets.enable_resumption(True)`
   or the environment variable `FASTHTTPC_TLS_RESUMPTION=1`. TLS 1.2 has no
   resumption, and there is no 0-RTT (early data) at all.
-- Hybrid post-quantum X25519MLKEM768 is offered only by the `chrome_131` and
-  `firefox_133` profiles, and only when the installed `cryptography` provides
-  ML-KEM (version 47 or newer). Without it the group is dropped from the
-  ClientHello, which then no longer matches the browser.
+- Hybrid post-quantum X25519MLKEM768 is offered by the Chrome and Firefox
+  profiles and `safari_27`, but only when the installed `cryptography` provides
+  ML-KEM (version 47 or newer). Without it, the group is dropped from the
+  ClientHello, which then no longer matches the browser. `chrome_158`'s ML-DSA
+  signature schemes likewise need `cryptography` 48 or newer, which provides
+  ML-DSA. On older versions they are dropped.
 - secp521r1, x448 and ffdhe key exchange are not implemented. Profiles that
   advertise them in `supported_groups` (Firefox, Safari) send no key_share for
   them; a server that asks for one through HelloRetryRequest gets an explicit
@@ -50,8 +52,27 @@
   `NO_PROXY` CIDR entries only match IP-literal targets (names are not resolved).
 - `AsyncSession(impersonate=None)` uses Python's `ssl` module: HTTP/1.1 only, no
   `cert=`, and `legacy_tls` has no effect there.
-- Three browser families are modelled; profiles age.
+- Three browser families are modelled; profiles age. There is no Edge profile
+  (see [Profiles](profiles.md)).
 - Pure-Python framing is slower than OpenSSL for bulk transfers.
+
+## Browser fingerprint deviations
+
+The current profiles (`chrome_158`, `firefox_160`, `safari_27`) are built from
+browser source code and published captures. The [Profiles](profiles.md) page lists
+the sources. The table below lists everything known not to match the real browser:
+
+| Profile | Deviation |
+|---|---|
+| `chrome_158` | Real Chrome retries with the server's trust anchors if the first chain is not trusted (`trust_anchors` in EncryptedExtensions). fasthttpc sends the extension, ignores the server's answer and does not retry. Certificate verification is unchanged. |
+| `chrome_158` | The trust anchor list is the Chrome Root Store's at Chromium 158. Real Chrome updates it through the component updater, so the 186-byte extension can drift between Chrome releases. |
+| `chrome_158` | The ECH GREASE AEAD is chosen at random between AES-128-GCM and ChaCha20. Chrome picks AES when the CPU has AES hardware. |
+| `chrome_158` | Validated against a real capture from Chrome **153**, plus the Chromium 158 source. No Chrome 158 binary capture was available. |
+| `firefox_160` | The ECH GREASE payload length (240) is estimated from NSS's padding formula, not measured. Real Firefox derives it from its inner ClientHello. |
+| `firefox_160` | The `zstd` certificate-compression entry is only advertised when `zstandard` is installed, and `brotli` only when `brotli` is installed. |
+| `firefox_160` | The TLS values come from the Firefox 160 source. The newest real capture available was Firefox 155. |
+| `safari_27` | Built from the Safari 27.0 capture data; 27.1/27.2 are assumed to have the same network stack (only the User-Agent says 27.2). |
+| all | HTTP/3 uses aioquic's ClientHello (no browser TLS fingerprint over QUIC); the Chrome QUIC profile does not send the `H3_DATAGRAM` (0x33) setting current Chrome sends. |
 
 ## Project
 

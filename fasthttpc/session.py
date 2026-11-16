@@ -276,9 +276,10 @@ class Session:
     fasthttpc senkron HTTP istemcisi.
 
     Args:
-        impersonate:     TLS fingerprint profili: ``"chrome_131"`` (varsayılan), ``"firefox_133"``,
-                         ``"safari_18"`` (takma adlar: ``"chrome"``, ``"firefox"``, ``"firefox_120"``,
-                         ``"safari"``, ``"safari_17"``) ya da ``None`` (tarayıcı taklidi yok).
+        impersonate:     TLS fingerprint profili: ``"chrome_158"`` (varsayılan), ``"firefox_160"``,
+                         ``"safari_27"``, eski ``"chrome_131"``/``"firefox_133"``/``"safari_18"``
+                         (takma adlar: ``"chrome"``, ``"firefox"``, ``"safari"`` güncel sürüme;
+                         ``"firefox_120"``, ``"safari_17"``) ya da ``None`` (tarayıcı taklidi yok).
         max_connections: Origin başına en fazla bağlantı (``limits`` verilmezse).
         timeout:         Zaman aşımı — float (saniye) veya :class:`Timeout` objesi.
         max_redirects:   Maksimum redirect sayısı.
@@ -335,7 +336,7 @@ class Session:
 
     def __init__(
         self,
-        impersonate:     str                          = "chrome_131",
+        impersonate:     str                          = "chrome_158",
         max_connections: int                          = 10,
         timeout:         Union[float, int, Timeout]   = 30.0,
         max_redirects:   int                          = 10,

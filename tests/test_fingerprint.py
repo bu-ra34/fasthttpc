@@ -38,7 +38,11 @@ def test_hata_mesaji_kullanilabilir_profilleri_listeler():
 @pytest.mark.parametrize("alias,canonical", [
     ("firefox_120", "firefox_133"),
     ("safari_17", "safari_18"),
-    ("chrome", "chrome_131"),
+    ("chrome", "chrome_158"),
+    ("firefox", "firefox_160"),
+    ("safari", "safari_27"),
+    ("safari_27_2", "safari_27"),
+    ("chrome_131", "chrome_131"),
 ])
 def test_takma_adlar_dogru_profile_gider(alias, canonical):
     assert get_profile(alias)["_name"] == canonical
@@ -54,7 +58,7 @@ def test_chrome_tls12_suitelerini_de_reklam_eder():
 
 
 def test_tls13_suiteleri_her_zaman_var():
-    for name in ("chrome_131", "firefox_133", "safari_18"):
+    for name in ("chrome_131", "firefox_133", "safari_18", "chrome_158", "firefox_160", "safari_27"):
         ciphers = ja3_string_from_client_hello(_client_hello(name)).split(",")[1].split("-")
         assert "4865" in ciphers  # 0x1301
 
@@ -81,8 +85,9 @@ def test_padding_boringssl_kurali():
 
 
 def test_profiller_farkli_ja3_uretir():
-    hashes_ = {p: ja3_for_profile(p)[1] for p in ("chrome_131", "firefox_133", "safari_18")}
-    assert len(set(hashes_.values())) == 3
+    adlar = ("chrome_131", "firefox_133", "safari_18", "chrome_158", "firefox_160", "safari_27")
+    hashes_ = {p: ja3_for_profile(p)[1] for p in adlar}
+    assert len(set(hashes_.values())) == len(adlar)
 
 
 def test_ja3_grease_degerlerini_disarida_birakir():

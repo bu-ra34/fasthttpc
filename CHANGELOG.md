@@ -131,6 +131,40 @@
 - README, README.tr, `proxy.md`, `limits.md`, `security.md`,
   `security-audit.md`, `migration-requests.md`, `migration-httpx.md` ve
   auth/hook sayfası yeni davranışa göre güncellendi.
+### Eklendi
+- **Güncel tarayıcı profilleri (2026-11-16 kararlı sürümleri):** `chrome_158`,
+  `firefox_160`, `safari_27` (Safari 27.2). Değerler tarayıcı kaynak kodundan
+  (Chromium 158 + BoringSSL, Firefox 160 + NSS 3.132), curl-impersonate
+  yakalamalarından ve gerçek bir Chrome for Testing 153 yerel yakalamasından
+  alındı; her değerin kaynağı `fasthttpc/fingerprint.py` ve `docs/profiles.md`'de.
+  `chrome_158`'in JA4'ü (ECH GREASE kapalıyken) gerçek Chrome yakalamasıyla birebir.
+- Chrome 158: ALPS yeni kod noktası 17613 (istemci EncryptedExtensions dahil),
+  `trust_anchors` uzantısı (51764 = 0xca34, Chrome Root Store'un 28 trust anchor
+  ID'si; süreç başına karışık sıra), `signature_algorithms` başında GREASE ve
+  ML-DSA-44/65/87, sürüme göre hesaplanan `sec-ch-ua` (`chrome_sec_ch_ua()`).
+- **ML-DSA CertificateVerify doğrulaması** (draft-ietf-tls-mldsa; saf ML-DSA, boş
+  bağlam; `cryptography` >= 48). ML-DSA yalnızca doğrulanabiliyorsa ilan edilir.
+- **zstd sertifika sıkıştırması** (RFC 8879, algoritma 3): `zstandard` kuruluysa
+  ilan edilir ve açılır (çıktı ilan edilen boyutla sınırlı).
+
+### Değişti
+- `chrome`, `firefox`, `safari` takma adları ve `Session`/`AsyncSession`
+  varsayılanı artık `chrome_158`/`firefox_160`/`safari_27`'yi gösterir. Eski
+  `chrome_131`, `firefox_133`, `safari_18` profilleri aynen duruyor (adlarıyla seçilebilir).
+- Firefox 160: ECDSA-CBC suite'leri ve ffdhe grupları çıkarıldı, ECH GREASE
+  AEAD'i 1/3. Safari 27: X25519MLKEM768, TLS 1.3 suite sırası 1302/1303/1301,
+  yalnızca TLS 1.3/1.2, h2'de SETTINGS 8 ve HEADERS PRIORITY bayrağı yok,
+  `Upgrade-Insecure-Requests` gönderilmez.
+- JA4 hesabı imza algoritması listesindeki GREASE değerlerini artık yok sayıyor
+  (FoxIO JA4 tanımı).
+
+### Dokümantasyon
+- Kullanıcı bildirimi doğrulandı: "extension 51764" Trust Anchor IDs'dir (PQ
+  kripto değil); ML-DSA gerçekten Chrome 158'in imza listesinde; Firefox 160'ta
+  ise ML-DSA kodda var ama `security.tls.enable_mldsa=false` olduğu için
+  ClientHello'da YOK. Safari 18 h2 dizesi gerçek Safari 18.0 ile aynıydı; farklılık
+  güncel Safari 26/27'ye göreydi. Ayrı Edge profili eklenmedi (TLS farkı
+  doğrulanamadı). Bilinen sapmalar `docs/limits.md`'de tablo olarak.
 
 ## [0.6.2] — 2026-11-16
 
