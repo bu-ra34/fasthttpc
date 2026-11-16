@@ -2,6 +2,27 @@
 
 ## [Unreleased]
 
+### Testler
+- Canlı testler (`FASTHTTPC_LIVE=1`): `badssl.com` yalnızca Extended Master
+  Secret'sız TLS 1.2 sunduğu için fasthttpc onu sertifikaya bakmadan ServerHello'da
+  reddediyor; eski `test_bad_certificates_rejected` bu yüzden sertifika
+  doğrulamasını hiç görmüyordu. Yerine `test_badssl_bad_cert_hosts_refused` geldi:
+  yalnızca sertifika hatasını ya da tam olarak EMS reddini kabul eder,
+  bağlantı sıfırlanması/zaman aşımı başarısızlıktır (atlanmaz).
+  `test_badssl_valid_cert_host_refused_for_missing_ems`, geçerli sertifikalı
+  `badssl.com`'un da aynı nedenle reddedildiğini gösterir.
+- TCP yolunda sertifika doğrulaması artık TLS 1.3 sunan gerçek sunuculara karşı
+  sınanıyor: `test_tcp_rejects_chain_from_untrusted_ca` (`www.cloudflare.com`,
+  `www.google.com`, ilgisiz bir CA ile `CertificateValidationError`) ve
+  `test_tcp_rejects_hostname_mismatch` (`quic.nginx.org` adresine yanlış adla
+  bağlanınca "no matching subjectAltName"); her ikisinin de başarılı bir
+  kontrol isteği var (`test_tcp_tls13_baseline_succeeds`).
+
+### Dokümantasyon
+- `docs/testing.md`: `badssl.com`'un EMS'siz TLS 1.2 sunduğu ve testlerin bunu
+  nasıl ele aldığı. `docs/limits.md` ve README: EMS'siz TLS 1.2 sunucuları
+  (`legacy_tls=True` olmadan) reddedilir.
+
 ## [0.6.2] — 2026-11-16
 
 ### Düzeltmeler
