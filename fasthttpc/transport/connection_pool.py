@@ -18,7 +18,8 @@ from typing import TYPE_CHECKING, Any, Optional
 
 from ..models.urls import URL
 from .happy_eyeballs import connect_infos
-from .proxy import ProxyConfig, connect_via_proxy, resolve_proxy
+from .proxy import (EnvProxies, ProxyConfig, connect_to_proxy, connect_via_proxy, resolve_proxy,
+                    select_proxy)
 
 
 from .._log import get_logger
@@ -77,12 +78,18 @@ class HTTPConnection:
                 gözetimini ve engellemesini atlar.
             proxy: Opsiyonel ``ProxyConfig``. Verilirse proxy'ye bağlanılıp
                 hedefe tünel (CONNECT/SOCKS5) kurulur; hedef adı proxy'de
-                çözülür (resolver kullanılmaz).
+                çözülür (resolver kullanılmaz). Düz ``http://`` hedef + HTTP
+                proxy'sinde tünel kurulmaz: soket proxy'nin kendisine açılır ve
+                ``conn_data["forward_proxy"]`` işaretlenir (mutlak biçimli istek).
         """
         scheme, host, port = self.origin
 
         if proxy is not None:
-            self.socket = connect_via_proxy(proxy, host, port, timeout=timeout)
+            if scheme == "http" and proxy.scheme == "http":
+                self.socket = connect_to_proxy(proxy, timeout=timeout)
+                self.conn_data["forward_proxy"] = proxy
+            else:
+                self.socket = connect_via_proxy(proxy, host, port, timeout=timeout)
             self.is_closed = False
             return
 
@@ -179,13 +186,15 @@ class ConnectionPool:
 
     def __init__(self, max_connections: int = 10, timeout: float = 30.0,
                  idle_timeout: float = DEFAULT_IDLE_TIMEOUT, resolver=None,
-                 proxy=None, tls_scope=None):
+                 proxy=None, tls_scope=None, env_proxies: "EnvProxies | None" = None):
         self.max_connections = max_connections
         # mTLS: istemci sertifikası kimliği; havuz anahtarına girer, böylece farklı
         # sertifikalı oturumlar (başka havuz örnekleri dahil) bağlantı paylaşmaz.
         self.tls_scope       = tls_scope
         # proxy: None | URL str | ProxyConfig | {"https": url, "all": url}
         self.proxy           = proxy
+        # trust_env: ortamdan okunan proxy'ler (yalnızca ``proxy`` None iken kullanılır).
+        self.env_proxies     = env_proxies
         self.timeout         = timeout
         self.idle_timeout    = idle_timeout
         self.resolver        = resolver
@@ -250,8 +259,8 @@ class ConnectionPool:
         conn.pool_key = key
         try:
             conn.connect(timeout=connect_timeout or self.timeout, resolver=self.resolver,
-                         proxy=resolve_proxy(self.proxy if proxy is None else proxy,
-                                             url.scheme))
+                         proxy=(self.proxy_for(url) if proxy is None
+                                else resolve_proxy(proxy, url.scheme)))
         except Exception:
             # Bağlantı kurulamadı: bu slot için hiç bağlantı verilmeyecek,
             # semaphore'u serbest bırakmazsak kalıcı olarak sızar (havuz asla
@@ -261,7 +270,9 @@ class ConnectionPool:
         conn.in_use = True
         return conn
 
-                                                                              
+    def proxy_for(self, url: URL) -> "ProxyConfig | None":
+        """Bu URL için oturum düzeyi proxy: ``proxy=``/``proxies=`` ya da ortam (NO_PROXY dahil)."""
+        return select_proxy(url.scheme, url.host, url.port, self.proxy, self.env_proxies)
 
     def release(self, conn: HTTPConnection) -> None:
         """Bağlantıyı Keep-Alive amacıyla havuza geri koy."""
@@ -308,7 +319,7 @@ class ConnectionPool:
             conn = HTTPConnection(origin)
             try:
                 conn.connect(timeout=self.timeout, resolver=self.resolver,
-                             proxy=resolve_proxy(self.proxy, url.scheme))
+                             proxy=self.proxy_for(url))
                 if tls_negotiate_fn:
                     conn.socket = tls_negotiate_fn(conn.socket, url.host, impersonate, port=url.port)
                     conn.tls_established = True
