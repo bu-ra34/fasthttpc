@@ -47,6 +47,33 @@ def test_environ_proxies_cgi_ortaminda_buyuk_harf_http_proxy_yok_sayilir():
         "http": "http://ok:1"}
 
 
+class _WindowsEnviron(dict):
+    """Windows'taki os.environ gibi: anahtarlar büyük harfle saklanır, get() harfe duyarsız."""
+
+    def __init__(self, items):
+        super().__init__({k.upper(): v for k, v in items.items()})
+
+    def get(self, key, default=None):
+        return super().get(key.upper(), default)
+
+    def __contains__(self, key):
+        return super().__contains__(key.upper())
+
+
+def test_environ_proxies_windows_harf_duyarsiz_ortam_httpoxy_korumasini_delmez():
+    """Windows'ta get("http_proxy") HTTP_PROXY'yi döndürür; CGI'da yine de kullanılmamalı."""
+    env = _WindowsEnviron({"REQUEST_METHOD": "GET", "HTTP_PROXY": "http://saldirgan:1",
+                           "HTTPS_PROXY": "http://p:2"})
+    e = environ_proxies(env)
+    assert "http" not in e.proxies and e.proxies["https"] == "http://p:2"
+
+
+def test_environ_proxies_windows_kaynak_adi_gercek_anahtar():
+    """Hata mesajlarında görünen kaynak adı, ortamda gerçekten bulunan addır."""
+    e = environ_proxies(_WindowsEnviron({"HTTP_PROXY": "http://p:1", "NO_PROXY": "a.test"}))
+    assert e.sources == {"http": "HTTP_PROXY"} and e.no_proxy == "a.test"
+
+
 # ---- NO_PROXY eşleştirme -------------------------------------------------------------
 
 @pytest.mark.parametrize("host,port,no_proxy,beklenen", [
