@@ -59,3 +59,4 @@ nav:
       - Security model: security.md
       - Security review (2026-11): security-audit.md
       - Known limits: limits.md
+      - Performance: performance.md

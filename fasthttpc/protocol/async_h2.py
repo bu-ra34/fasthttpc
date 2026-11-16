@@ -45,10 +45,12 @@ from .http2_parser import (
     Http2Connection,
     Http2ConnectionError,
     Http2StreamError,
+    _window_update_frame,
     h2_for_profile,
     h2_headers_priority_field,
     h2_request_headers,
     h2_setting,
+    h2_wu_thresholds,
     HPACK_DEFAULT_TABLE_SIZE,
     _strip_data_frame_padding,
     _strip_headers_frame_fields,
@@ -88,14 +90,16 @@ class H2Response:
 class _Stream:
     __slots__ = ("id", "fut", "status", "headers", "body", "headers_done",
                  "send_window", "activity", "first_byte_time",
-                 "streaming", "chunks", "hdr_fut", "waiter")
+                 "streaming", "chunks", "hdr_fut", "waiter", "unacked")
 
     def __init__(self, sid: int, fut: "asyncio.Future", send_window: int):
         self.id = sid
         self.fut = fut
         self.status = 0
         self.headers: list[tuple[str, str]] = []
-        self.body = bytearray()
+        # Gövde parçaları; sonda TEK b"".join (bytearray'e ekleyip bytes() almak
+        # büyük gövdede yeniden boyutlamalar + bir tam kopya daha demekti).
+        self.body: list[bytes] = []
         self.headers_done = False
         self.send_window = send_window
         self.activity = False
@@ -106,6 +110,7 @@ class _Stream:
         self.chunks: "collections.deque[tuple[bytes, int]]" = collections.deque()
         self.hdr_fut: "Optional[asyncio.Future]" = None
         self.waiter: "Optional[asyncio.Future]" = None
+        self.unacked = 0          # tüketilmiş, stream WINDOW_UPDATE'i ile geri verilmemiş bayt
 
     def notify(self) -> None:
         w, self.waiter = self.waiter, None
@@ -150,9 +155,15 @@ class H2StreamHandle:
         while True:
             if st.chunks:
                 data, raw_len = st.chunks.popleft()
-                if raw_len and not st.fut.done() and not c._closed:
+                if raw_len:
+                    st.unacked += raw_len
+                if (st.unacked >= c._wu_stream_threshold and st.unacked
+                        and not st.fut.done() and not c._closed):
+                    # Stream kredisi tüketildikçe; eşik: h2_wu_thresholds (varsayılan
+                    # 65535 pencerede her parçada, büyük pencerede toplanarak).
                     try:
-                        c._write(_frame(FrameType.WINDOW_UPDATE, 0, st.id, struct.pack("!I", raw_len)))
+                        c._write(_window_update_frame(st.id, st.unacked))
+                        st.unacked = 0
                         await c._drain()
                     except (OSError, Http2ConnectionError):
                         pass        # bağlantı koptu: sıradaki okuma hatayı bildirir
@@ -272,6 +283,13 @@ class AsyncHttp2Connection:
         self._hblock_end_stream = False
         self.last_used = time.perf_counter()
         self.loop = B.current_token()   # asyncio: olay döngüsü; trio: TrioToken
+        # Alım akış kontrolü (bkz. http2_parser.h2_wu_thresholds): bağlantı düzeyinde
+        # geri verilmemiş kredi ve eşikler.
+        self._conn_unacked = 0
+        self._wu_conn_threshold, self._wu_stream_threshold = h2_wu_thresholds(self._h2)
+        # Son drain'den beri yazım yapıldı mı? Okuma döngüsü her frame'den sonra
+        # (yazacak bir şey yokken bile) drain beklemesin.
+        self._need_drain = False
 
     # ------------------------------------------------------------- durum
     @property
@@ -297,6 +315,7 @@ class AsyncHttp2Connection:
 
     # ------------------------------------------------------- düşük seviye
     async def _drain(self) -> None:
+        self._need_drain = False
         async with self._drain_lock:
             if self.write_timeout is None:
                 await self._s.drain()
@@ -307,6 +326,7 @@ class AsyncHttp2Connection:
         if self._closed:
             raise Http2ConnectionError("HTTP/2 bağlantısı kapalı.")
         self._s.write(data)
+        self._need_drain = True
 
     def _wake(self) -> None:
         waiters, self._waiters = self._waiters, []
@@ -328,6 +348,7 @@ class AsyncHttp2Connection:
         try:
             if not self._closed:
                 self._s.write(_frame(FrameType.GOAWAY, 0, 0, struct.pack("!II", 0, error_code)))
+                self._need_drain = True
         except (OSError, RuntimeError, Http2ConnectionError) as e:
             logger.debug("GOAWAY gönderilemedi: %s", e)
 
@@ -351,9 +372,14 @@ class AsyncHttp2Connection:
                     raise self._conn_error(6, f"frame çok büyük ({length})")
                 total = HTTP2Frame.HEADER_SIZE + length
                 if len(buf) >= total:
-                    raw = bytes(buf[:total])
+                    # Alanlar doğrudan tampondan, yük tek kopyayla (bytes(dilim) +
+                    # parse() içinde yeniden dilimleme iki kopyaydı).
+                    sid = int.from_bytes(buf[5:9], "big") & 0x7FFFFFFF
+                    with memoryview(buf) as mv:
+                        payload = mv[HTTP2Frame.HEADER_SIZE:total].tobytes()
+                    f = HTTP2Frame(length, buf[3], buf[4], sid, payload)
                     del buf[:total]
-                    return HTTP2Frame.parse(raw)
+                    return f
             data = await self._s.read(65536)
             if not data:
                 raise Http2ConnectionError("Bağlantı beklenmedik şekilde kapandı.")
@@ -370,7 +396,8 @@ class AsyncHttp2Connection:
                     return
                 if self._closed:
                     return
-                await self._drain()
+                if self._need_drain:
+                    await self._drain()
         except B.cancelled_exc_class():
             err = Http2ConnectionError("HTTP/2 bağlantısı kapatıldı.")
             raise
@@ -428,8 +455,9 @@ class AsyncHttp2Connection:
     def _finish(self, st: _Stream) -> None:
         self._streams.pop(st.id, None)
         self.last_used = time.perf_counter()
+        self._flush_conn_credit()
         if not st.fut.done():
-            st.fut.set_result(H2Response(st.status, st.headers, bytes(st.body), st.first_byte_time))
+            st.fut.set_result(H2Response(st.status, st.headers, b"".join(st.body), st.first_byte_time))
         if st.hdr_fut is not None and not st.hdr_fut.done():
             st.hdr_fut.set_result(None)
         st.notify()
@@ -461,16 +489,36 @@ class AsyncHttp2Connection:
                 st.chunks.append((bytes(data), raw_len))
                 st.notify()
             else:
-                st.body += _strip_data_frame_padding(f)
+                st.body.append(_strip_data_frame_padding(f))
         if raw_len:
-            wu = _frame(FrameType.WINDOW_UPDATE, 0, 0, struct.pack("!I", raw_len))
+            # Bağlantı kredisi alındığı anda (diğer stream'ler aç kalmasın), eşiğe
+            # ulaşınca TOPLU geri verilir; bkz. h2_wu_thresholds. Kalan, stream bitince
+            # (_finish) geri verilir. İki frame tek yazımda (= tek TLS record'u).
+            self._conn_unacked += raw_len
+            wu = b""
+            if self._conn_unacked >= self._wu_conn_threshold:
+                wu = _window_update_frame(0, self._conn_unacked)
+                self._conn_unacked = 0
             # Akış modunda stream penceresi TÜKETİCİ okudukça açılır (geri basınç):
             # okunmayan veri en çok ilan edilen stream penceresi kadar tamponlanır.
             if st is not None and not f.end_stream and not st.streaming:
-                wu += _frame(FrameType.WINDOW_UPDATE, 0, f.stream_id, struct.pack("!I", raw_len))
-            self._write(wu)
+                st.unacked += raw_len
+                if st.unacked >= self._wu_stream_threshold:
+                    wu += _window_update_frame(f.stream_id, st.unacked)
+                    st.unacked = 0
+            if wu:
+                self._write(wu)
         if st is not None and f.end_stream:
             self._finish(st)
+
+    def _flush_conn_credit(self) -> None:
+        """Geri verilmemiş bağlantı kredisini gönderir (stream bitişinde; pencere sızmaz)."""
+        if self._conn_unacked and not self._closed:
+            n, self._conn_unacked = self._conn_unacked, 0
+            try:
+                self._write(_window_update_frame(0, n))
+            except (OSError, RuntimeError, Http2ConnectionError):
+                pass
 
     def _on_headers(self, f: HTTP2Frame) -> None:
         if f.type == FrameType.HEADERS:

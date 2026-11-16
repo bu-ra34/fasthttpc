@@ -2,6 +2,39 @@
 
 ## [Unreleased]
 
+### Performans
+- **HTTP/2 alım akış kontrolü:** her 16 KiB'lik DATA frame'i için iki ayrı TLS
+  record'unda iki WINDOW_UPDATE gönderiliyordu. İlan edilen pencere 65535'ten
+  büyükse (tarayıcı profilleri) kredi artık tarayıcılar gibi toplu geri
+  veriliyor: eşik `min(pencere/2, 32 KiB)`. Stream bitince bağlantı kredisi
+  eksiksiz geri verilir, geri basınç korunur. Bağlantı ve stream güncellemesi
+  tek record'da gider. `default` profilinde (65535) davranış eskisiyle aynı.
+  İlan edilen SETTINGS ve önsöz değerleri, yani parmak izi değişmedi.
+- **Record katmanı:** nonce tamsayı XOR'u ile kuruluyor. `ct||tag`
+  bölünmeden `cryptography`'ye veriliyor (`seal`/`open`). Record tampondan
+  tek kopyayla alınıyor, padding `rstrip` ile atılıyor ve senkron yolda
+  `recv` 64 KiB okuyor. AEAD doğrulaması, record boyut sınırları ve sequence
+  denetimleri aynı. TLS 1.3 sans-IO çekirdeği ve TLS 1.2 de aynı yoldan geçiyor.
+- **HTTP/2 frame yolu:** frame yükü tek kopyayla alınıyor, gövde tek
+  `b"".join` ile birleştiriliyor ve kapalı debug f-string'leri artık her
+  frame'de değerlendirilmiyor. Async okuyucu yalnızca yazım yaptıysa drain
+  bekliyor. `AsyncTLSStream.read()` çözülmüş record'ların hepsini tek
+  çağrıda dönüyor.
+- **Küçük istekler:** `Headers(list)` kurulumu O(n²) yerine doğrusal.
+  `URL.params` ilk erişimde ayrıştırılıyor. `.netrc` her istekte yeniden
+  ayrıştırılmıyor; dosya değişirse yeniden okunuyor.
+- Yerel ölçümde (64 MiB, istemci CPU'su) HTTP/2 indirme ~255'ten ~440–475
+  MB/s'ye, async HTTP/2 indirme ~230'dan ~330–365 MB/s'ye, HTTP/1.1 indirme
+  ~%10–25 yükseldi. Ayrıntılar ve uyarılar `docs/performance.md`'de.
+
+### Araçlar
+- `benchmarks/local_bench.py`: ağsız uçtan uca benchmark. Sunucular ayrı
+  süreçte çalışıyor. HTTP/1.1, HTTP/2, akış, küçük istek, handshake ve async
+  senaryolarını ölçüyor, `--profile` ile cProfile çıktısı veriyor ve
+  `FASTHTTPC_BENCH_SRC` ile eski sürümle karşılaştırıyor.
+- `tests/test_perf_regresyon.py`: zamanlama eşiği olmadan sistem çağrısı,
+  record ve frame sayılarını ölçen regresyon testleri.
+
 ## [0.6.2] — 2026-11-16
 
 ### Düzeltmeler

@@ -54,7 +54,19 @@ class URL:
         # tekrar eden anahtarların düzeni değişir, kodlama farklılaşır. İmza
         # doğrulayan API'lerde bu doğrudan 403 demektir.
         self.raw_query = parsed.query
-        self.params = QueryParams(parsed.query)
+        # ``params`` ilk erişimde ayrıştırılır (bkz. property): istek başına birkaç
+        # URL kurulur ve neredeyse hiçbiri sorguyu sözlük olarak kullanmaz.
+        self._params: "QueryParams | None" = None
+
+    @property
+    def params(self) -> QueryParams:
+        if self._params is None:
+            self._params = QueryParams(self.raw_query)
+        return self._params
+
+    @params.setter
+    def params(self, value: QueryParams) -> None:
+        self._params = value
 
     def copy_with(self, **kwargs: Any) -> 'URL':
         """İstenen parametreleri değiştirerek yeni bir URL nesnesi döner."""
@@ -70,8 +82,9 @@ class URL:
             new_url.params = kwargs["params"]
             new_url.raw_query = str(kwargs["params"])
         else:
-            new_url.params = self.params
             new_url.raw_query = kwargs.get("raw_query", self.raw_query)
+            # raw_query değiştiyse eski params'ı taşıma; ilk erişimde yeniden ayrıştırılır.
+            new_url._params = self._params if new_url.raw_query == self.raw_query else None
         return new_url
 
     @property
