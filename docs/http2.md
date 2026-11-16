@@ -13,7 +13,9 @@ offers only `http/1.1`.
   caller has consumed.
 - The SETTINGS set and order, the connection WINDOW_UPDATE, the HEADERS priority
   field, pseudo-header order and header order follow the profile.
-- Server push is disabled (`ENABLE_PUSH=0`). PRIORITY frames are not sent and
+- Server push is disabled (`ENABLE_PUSH=0`); a PUSH_PROMISE from the server is a
+  connection error (GOAWAY with PROTOCOL_ERROR) on both `Session` and
+  `AsyncSession`. PRIORITY frames are not sent and
   are ignored when received.
 - HPACK Huffman *encoding* is not implemented (decoding is).
 

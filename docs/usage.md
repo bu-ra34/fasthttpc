@@ -73,9 +73,9 @@ async with AsyncSession() as s:
 
 `AsyncSession` supports `ws://` (plain TCP) and `wss://`; `wss://` uses the
 profile's ClientHello with ALPN `http/1.1`, directly or through a proxy.
-`Session.websocket()` also exists, but it is less tested: a `ws://` URL
-currently fails with `TypeError`, and for `wss://` it offers the profile's full
-ALPN list (`h2, http/1.1`), so prefer `AsyncSession` for WebSockets.
+`Session.websocket()` supports `ws://` and `wss://` as well: `wss://` uses the
+profile's ClientHello with ALPN `http/1.1` only, and reads use the session's
+read timeout. `AsyncSession` is the more complete option (proxies, concurrency).
 
 ## DNS-over-HTTPS
 

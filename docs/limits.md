@@ -29,8 +29,9 @@
   sent; the HEADERS priority field follows the profile.
 - Concurrent HTTP/2 streams on one connection are an `AsyncSession` feature;
   `Session` runs one request at a time on an HTTP/2 connection.
-- HTTP/3 is experimental: it is not used through proxies or with `cert=`, does
-  not work under trio, buffers whole response bodies, never uses resumption or
+- HTTP/3 is experimental: it is not used through proxies or with `cert=`, is
+  not used under trio (`http3=True` falls back, `"force"` raises
+  `Http3ConnectError`), buffers whole response bodies, never uses resumption or
   0-RTT, and its QUIC TLS handshake is aioquic's (no browser ClientHello). It has
   only been tested against a local aioquic server. See [HTTP/3](features/http3.md).
 
