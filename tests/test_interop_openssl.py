@@ -30,7 +30,7 @@ pytestmark = [pytest.mark.interop, pytest.mark.skipif(OPENSSL is None, reason="o
 SUITES = ["TLS_AES_128_GCM_SHA256", "TLS_AES_256_GCM_SHA384", "TLS_CHACHA20_POLY1305_SHA256"]
 GROUPS = ["X25519", "P-256", "P-384"]
 KEYS = ["rsa2048", "rsa4096", "p256", "p384"]
-PROFILES = ["chrome_131", "firefox_133", "safari_18"]
+PROFILES = ["chrome_131", "firefox_133", "safari_18", "chrome_158", "firefox_160", "safari_27"]
 
 
 # --------------------------------------------------------------------------- yardımcılar
