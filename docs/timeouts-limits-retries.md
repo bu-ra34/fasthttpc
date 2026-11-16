@@ -15,10 +15,18 @@ Session(timeout=Timeout(10.0, connect=5.0))      # connect 5, read/write/pool 10
 | `read` | Waiting for data (inactivity period on async) |
 | `write` | Sending data (on the sync side it shares the read socket timeout) |
 | `pool` | Waiting for a free pooled connection. Takes the first argument like the other fields; if it ends up `None`, `Session` uses the connect timeout and `AsyncSession` waits without limit |
-| `total` | Budget for the whole request including the body (default `None`, no limit); unlike `read` it also catches servers that trickle data slowly |
+| `total` | Per-request budget for getting/opening the connection plus the whole response including the body (default `None`, no limit); unlike `read` it also catches servers that trickle data slowly. With `stream=True` it covers the request up to the response headers; each read of the streamed body is then bounded by `read` |
 
 A per-request `timeout=` (number, `(connect, read)` tuple or `Timeout`)
 overrides the session's for that request; `timeout=None` there means no limit.
+
+Timeouts belong to the request, not to the connection: a request sent over an
+already-open keep-alive HTTP/1.1 or HTTP/2 connection uses its own effective
+`read`/`write`/`total` (session or per-request), never the values of the request
+that opened the connection. This holds for `Session` and `AsyncSession`,
+streaming and non-streaming. A timeout raises `TimeoutError` (`asyncio.TimeoutError`
+on `AsyncSession`, the same class on Python 3.11+); timed-out requests are not
+retried automatically, because the server may already be processing them.
 
 ## `Limits`
 

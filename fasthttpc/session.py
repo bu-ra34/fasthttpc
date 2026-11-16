@@ -25,7 +25,8 @@ from .models.response import Response, HTTPStatusError
 from .transport.connection_pool import ConnectionPool
 from .security.tls_adapter      import TLSAdapter
 from .security.alerts          import describe_alert
-from .protocol.http1_parser     import HTTP1Parser, MAX_RESPONSE_HEADER_BYTES, parse_chunk_size
+from .protocol.http1_parser     import MAX_RESPONSE_HEADER_BYTES, parse_chunk_size
+from .streaming  import decode_body
 from .protocol.http2_parser     import (Http2Connection, Http2StreamError, Http2ConnectionError,
                                          Http2RefusedError)
 from .metrics    import RequestMetrics
@@ -497,7 +498,7 @@ class Session:
             return resp
 
         ce = resp_headers.get("content-encoding", "").lower()
-        body_raw = HTTP1Parser._decompress(body_raw, ce)
+        body_raw = decode_body(body_raw, ce)
 
         resp         = Response(status_code=status_code, headers=resp_headers, body=body_raw)
         resp.request = req
@@ -525,7 +526,7 @@ class Session:
             if h3.state.force:
                 raise ConnectionError("http3='force' bir HTTP proxy ile kullanılamaz (UDP).")
             return None
-        t = self.timeout
+        t = self._tmo()      # istek düzeyi timeout= dahil
         timeout = t.total if t.total is not None else t.read_timeout
         h3_headers = [(k.decode("latin-1").lower(), v.decode("latin-1")) for k, v in req.headers.raw]
         h3_headers = [(k, v) for k, v in h3_headers
@@ -559,6 +560,45 @@ class Session:
         if self._cache and method.upper() == "GET":
             self._cache.store(str(url), method, resp)
         return resp
+
+    def _arm_timeouts(self, conn: "HTTPConnection", start: float) -> None:
+        """Bu isteğin ETKİN zaman aşımını bağlantıya uygular (yeni ya da havuzdan).
+
+        Soket zaman aşımı bağlantıya değil İSTEĞE aittir: her istekte yeniden
+        ayarlanır. Eskiden yalnızca TLS el sıkışmasından sonra ayarlandığından,
+        yeniden kullanılan (keep-alive / HTTP/2) bağlantıda bağlantıyı açan ilk
+        isteğin süresi kalıyor; istek düzeyi ``timeout=`` ve ``Timeout.total``
+        yok sayılıyordu. ``total`` (``start``'tan, yani havuzdan alma/bağlanma
+        dahil sayılır) her okumadan önce kalan süreye göre kısaltılır
+        (h1: :meth:`_read_app_data`, h2: ``Http2Connection.deadline``).
+        """
+        tmo = self._tmo()
+        read = tmo.read_timeout
+        total = tmo.total
+        deadline = None if total is None else start + total
+        conn.conn_data["deadline"] = deadline
+        if deadline is None:
+            conn.socket.raw_socket.settimeout(read)
+        else:
+            left = deadline - time.perf_counter()
+            if left <= 0:
+                raise TimeoutError("İstek toplam süre sınırını (Timeout.total) aştı.")
+            conn.socket.raw_socket.settimeout(min(read, left))
+        h2 = conn.h2_conn
+        if h2 is not None:
+            h2.read_timeout = read
+            h2.deadline = deadline
+
+    def _end_deadline(self, conn: "HTTPConnection") -> None:
+        """Toplam süre sınırını kaldırır (akış gövdesi yalnızca ``read`` ile sınırlı;
+        istek bitti). Soket, isteğin tam ``read`` süresine döner."""
+        h2 = conn.h2_conn
+        had = conn.conn_data.pop("deadline", None) is not None
+        if h2 is not None and h2.deadline is not None:
+            h2.deadline = None
+            had = True
+        if had and not conn.is_closed:
+            conn.socket.raw_socket.settimeout(self._tmo().read_timeout)
 
     def _read_app_data(self, conn: "HTTPConnection") -> bytes:
         """Sadece Application Data döner; post-handshake handshake mesajları
@@ -797,6 +837,7 @@ class Session:
             rot_proxy = None
             is_new_conn = False
             got_bytes = False
+            attempt_start = time.perf_counter()     # Timeout.total buradan sayılır
             try:
                 rot_proxy = self._rotator.next() if self._rotator is not None else None
                 acq: _AcquireKw = {"proxy": rot_proxy} if rot_proxy is not None else {}
@@ -835,9 +876,15 @@ class Session:
                     else:
                         logger.debug("TLS 1.3 kuruldu (ALPN: http/1.1)")
 
+                # Yeni ya da yeniden kullanılan bağlantı: zaman aşımı HER istekte.
+                self._arm_timeouts(conn, attempt_start)
+
                 if conn.h2_conn is not None:
                     resp = self._send_h2_request(conn, req, metrics, cache_entry, method, url,
                                                  stream=stream)
+                    # Başlıklar (akışsızsa gövde de) geldi: total burada biter; akış
+                    # gövdesi h1'deki gibi her okumada isteğin read süresiyle sınırlıdır.
+                    self._end_deadline(conn)
                     if resp._stream is not None:
                         # Bağlantıyı akış yönetir (bitince/close'ta havuza döner).
                         if metrics and metrics.request_start:
@@ -863,9 +910,6 @@ class Session:
 
                 if metrics: metrics.bytes_sent = len(raw_bytes)
 
-                total = self._tmo().total
-                if total is not None:
-                    conn.conn_data["deadline"] = time.perf_counter() + total
                 conn.socket.send_record(raw_bytes)
                 send_time = time.perf_counter()
 
@@ -937,9 +981,9 @@ class Session:
                         framing == "length"
                         and int(resp_headers.get("content-length", "0").strip()) == 0):
                     # Akış: gövdeyi OKUMADAN dön. Toplam süre sınırı (deadline)
-                    # akışa uygulanmaz; her okuma read_timeout ile sınırlıdır.
-                    if conn.conn_data.pop("deadline", None) is not None:
-                        conn.socket.raw_socket.settimeout(self.timeout.read_timeout)
+                    # akış gövdesine uygulanmaz; her okuma İSTEĞİN read süresiyle
+                    # sınırlıdır (eskiden oturumunkiyle: istek düzeyi timeout= yok sayılırdı).
+                    self._end_deadline(conn)
                     reusable = not ("close" in conn_hdr or framing == "eof"
                                     or (http10 and "keep-alive" not in conn_hdr))
                     gen = self._iter_body(conn, first_body_chunk, resp_headers, framing)
@@ -957,8 +1001,7 @@ class Session:
                         resp.elapsed = time.perf_counter() - metrics.request_start
                     return resp
                 body_raw = self._collect_body(conn, first_body_chunk, resp_headers, metrics, framing)
-                if conn.conn_data.pop("deadline", None) is not None:
-                    conn.socket.raw_socket.settimeout(self._tmo().read_timeout)
+                self._end_deadline(conn)
 
                 if metrics:
                     metrics.transfer_end   = time.perf_counter()
@@ -969,7 +1012,7 @@ class Session:
 
                                                                            
                 ce       = resp_headers.get("content-encoding", "").lower()
-                body_raw = HTTP1Parser._decompress(body_raw, ce)
+                body_raw = decode_body(body_raw, ce)
 
                 resp         = Response(status_code=status_code, headers=resp_headers, body=body_raw)
                 resp.request = req

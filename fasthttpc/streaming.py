@@ -27,8 +27,15 @@ def _optional_module(name: str) -> ModuleType | None:
         return None
 
 
-_brotli = _optional_module("brotli")
+# PyPy'de ``brotli`` yerine aynı API'li ``brotlicffi`` kullanılır.
+_brotli = _optional_module("brotli") or _optional_module("brotlicffi")
 _zstd = _optional_module("zstandard")
+
+#: Content-Encoding -> (denenecek modüller, kurulacak paket, fasthttpc extra'sı)
+_DECODER_PACKAGES: dict[str, tuple[tuple[str, ...], str, str]] = {
+    "br":   (("brotli", "brotlicffi"), "brotli", "brotli"),
+    "zstd": (("zstandard",), "zstandard", "zstd"),
+}
 
 
 class StreamConsumed(RuntimeError):
@@ -44,7 +51,39 @@ class ResponseNotRead(RuntimeError):
 
 
 class DecodeError(ValueError):
-    """Akış ortasında Content-Encoding açılamadı (bozuk sıkıştırılmış veri)."""
+    """Content-Encoding açılamadı (bozuk sıkıştırılmış veri ya da eksik açıcı)."""
+
+
+class MissingDecoderError(DecodeError):
+    """Yanıt, açıcı paketi kurulu olmayan bir kodlamayla (``br``/``zstd``) geldi.
+
+    Gövde ASLA sıkıştırılmış haliyle sessizce döndürülmez. Öznitelikler:
+    ``encoding`` (ör. ``"br"``) ve kurulması gereken ``package`` (ör. ``"brotli"``).
+    Ham baytlar gerekiyorsa ``stream=True`` ile ``iter_raw()`` kullanılabilir.
+    """
+
+    def __init__(self, encoding: str, package: str, extra: str):
+        self.encoding = encoding
+        self.package = package
+        self.extra = extra
+        super().__init__(
+            f"Yanıt gövdesi 'Content-Encoding: {encoding}' ile sıkıştırılmış ama açıcı paket "
+            f"'{package}' kurulu değil (ya da yüklenemedi). Kurmak için: "
+            f"pip install {package}  (veya: pip install 'fasthttpc[{extra}]')")
+
+
+def _decoder_module(enc: str) -> ModuleType:
+    """``br``/``zstd`` açıcı modülü; yoksa :class:`MissingDecoderError`.
+
+    Her çağrıda ``importlib`` ile bakılır (``sys.modules`` önbelleği sayesinde ucuz);
+    böylece paket kaldırılmış/engellenmişse durum doğru yansır."""
+    modules, package, extra = _DECODER_PACKAGES[enc]
+    for name in modules:
+        try:
+            return importlib.import_module(name)
+        except ImportError:
+            continue
+    raise MissingDecoderError(enc, package, extra)
 
 
 _DECODE_ERRORS: tuple[type[BaseException], ...] = (zlib.error, ValueError, EOFError)
@@ -66,9 +105,16 @@ class _OneDecoder:
         self._obj: Any
         self._passthrough = False
         self._started = False
-        self._obj = self._make(enc)
+        # Bilinen ama açıcısı kurulu olmayan kodlama: ilk BOŞ OLMAYAN parçada hata
+        # (gövdesiz yanıtlar -- HEAD/204/304 -- hata vermez).
+        self._missing: "MissingDecoderError | None" = None
+        try:
+            self._obj = self._make(enc)
+        except MissingDecoderError as e:
+            self._obj, self._missing = None, e
+            return
         if self._obj is None:
-            self._passthrough = True
+            self._passthrough = True        # bilinmeyen kodlama: olduğu gibi
 
     @staticmethod
     def _make(enc: str, raw_deflate: bool = False) -> Any:
@@ -76,10 +122,10 @@ class _OneDecoder:
             return zlib.decompressobj(zlib.MAX_WBITS | 16)
         if enc == "deflate":
             return zlib.decompressobj(-zlib.MAX_WBITS if raw_deflate else zlib.MAX_WBITS)
-        if enc == "br" and _brotli is not None:
-            return _brotli.Decompressor()
-        if enc == "zstd" and _zstd is not None:
-            return _zstd.ZstdDecompressor().decompressobj()
+        if enc == "br":
+            return _decoder_module("br").Decompressor()
+        if enc == "zstd":
+            return _decoder_module("zstd").ZstdDecompressor().decompressobj()
         return None
 
     def _run(self, chunk: bytes) -> bytes:
@@ -90,6 +136,9 @@ class _OneDecoder:
     def decode(self, chunk: bytes) -> bytes:
         if self._passthrough or not chunk:
             return chunk
+        if self._missing is not None:
+            m = self._missing
+            raise MissingDecoderError(m.encoding, m.package, m.extra)
         first = not self._started
         self._started = True
         try:
@@ -148,6 +197,16 @@ class IncrementalDecoder:
                 tail = d2.decode(tail)
             out += tail
         return out
+
+
+def decode_body(data: bytes, content_encoding: str) -> bytes:
+    """Tüm gövdeyi açar. Akışlı yolla (:class:`IncrementalDecoder`) AYNI davranış:
+    virgüllü zincirler, bozuk ilk parçada ham geçiş, eksik açıcıda
+    :class:`MissingDecoderError`."""
+    if not data or not content_encoding:
+        return data
+    d = IncrementalDecoder(content_encoding)
+    return d.decode(data) + d.flush()
 
 
 class LineSplitter:
