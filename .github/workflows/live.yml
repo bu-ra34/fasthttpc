@@ -1,0 +1,69 @@
+name: Live tests
+
+# Real-internet HTTP/3 tests (tests/live, marker `live`) against public servers:
+# cloudflare-quic.com, quic.nginx.org, www.google.com, badssl.com. GitHub-hosted
+# runners allow outbound UDP/443 and do not intercept TLS. Manual + weekly only:
+# never on push/PR, so a flaky third-party server cannot block CI.
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "17 5 * * 1"   # Mondays 05:17 UTC
+
+permissions:
+  contents: read
+
+concurrency:
+  group: live-tests
+  cancel-in-progress: false
+
+jobs:
+  live:
+    name: live (${{ matrix.os }}, py${{ matrix.python-version }}, aioquic ${{ matrix.aioquic }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Oldest supported aioquic: exercises the GOAWAY shim (aioquic < 1.8).
+          - os: ubuntu-latest
+            python-version: "3.10"
+            aioquic: "1.3.*"
+          # Latest aioquic: native GoAwayReceived path.
+          - os: ubuntu-latest
+            python-version: "3.13"
+            aioquic: latest
+          - os: macos-latest
+            python-version: "3.12"
+            aioquic: latest
+          - os: windows-latest
+            python-version: "3.12"
+            aioquic: latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+      - name: Install dependencies
+        shell: bash
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[http3,brotli,zstd]" pytest pytest-timeout
+          if [ "${{ matrix.aioquic }}" != "latest" ]; then
+            pip install "aioquic==${{ matrix.aioquic }}"
+          fi
+      - name: Show HTTP/3 backend
+        shell: bash
+        run: |
+          python - <<'EOF'
+          import aioquic
+          from fasthttpc.http3 import core
+          print("aioquic", aioquic.__version__, "native GOAWAY:", core._NATIVE_GOAWAY)
+          EOF
+      - name: Live tests
+        shell: bash
+        env:
+          FASTHTTPC_LIVE: "1"
+        # --timeout: per-test hard limit so a hung socket fails the test, not the job.
+        run: python -m pytest -m live tests/live -v -rA --timeout 120
