@@ -127,7 +127,16 @@ def environ_proxies(environ: Optional[Mapping[str, str]] = None) -> Optional[Env
     şema, proxy gerçekten kullanılacağı zaman :func:`select_proxy` içinde hata verir.
     """
     env = os.environ if environ is None else environ
-    cgi = "REQUEST_METHOD" in env
+    # Adlar TAM eşleşmeyle aranır. Windows'ta os.environ büyük/küçük harfe duyarsızdır
+    # (anahtarlar büyük harfle saklanır): env.get("http_proxy") orada HTTP_PROXY'yi
+    # döndürür ve CGI'daki httpoxy korumasını delerdi. Anahtar kümesine bakmak,
+    # yalnızca gerçekten var olan adı (Windows'ta büyük harfli olanı) bulur.
+    keys = set(env.keys())
+
+    def _get(name: str) -> str:
+        return (env[name] or "").strip() if name in keys else ""
+
+    cgi = "REQUEST_METHOD" in keys
     proxies: dict[str, str] = {}
     sources: dict[str, str] = {}
     for scheme in ("http", "https", "all"):
@@ -135,14 +144,14 @@ def environ_proxies(environ: Optional[Mapping[str, str]] = None) -> Optional[Env
         if not (cgi and scheme == "http"):
             names.append(f"{scheme.upper()}_PROXY")
         for name in names:
-            val = (env.get(name) or "").strip()
+            val = _get(name)
             if val:
                 proxies[scheme] = val if "://" in val else "http://" + val
                 sources[scheme] = name
                 break
     no_proxy = ""
     for name in ("no_proxy", "NO_PROXY"):
-        val = (env.get(name) or "").strip()
+        val = _get(name)
         if val:
             no_proxy = val
             break
