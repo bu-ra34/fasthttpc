@@ -6,12 +6,16 @@ import threading
 import time
 from typing import Any, Optional
 
+from .._backend import current_backend
 from ..models.headers import Headers
 from ..protocol.http1_parser import HTTP1Parser
 from ..security.cert_validator import CertificateValidationError
 from .altsvc import AltSvcCache
 from .core import Http3ConnectError, Http3Error
 from .options import Http3Options
+
+_TRIO_UNSUPPORTED = ("HTTP/3 trio altında desteklenmiyor (aioquic yalnızca asyncio ile çalışır); "
+                     "http3='force' yerine http3=True (h2/h1'e düşer) ya da asyncio kullanın.")
 
 
 def require_aioquic() -> None:
@@ -172,6 +176,12 @@ class AsyncHttp3:
         origin = (host, port)
         target = self.state.target_for(host, port)
         if target is None:
+            return None
+        if current_backend() != "asyncio":
+            # aioquic'in G/Ç katmanı asyncio'ya bağlıdır: trio altında h3 YOK. "force" -> açık
+            # hata (RuntimeError yerine); "auto" -> mTLS/proxy durumlarındaki gibi h2/h1'e düş.
+            if self.state.force:
+                raise Http3ConnectError(_TRIO_UNSUPPORTED)
             return None
         from .core import Http3RequestRefused
         for attempt in (0, 1):

@@ -2,6 +2,32 @@
 
 ## [Unreleased]
 
+## [0.6.2] — 2026-11-16
+
+### Düzeltmeler
+- **Senkron WebSocket:** `Session.websocket("ws://...")` `settimeout`'a `Timeout`
+  nesnesi geçirdiği için her zaman `TypeError` veriyordu; okuma zaman aşımı artık
+  oturumun `Timeout`'undan alınıyor ve zaman aşımı kapanış gibi görünmüyor
+  (`TimeoutError`). `wss://` ALPN'de profilin tam listesini (`h2, http/1.1`)
+  öneriyordu; artık yalnızca `http/1.1` önerir, sunucu yine de h2 seçerse açık
+  hata verilir (`TLSAdapter.negotiate(alpn=...)`). `wss://` adreslerinde
+  varsayılan port 443 oldu; senkron `Host` başlığı varsayılan olmayan portu içerir.
+- **HTTP/3 + trio:** trio altında `AsyncSession(http3=...)` `RuntimeError: no
+  running event loop` veriyordu. Artık `http3="force"` açık bir
+  `Http3ConnectError` verir, `http3=True` HTTP/2 ya da 1.1'e düşer.
+- **Senkron HTTP/2 PUSH_PROMISE:** sessizce yok sayılıyordu (başlık bloğu HPACK ile
+  çözülmediği için dinamik tablo bozulabiliyordu). ENABLE_PUSH=0 ilan edildiği
+  için artık async yolda olduğu gibi bağlantı hatasıdır: GOAWAY(PROTOCOL_ERROR)
+  gönderilir ve bağlantı yeniden kullanılmaz.
+
+### Dokümantasyon
+- README, README.tr ve mkdocs sayfaları koda göre güncellendi: HTTP/3 (deneysel,
+  yalnızca yerel testler), trio, TLS 1.3 PSK oturum devamı (varsayılan kapalı,
+  0-RTT yok), X25519MLKEM768 (Chrome/Firefox profilleri, `cryptography` >= 47),
+  mTLS, akış, auth/hook sayfaları; "yakında" bölümü kaldırıldı. Düz HTTP
+  olmaması, proxy ortam değişkenlerinin okunmaması ve trio altında HTTP/3'ün
+  çalışmaması bilinen sınırlara eklendi.
+
 ## [0.6.1] — 2026-11-16
 
 Kendi içimizde yapılan güvenlik incelemesi (bağımsız denetim değildir):

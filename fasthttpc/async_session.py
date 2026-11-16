@@ -299,20 +299,24 @@ async def _discard_stream(resp: Response) -> None:
 
 class AsyncSession:
     """
-    asyncio tabanlı async HTTP istemcisi.
+    Async HTTP istemcisi: asyncio altında, ``fasthttpc[trio]`` kuruluysa trio
+    altında da (anyio üzerinden) çalışır. HTTP/3 (``http3=``) yalnızca asyncio'da.
 
     Sync Session ile aynı API — await ile kullanılır.
 
     Özellikler:
+    - HTTP/2 multiplexing (aynı bağlantıda eşzamanlı istekler)
     - Plugin sistemi: session.use(plugin)
     - Proxy rotasyonu: session.set_proxies([...])
     - Response cache (ETag/Last-Modified)
     - Metrics (resp.metrics)
-    - iter_content() streaming
+    - Akış: ``stream=True`` / ``async with session.stream(...)`` + ``aiter_*``
 
     Parametreler senkron :class:`~fasthttpc.session.Session` ile aynıdır
     (``resolver`` dahil); sıra farkı: ``timeout`` ve ``max_redirects``
-    ``max_connections``'tan önce gelir (isimle çağırın).
+    ``max_connections``'tan önce gelir (isimle çağırın). ``max_connections``
+    burada TOPLAM eşzamanlı bağlantıdır (varsayılan 100). ``impersonate=None``
+    stdlib ``ssl`` kullanır (yalnızca HTTP/1.1, ``cert=`` yok).
 
     Kullanım:
         async with AsyncSession(impersonate="chrome_131") as session:

@@ -5,9 +5,14 @@
 ```bash
 pip install fasthttpc
 pip install "fasthttpc[brotli,zstd]"   # optional content decoders
+pip install "fasthttpc[trio]"          # optional: AsyncSession under trio
+pip install "fasthttpc[http3]"         # optional: experimental HTTP/3 (aioquic)
+pip install "fasthttpc[all]"           # all of the above
 ```
 
 Requires Python 3.10+. Runtime dependencies: `cryptography` and `certifi`.
+Post-quantum key exchange (X25519MLKEM768) is only offered when the installed
+`cryptography` is version 47 or newer.
 
 ## First request
 

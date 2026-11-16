@@ -11,7 +11,14 @@ Every TLS connection authenticates the server with three mandatory checks:
 Trust anchors: `certifi` plus the system store, or exactly the PEM given as
 `verify=`. `verify=False` raises `ValueError`. Certificate errors are never
 retried. TLS 1.2 additionally requires EMS and `renegotiation_info`, detects
-downgrade sentinels and rejects weak suites.
+downgrade sentinels and rejects weak suites (unless `legacy_tls=True`, see
+[legacy TLS](features/legacy-tls.md)).
+
+The table describes fasthttpc's own TLS stack. Two paths use Python's `ssl`
+module with `ssl.create_default_context()` instead, which also always verifies
+the chain and hostname: `AsyncSession(impersonate=None)` and the DNS-over-HTTPS
+resolver. For HTTP/3, fasthttpc runs the same certificate validator on the
+QUIC handshake before any request is sent.
 
 ## Not covered
 

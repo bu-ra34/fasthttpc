@@ -24,4 +24,16 @@ s.set_proxies(["http://p1:3128", "http://p2:3128"], strategy="round_robin")
 ```
 
 `AsyncSession` supports the same arguments; `set_proxies` overrides `proxy=`.
-Using stdlib `ssl` (no `impersonate`) through a proxy requires Python 3.11+.
+A proxy that cannot be reached is taken out of the rotation. `strategy` is
+`"round_robin"` or `"performance"`.
+
+Notes:
+
+- `socks5h://` is accepted as well; with both schemes the target name is
+  resolved by the proxy (IP literals are sent as addresses).
+- Proxy environment variables (`HTTP_PROXY`, `HTTPS_PROXY`, `NO_PROXY`) are not
+  read; pass the proxy explicitly.
+- HTTP/3 (UDP) is never used through a proxy; with `http3="force"` a proxied
+  request raises `ConnectionError`.
+- `AsyncSession(impersonate=None)` (stdlib `ssl`) also works through a proxy,
+  on every supported Python version.

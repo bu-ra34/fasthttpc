@@ -36,7 +36,7 @@ No Critical or High findings were identified.
 | FHC-15 | Info | Legacy CBC (MAC-then-encrypt) Lucky13 mitigation is best effort | Open (by design) |
 | FHC-16 | Info | DoH query string is built without URL-encoding the host name | Open |
 | FHC-17 | Info | PSK resumption reuses the ticket's peer certificate without re-checking validity | Open |
-| — | — | Async TLS handshake failure sends no alert to the server | Tracked separately |
+| — | — | Async TLS handshake failure sends no alert to the server | Fixed separately in 0.6.1 |
 
 ## Findings
 
