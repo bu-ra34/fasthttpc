@@ -45,6 +45,21 @@ class FastAESGCM:
                 "GCM authentication tag mismatch: veri bozulmuş veya değiştirilmiş olabilir (olası MITM/tampering)."
             ) from e
 
+    # Record katmanının sıcak yolu: ct||tag tek parça (bölüp yeniden birleştirmek iki
+    # gereksiz kopya demekti). Doğrulama aynıdır: tag tutmazsa ValueError.
+    def seal(self, iv: bytes, plaintext: bytes, aad: bytes = b'') -> bytes:
+        """ciphertext || tag (16 bayt) döner."""
+        return self._aead.encrypt(iv, plaintext, aad)
+
+    def open(self, iv: bytes, ciphertext_and_tag: bytes, aad: bytes) -> bytes:
+        """ciphertext || tag'i doğrular ve çözer; tag tutmazsa ValueError."""
+        try:
+            return self._aead.decrypt(iv, ciphertext_and_tag, aad)
+        except _InvalidTag as e:
+            raise ValueError(
+                "GCM authentication tag mismatch: veri bozulmuş veya değiştirilmiş olabilir (olası MITM/tampering)."
+            ) from e
+
 
 class FastChaCha20Poly1305:
     """OpenSSL tabanlı ChaCha20-Poly1305. encrypt_aead/decrypt_aead arayüzü."""
@@ -58,6 +73,19 @@ class FastChaCha20Poly1305:
     def decrypt_aead(self, nonce: bytes, ciphertext: bytes, aad: bytes, auth_tag: bytes) -> bytes:
         try:
             return self._aead.decrypt(nonce, ciphertext + auth_tag, aad)
+        except _InvalidTag as e:
+            raise ValueError(
+                "Poly1305 authentication tag mismatch: veri bozulmuş veya değiştirilmiş olabilir (olası MITM/tampering)."
+            ) from e
+
+    def seal(self, nonce: bytes, plaintext: bytes, aad: bytes = b'') -> bytes:
+        """ciphertext || tag (16 bayt) döner."""
+        return self._aead.encrypt(nonce, plaintext, aad)
+
+    def open(self, nonce: bytes, ciphertext_and_tag: bytes, aad: bytes) -> bytes:
+        """ciphertext || tag'i doğrular ve çözer; tag tutmazsa ValueError."""
+        try:
+            return self._aead.decrypt(nonce, ciphertext_and_tag, aad)
         except _InvalidTag as e:
             raise ValueError(
                 "Poly1305 authentication tag mismatch: veri bozulmuş veya değiştirilmiş olabilir (olası MITM/tampering)."

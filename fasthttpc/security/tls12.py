@@ -324,12 +324,11 @@ class RecordCipher:
         seq8 = self.seq.to_bytes(8, "big")
         aad = seq8 + struct.pack("!BHH", content_type, version, len(plaintext))
         if self.is_aes:
-            ct, tag = self.aead.encrypt_gcm(self.iv + seq8, plaintext, aad)
-            body = seq8 + ct + tag
+            body = seq8 + self.aead.seal(self.iv + seq8, plaintext, aad)     # explicit || ct || tag
         else:
-            nonce = bytes(a ^ b for a, b in zip(self.iv, b"\x00\x00\x00\x00" + seq8))
-            ct, tag = self.aead.encrypt_aead(nonce, plaintext, aad)
-            body = ct + tag
+            # RFC 7905: iv XOR seq (tamsayı XOR'u; bayt bayt üreteçten hızlı)
+            nonce = (int.from_bytes(self.iv, "big") ^ self.seq).to_bytes(12, "big")
+            body = self.aead.seal(nonce, plaintext, aad)                      # ct || tag
         self.seq += 1
         return body
 
@@ -339,17 +338,15 @@ class RecordCipher:
             raise _err(AL_BAD_RECORD_MAC, "bad_record_mac", "şifreli record AEAD için fazla kısa.")
         seq8 = self.seq.to_bytes(8, "big")
         if self.is_aes:
-            explicit, ct, tag = body[:8], body[8:-16], body[-16:]
-            aad = seq8 + bytes([content_type]) + version + struct.pack("!H", len(ct))
-            nonce = self.iv + explicit
-            decrypt = self.aead.decrypt_gcm
+            ct_tag = body[8:]                                  # ct || tag
+            aad = seq8 + bytes([content_type]) + version + struct.pack("!H", len(ct_tag) - 16)
+            nonce = self.iv + body[:8]
         else:
-            ct, tag = body[:-16], body[-16:]
-            aad = seq8 + bytes([content_type]) + version + struct.pack("!H", len(ct))
-            nonce = bytes(a ^ b for a, b in zip(self.iv, b"\x00\x00\x00\x00" + seq8))
-            decrypt = self.aead.decrypt_aead
+            ct_tag = body
+            aad = seq8 + bytes([content_type]) + version + struct.pack("!H", len(ct_tag) - 16)
+            nonce = (int.from_bytes(self.iv, "big") ^ self.seq).to_bytes(12, "big")
         try:
-            pt = decrypt(nonce, ct, aad, tag)
+            pt = self.aead.open(nonce, ct_tag, aad)
         except ValueError as e:
             raise _err(AL_BAD_RECORD_MAC, "bad_record_mac", f"TLS record'u doğrulanamadı ({e})") from e
         self.seq += 1
