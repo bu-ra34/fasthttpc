@@ -14,7 +14,11 @@ s.get(url, auth=None)                              # skip the session-level auth
 - Precedence: per-request `auth=` > session `auth=` > `.netrc` (when
   `trust_env=True`, the default; the `NETRC` environment variable is honoured)
   > credentials in the URL (`https://user:pass@host/`).
-- `trust_env` only controls `.netrc`; proxy environment variables are not read.
+- `trust_env` also controls the proxy environment variables (see
+  [proxies](../proxy.md)) and the CA bundle variables (`REQUESTS_CA_BUNDLE`,
+  `SSL_CERT_FILE`, `CURL_CA_BUNDLE`).
+- After an `https://` to `http://` redirect no credentials are sent at all
+  (not even `.netrc`).
 - Digest follows RFC 7616: MD5, SHA-256 and their `-sess` variants,
   `qop=auth`/`auth-int`, `userhash`. The strongest offered algorithm is used.
 - Custom auth: requests-style callable `__call__(request) -> request`, or an

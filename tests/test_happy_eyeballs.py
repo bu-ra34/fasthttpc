@@ -212,8 +212,11 @@ def test_async_open_connection_happy_eyeballs_gecikmesiyle_cagrilir(monkeypatch)
         with pytest.raises(Exception):          # TLS konuşmayan sunucu: el sıkışma hatası beklenir
             await asyncio.wait_for(AsyncTLSStream.connect("localhost", port, "chrome_131"), 1)
         s = AsyncSession(timeout=2)
-        with pytest.raises(Exception):
-            await s.get(f"http://localhost:{port}/")
+        # https: AsyncSession'ın TLS yolu (el sıkışma hatası); http: düz TCP yolu (yanıt
+        # gelmez -> okuma zaman aşımı). 0.6.2'ye kadar http:// de TLS yolundan gidiyordu.
+        for scheme in ("https", "http"):
+            with pytest.raises(Exception):
+                await s.get(f"{scheme}://localhost:{port}/", timeout=1)
         await s.close()
         ls.close()
     asyncio.run(main())

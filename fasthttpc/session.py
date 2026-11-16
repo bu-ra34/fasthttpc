@@ -23,16 +23,19 @@ from .models.headers  import Headers, check_header_field, check_request_line
 from .models.request  import Request
 from .models.response import Response, HTTPStatusError
 from .transport.connection_pool import ConnectionPool
+from .transport.plain           import PlainSocket
+from .transport.proxy           import ProxyConfig, absolute_form, authority, forward_proxy_headers
 from .security.tls_adapter      import TLSAdapter
 from .security.alerts          import describe_alert
-from .protocol.http1_parser     import HTTP1Parser, MAX_RESPONSE_HEADER_BYTES, parse_chunk_size
+from .protocol.http1_parser     import MAX_RESPONSE_HEADER_BYTES, parse_chunk_size
+from .streaming  import decode_body
 from .protocol.http2_parser     import (Http2Connection, Http2StreamError, Http2ConnectionError,
                                          Http2RefusedError)
 from .metrics    import RequestMetrics
 from .cache      import ResponseCache
 from .buffer     import AdaptiveReceiver, get_pool
 from .timeout    import Timeout
-from .config     import Limits, resolve_verify
+from .config     import Limits, environ_ca_bundle, resolve_verify
 from .security.client_cert import ClientCert
 from .retry      import Retry
 from .multipart  import encode_multipart
@@ -54,7 +57,7 @@ if TYPE_CHECKING:
     from .protocol.http2_parser import H2ClientStream, WebSocketConnection
     from .transport.connection_pool import HTTPConnection
     from .transport.mock import BaseTransport
-    from .transport.proxy import ProxySpec
+    from .transport.proxy import EnvProxies, ProxySpec
 
 logger = get_logger("session")
 
@@ -109,6 +112,13 @@ def _proxy_spec(proxy: "ProxySpec", proxies: "ProxySpec") -> "ProxySpec":
         resolve_proxy(spec, scheme)  # hatalı URL'i erken (Session kurulurken) yakala
     return spec
 
+
+def _env_proxies(proxy: "ProxySpec", proxies: "ProxySpec", trust_env: bool) -> "EnvProxies | None":
+    """trust_env iken ve açık proxy verilmemişse ortamdaki proxy ayarları (yoksa None)."""
+    if not trust_env or proxy is not None or proxies is not None:
+        return None
+    from .transport.proxy import environ_proxies
+    return environ_proxies()
 
 
 _DISCARD_LIMIT = 65536
@@ -266,9 +276,10 @@ class Session:
     fasthttpc senkron HTTP istemcisi.
 
     Args:
-        impersonate:     TLS fingerprint profili: ``"chrome_131"`` (varsayılan), ``"firefox_133"``,
-                         ``"safari_18"`` (takma adlar: ``"chrome"``, ``"firefox"``, ``"firefox_120"``,
-                         ``"safari"``, ``"safari_17"``) ya da ``None`` (tarayıcı taklidi yok).
+        impersonate:     TLS fingerprint profili: ``"chrome_158"`` (varsayılan), ``"firefox_160"``,
+                         ``"safari_27"``, eski ``"chrome_131"``/``"firefox_133"``/``"safari_18"``
+                         (takma adlar: ``"chrome"``, ``"firefox"``, ``"safari"`` güncel sürüme;
+                         ``"firefox_120"``, ``"safari_17"``) ya da ``None`` (tarayıcı taklidi yok).
         max_connections: Origin başına en fazla bağlantı (``limits`` verilmezse).
         timeout:         Zaman aşımı — float (saniye) veya :class:`Timeout` objesi.
         max_redirects:   Maksimum redirect sayısı.
@@ -290,7 +301,13 @@ class Session:
         hooks:           requests tarzı ``{"response": [fn, ...]}``; ``fn(response, **kw)``
                          yeni Response döndürebilir.
         event_hooks:     httpx tarzı ``{"request": [fn], "response": [fn]}``.
-        trust_env:       ``True`` iken ``.netrc`` (``NETRC`` env dahil) kimliği kullanılır.
+        trust_env:       ``True`` (varsayılan; requests/httpx gibi) iken ortam okunur: ``.netrc``
+                         (``NETRC`` dahil) kimliği; ``proxy``/``proxies`` verilmemişse
+                         ``HTTP_PROXY``/``HTTPS_PROXY``/``ALL_PROXY``/``NO_PROXY``;
+                         ``verify=True`` ise ``REQUESTS_CA_BUNDLE``/``SSL_CERT_FILE``/
+                         ``CURL_CA_BUNDLE`` (yalnızca HANGİ CA bundle'ının kullanılacağını
+                         değiştirir; doğrulama kapanmaz). Proxy ve CA değişkenleri oturum
+                         kurulurken okunur.
         params:          Her isteğe eklenen varsayılan sorgu parametreleri.
         cert:            İstemci sertifikası (mTLS), YALNIZCA oturum düzeyinde: ``"client.pem"``
                          (sertifika+anahtar), ``("cert.pem", "key.pem")``, ``("cert.pem", "key.pem",
@@ -301,7 +318,9 @@ class Session:
                          başlıkları < ``headers`` < istek başlıkları; değeri
                          ``None`` olan başlık varsayılanı kaldırır.
         proxy / proxies: ``"http://..."`` / ``"socks5://..."`` ya da şema sözlüğü
-                         (``{"https": ...}``). Ortam değişkenleri okunmaz.
+                         (``{"https": ...}``). Verilirse (``proxies={}`` dahil) proxy ortam
+                         değişkenleri okunmaz. Düz ``http://`` hedefler HTTP proxy'sine
+                         mutlak biçimli istekle (CONNECT'siz), SOCKS5'te tünelden gider.
         http3:           DENEYSEL, varsayılan ``False``. ``True`` (Alt-Svc keşfi, h2'ye
                          düşüş), ``"force"`` ya da ``fasthttpc.http3.Http3Options``.
                          ``fasthttpc[http3]`` (aioquic) gerektirir.
@@ -317,7 +336,7 @@ class Session:
 
     def __init__(
         self,
-        impersonate:     str                          = "chrome_131",
+        impersonate:     str                          = "chrome_158",
         max_connections: int                          = 10,
         timeout:         Union[float, int, Timeout]   = 30.0,
         max_redirects:   int                          = 10,
@@ -367,6 +386,8 @@ class Session:
         self.max_redirects = max_redirects
         self.verify        = verify
         self._ca_path      = resolve_verify(verify)
+        if self._ca_path is None and trust_env:
+            self._ca_path = environ_ca_bundle()
         self.retries       = Retry.from_value(retries)
         self.transport     = transport
         self.limits        = limits if limits is not None else Limits(max_connections=max_connections)
@@ -376,6 +397,7 @@ class Session:
             resolver=resolver,
             proxy=_proxy_spec(proxy, proxies),
             tls_scope=self.client_cert.identity if self.client_cert is not None else None,
+            env_proxies=_env_proxies(proxy, proxies, trust_env),
         )
         self.limits.apply_to_pool(self.pool)
         self.cookie_jar = CookieJar()
@@ -391,7 +413,6 @@ class Session:
         self._pool     = get_pool()
         # HTTP/3 (opsiyonel, aioquic): True -> Alt-Svc keşfi + h2'ye düşüş, "force" -> doğrudan h3.
         self._h3: "SyncHttp3 | None" = None
-        self._has_proxy = bool(_proxy_spec(proxy, proxies))
         from .http3.options import Http3Options
         _h3opts = Http3Options.from_value(http3)
         if _h3opts is not None and self.client_cert is not None:
@@ -497,7 +518,7 @@ class Session:
             return resp
 
         ce = resp_headers.get("content-encoding", "").lower()
-        body_raw = HTTP1Parser._decompress(body_raw, ce)
+        body_raw = decode_body(body_raw, ce)
 
         resp         = Response(status_code=status_code, headers=resp_headers, body=body_raw)
         resp.request = req
@@ -520,12 +541,12 @@ class Session:
         """HTTP/3 denemesi: Response ya da None (h2/h1'e düş). Ayrıntı: fasthttpc.http3."""
         h3 = self._h3
         assert h3 is not None    # yalnızca http3= etkinken çağrılır
-        if self._has_proxy or self._rotator is not None:
+        if self._rotator is not None or self.pool.proxy_for(req.url) is not None:
             # UDP bir HTTP proxy'sinden geçemez.
             if h3.state.force:
                 raise ConnectionError("http3='force' bir HTTP proxy ile kullanılamaz (UDP).")
             return None
-        t = self.timeout
+        t = self._tmo()      # istek düzeyi timeout= dahil
         timeout = t.total if t.total is not None else t.read_timeout
         h3_headers = [(k.decode("latin-1").lower(), v.decode("latin-1")) for k, v in req.headers.raw]
         h3_headers = [(k, v) for k, v in h3_headers
@@ -559,6 +580,45 @@ class Session:
         if self._cache and method.upper() == "GET":
             self._cache.store(str(url), method, resp)
         return resp
+
+    def _arm_timeouts(self, conn: "HTTPConnection", start: float) -> None:
+        """Bu isteğin ETKİN zaman aşımını bağlantıya uygular (yeni ya da havuzdan).
+
+        Soket zaman aşımı bağlantıya değil İSTEĞE aittir: her istekte yeniden
+        ayarlanır. Eskiden yalnızca TLS el sıkışmasından sonra ayarlandığından,
+        yeniden kullanılan (keep-alive / HTTP/2) bağlantıda bağlantıyı açan ilk
+        isteğin süresi kalıyor; istek düzeyi ``timeout=`` ve ``Timeout.total``
+        yok sayılıyordu. ``total`` (``start``'tan, yani havuzdan alma/bağlanma
+        dahil sayılır) her okumadan önce kalan süreye göre kısaltılır
+        (h1: :meth:`_read_app_data`, h2: ``Http2Connection.deadline``).
+        """
+        tmo = self._tmo()
+        read = tmo.read_timeout
+        total = tmo.total
+        deadline = None if total is None else start + total
+        conn.conn_data["deadline"] = deadline
+        if deadline is None:
+            conn.socket.raw_socket.settimeout(read)
+        else:
+            left = deadline - time.perf_counter()
+            if left <= 0:
+                raise TimeoutError("İstek toplam süre sınırını (Timeout.total) aştı.")
+            conn.socket.raw_socket.settimeout(min(read, left))
+        h2 = conn.h2_conn
+        if h2 is not None:
+            h2.read_timeout = read
+            h2.deadline = deadline
+
+    def _end_deadline(self, conn: "HTTPConnection") -> None:
+        """Toplam süre sınırını kaldırır (akış gövdesi yalnızca ``read`` ile sınırlı;
+        istek bitti). Soket, isteğin tam ``read`` süresine döner."""
+        h2 = conn.h2_conn
+        had = conn.conn_data.pop("deadline", None) is not None
+        if h2 is not None and h2.deadline is not None:
+            h2.deadline = None
+            had = True
+        if had and not conn.is_closed:
+            conn.socket.raw_socket.settimeout(self._tmo().read_timeout)
 
     def _read_app_data(self, conn: "HTTPConnection") -> bytes:
         """Sadece Application Data döner; post-handshake handshake mesajları
@@ -757,7 +817,8 @@ class Session:
             req.headers[k] = v
 
                                
-        if "host"       not in req.headers: req.headers["Host"]       = req.url.host
+        if "host"       not in req.headers:
+            req.headers["Host"] = authority(req.url.host, req.url.port, req.url.scheme)
         if "connection" not in req.headers: req.headers["Connection"] = "keep-alive"
         # Çerezler yalnızca domain/path/Secure kurallarına uyanlar arasından
         # seçilir; redirect başka bir host'a giderse oraya gönderilmez.
@@ -783,7 +844,7 @@ class Session:
         for raw_k, raw_v in req.headers.raw:
             check_header_field(raw_k, raw_v)
 
-        if self._h3 is not None:
+        if self._h3 is not None and req.url.scheme == "https":     # h3 yalnızca https
             h3_resp = self._h3_attempt(req, metrics, cache_entry, method, url)
             if h3_resp is not None:
                 return h3_resp
@@ -797,6 +858,7 @@ class Session:
             rot_proxy = None
             is_new_conn = False
             got_bytes = False
+            attempt_start = time.perf_counter()     # Timeout.total buradan sayılır
             try:
                 rot_proxy = self._rotator.next() if self._rotator is not None else None
                 acq: _AcquireKw = {"proxy": rot_proxy} if rot_proxy is not None else {}
@@ -813,7 +875,12 @@ class Session:
                     metrics.connect_end       = time.perf_counter()
 
                      
-                if is_new_conn:
+                if is_new_conn and req.url.scheme == "http":
+                    # Düz HTTP/1.1 (h2c yok): TLS ve ALPN yok, aynı kayıt arayüzü.
+                    conn.socket = PlainSocket(conn.socket)
+                    conn.socket.raw_socket.settimeout(self._tmo().read_timeout)
+                    conn.tls_established = True
+                elif is_new_conn:
                     if metrics: metrics.tls_start = time.perf_counter()
                     logger.debug("%s profili ile TLS el sıkışması başlıyor (%s)",
                                  self.impersonate, req.url.host)
@@ -835,9 +902,15 @@ class Session:
                     else:
                         logger.debug("TLS 1.3 kuruldu (ALPN: http/1.1)")
 
+                # Yeni ya da yeniden kullanılan bağlantı: zaman aşımı HER istekte.
+                self._arm_timeouts(conn, attempt_start)
+
                 if conn.h2_conn is not None:
                     resp = self._send_h2_request(conn, req, metrics, cache_entry, method, url,
                                                  stream=stream)
+                    # Başlıklar (akışsızsa gövde de) geldi: total burada biter; akış
+                    # gövdesi h1'deki gibi her okumada isteğin read süresiyle sınırlıdır.
+                    self._end_deadline(conn)
                     if resp._stream is not None:
                         # Bağlantıyı akış yönetir (bitince/close'ta havuza döner).
                         if metrics and metrics.request_start:
@@ -853,19 +926,22 @@ class Session:
                     return resp
 
                                  
-                req_lines = [f"{req.method} {req.url.raw_path.decode('ascii')} HTTP/1.1"]
+                target = req.url.raw_path.decode("ascii")
+                fwd: "ProxyConfig | None" = conn.conn_data.get("forward_proxy")
+                if fwd is not None:      # http:// + HTTP proxy: mutlak biçim (CONNECT yok)
+                    target = absolute_form(req.url.host, req.url.port, target)
+                req_lines = [f"{req.method} {target} HTTP/1.1"]
                 h1_pairs = [(k.decode("latin-1"), v.decode("latin-1")) for k, v in req.headers.raw]
                 h1_pairs = order_h1(self.impersonate,
                                     drop_h2_only_defaults(self.impersonate, h1_pairs))
+                if fwd is not None and "proxy-authorization" not in req.headers:
+                    h1_pairs += forward_proxy_headers(fwd)
                 for k, v in h1_pairs:
                     req_lines.append(f"{k}: {v}")
                 raw_bytes = "\r\n".join(req_lines).encode("ascii") + b"\r\n\r\n" + req.body
 
                 if metrics: metrics.bytes_sent = len(raw_bytes)
 
-                total = self._tmo().total
-                if total is not None:
-                    conn.conn_data["deadline"] = time.perf_counter() + total
                 conn.socket.send_record(raw_bytes)
                 send_time = time.perf_counter()
 
@@ -937,9 +1013,9 @@ class Session:
                         framing == "length"
                         and int(resp_headers.get("content-length", "0").strip()) == 0):
                     # Akış: gövdeyi OKUMADAN dön. Toplam süre sınırı (deadline)
-                    # akışa uygulanmaz; her okuma read_timeout ile sınırlıdır.
-                    if conn.conn_data.pop("deadline", None) is not None:
-                        conn.socket.raw_socket.settimeout(self.timeout.read_timeout)
+                    # akış gövdesine uygulanmaz; her okuma İSTEĞİN read süresiyle
+                    # sınırlıdır (eskiden oturumunkiyle: istek düzeyi timeout= yok sayılırdı).
+                    self._end_deadline(conn)
                     reusable = not ("close" in conn_hdr or framing == "eof"
                                     or (http10 and "keep-alive" not in conn_hdr))
                     gen = self._iter_body(conn, first_body_chunk, resp_headers, framing)
@@ -957,8 +1033,7 @@ class Session:
                         resp.elapsed = time.perf_counter() - metrics.request_start
                     return resp
                 body_raw = self._collect_body(conn, first_body_chunk, resp_headers, metrics, framing)
-                if conn.conn_data.pop("deadline", None) is not None:
-                    conn.socket.raw_socket.settimeout(self._tmo().read_timeout)
+                self._end_deadline(conn)
 
                 if metrics:
                     metrics.transfer_end   = time.perf_counter()
@@ -969,7 +1044,7 @@ class Session:
 
                                                                            
                 ce       = resp_headers.get("content-encoding", "").lower()
-                body_raw = HTTP1Parser._decompress(body_raw, ce)
+                body_raw = decode_body(body_raw, ce)
 
                 resp         = Response(status_code=status_code, headers=resp_headers, body=body_raw)
                 resp.request = req
@@ -1075,7 +1150,7 @@ class Session:
             if self.transport is None:
                 resp = self._raw_request(method, url, data=body or None, headers=hdrs,
                                          metrics=metrics, stream=stream)
-                if self._h3 is not None:
+                if self._h3 is not None and str(url).lower().startswith("https:"):
                     u = URL(str(url))
                     self._h3.state.observe(u.host, u.port, resp.headers)    # Alt-Svc keşfi
             else:
@@ -1244,7 +1319,9 @@ class Session:
                 same_origin = cur.origin == first_origin
                 hop_auth, _src = self._auth_for(
                     auth if same_origin else None, url_creds if same_origin else None, cur.host)
-                if not same_origin and _src == "explicit":
+                if ((not same_origin and _src == "explicit")
+                        or _api.is_downgrade(first_origin[0], cur.scheme)):
+                    # https -> http: hiçbir kimlik (.netrc dahil) düz metin olarak gitmez.
                     hop_auth = None
                 hop_headers = dict(merged)
                 if same_origin and req_cookies and not _api._has(hop_headers, "cookie"):
@@ -1446,6 +1523,7 @@ class Session:
             response_headers.get_list("set-cookie"),
             request_host=url.host,
             request_path=url.path,
+            secure_origin=url.scheme in ("https", "wss"),
         )
 
                                                                                 

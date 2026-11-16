@@ -5,10 +5,11 @@
 Pure-Python HTTP istemcisi: kendi TLS 1.3 / TLS 1.2 yığını, tarayıcı TLS ve
 HTTP/2 parmak izi taklidi (Chrome, Firefox, Safari), HTTP/2 multiplexing,
 senkron ve async API (asyncio ya da anyio üzerinden trio). Deneysel HTTP/3
-isteğe bağlı bir ek paket olarak gelir. Kendine ait C eklentisi yoktur: tek
-derlenmiş çalışma zamanı bağımlılığı primitifler (AEAD, X25519, ML-KEM,
-sertifika ayrıştırma) için `cryptography`'dir; isteğe bağlı ekler (`http3`,
-`brotli`, `zstd`) kendi derlenmiş paketlerini getirir.
+isteğe bağlı bir ek paket olarak gelir. Kendine ait C eklentisi yoktur:
+derlenmiş çalışma zamanı bağımlılıkları primitifler (AEAD, X25519, ML-KEM,
+sertifika ayrıştırma) için `cryptography` ile `brotli` / `zstandard` içerik
+kod çözücüleridir (hepsi hazır wheel ile gelir); isteğe bağlı `http3` eki
+aioquic'i getirir.
 
 > **Durum: deneysel (alpha).** TLS yığını sıfırdan yazılmıştır. v0.2.0 ile sunucu
 > kimlik doğrulaması tam hâle geldi (aşağıya bakın). Kod kendi içimizde bir
@@ -19,14 +20,22 @@ sertifika ayrıştırma) için `cryptography`'dir; isteğe bağlı ekler (`http3
 ## Kurulum
 
 ```bash
-pip install fasthttpc
-pip install "fasthttpc[brotli,zstd]"   # isteğe bağlı içerik kod çözücüleri
+pip install fasthttpc                  # brotli ve zstd kod çözücüleri dahil
 pip install "fasthttpc[trio]"          # AsyncSession'ı trio altında çalıştırmak için (anyio + trio)
 pip install "fasthttpc[http3]"         # deneysel HTTP/3 (aioquic)
 ```
 
 Python 3.10+. CI testleri Linux'ta Python 3.10 - 3.13, Windows ve macOS'ta
 Python 3.12 ile çalıştırır.
+
+Tarayıcı profilleri `Accept-Encoding`'de `br` (Chrome/Firefox ayrıca `zstd`)
+ilan ettiğinden `brotli` ve `zstandard` normal bağımlılıktır (PyPy'de
+`brotlicffi`; orada zstd için `pip install "fasthttpc[zstd]"`). Eski
+`fasthttpc[brotli]` / `fasthttpc[zstd]` ekleri çalışmaya devam eder. Bir kod
+çözücü yine de eksikse, o `Content-Encoding` ile gelen yanıt sıkıştırılmış
+baytları sessizce döndürmez; kurulacak paketi ve `pip install` komutunu söyleyen
+`fasthttpc.MissingDecoderError` (`DecodeError` -> `ValueError` alt sınıfı)
+yükselir. Ham gövde gerekiyorsa `stream=True` + `iter_raw()` kullanılabilir.
 
 Geliştirme için:
 
@@ -41,15 +50,15 @@ pytest        # ağ gerektirmez (canlı testler FASTHTTPC_LIVE=1 olmadan atlanı
 
 | Alan | Destek |
 |---|---|
-| Protokoller | HTTP/1.1 (keep-alive, chunked), HTTP/2 (akış kontrolü, GOAWAY; eşzamanlı akışlar `AsyncSession`'da), WebSocket (`ws://`, `wss://`), HTTP/3 (**deneysel**, isteğe bağlı, aşağıya bakın) |
+| Protokoller | HTTP/1.1 (keep-alive, chunked; düz `http://` dahil), HTTP/2 (akış kontrolü, GOAWAY; eşzamanlı akışlar `AsyncSession`'da), WebSocket (`ws://`, `wss://`), HTTP/3 (**deneysel**, isteğe bağlı, aşağıya bakın) |
 | TLS | Kendi TLS 1.3'ümüz (HelloRetryRequest; key_share x25519, secp256r1, secp384r1 ve `cryptography` ML-KEM sunuyorsa hibrit post-kuantum X25519MLKEM768) ve TLS 1.2'nin güvenli bir alt kümesi (ECDHE + AEAD, EMS zorunlu). TLS 1.3 PSK oturum devamı var ama varsayılan kapalı; 0-RTT yok |
 | Sunucu doğrulaması | Zincir + hostname, CertificateVerify, Finished, hepsi zorunlu; `verify=` ile özel CA bundle |
 | İstemci sertifikası | `cert=` (mTLS): PEM, şifreli PKCS#8 veya PKCS#12; RSA >= 2048, P-256, P-384, Ed25519; TLS 1.3 ve TLS 1.2 |
-| Parmak izi | `chrome_131`, `firefox_133`, `safari_18` profilleri: ClientHello (JA3/JA4), HTTP/2 SETTINGS, pseudo-header sırası, başlık sırası |
+| Parmak izi | `chrome_158`, `firefox_160`, `safari_27` (2026-11 itibarıyla güncel kararlı sürümler; eski `chrome_131`, `firefox_133`, `safari_18` korunur): ClientHello (JA3/JA4; Chrome'un ALPS 17613, trust anchor ID ve ML-DSA imza şemaları dahil), HTTP/2 SETTINGS, pseudo-header sırası, başlık sırası. Kaynaklar ve bilinen sapmalar: [profiller](https://bu-ra34.github.io/fasthttpc/profiles/) |
 | Async | `AsyncSession` asyncio altında ya da anyio üzerinden trio altında (`fasthttpc[trio]`); aynı parmak izi ve gerçek HTTP/2 multiplexing |
 | Akış | `stream=True` / `s.stream(...)`; `iter_bytes`, `iter_text`, `iter_lines`, `iter_raw` ve async `aiter_*` karşılıkları; HTTP/1.1 ve HTTP/2 |
 | Auth ve hook'lar | Basic, Digest (RFC 7616), Bearer, `.netrc`, özel auth (requests veya httpx tarzı); requests tarzı `hooks=`, httpx tarzı `event_hooks=`; `Session` ve `AsyncSession`'da plugin'ler |
-| Proxy | HTTP CONNECT (+Basic), SOCKS5 (RFC 1929), rotasyon; TLS her zaman tünelin içinde kurulur |
+| Proxy | HTTP CONNECT (+Basic), SOCKS5 (RFC 1929), rotasyon; `trust_env=True` ile `HTTP_PROXY`/`HTTPS_PROXY`/`ALL_PROXY`/`NO_PROXY`; TLS her zaman tünelin içinde kurulur |
 | Zaman aşımı / sınır / yeniden deneme | `Timeout` (`total` dahil), `Limits`, urllib3 tarzı `Retry` (`Retry-After` ile) |
 | Çerez, cache, yönlendirme | RFC 6265 cookie jar, response cache, yönlendirme geçmişi |
 | DNS | İsteğe bağlı DNS-over-HTTPS çözücü; çok adresli host'larda Happy Eyeballs (RFC 8305) |
@@ -80,7 +89,8 @@ Dürüst karşılaştırma; burada "olgunluk" özellikler kadar önemlidir.
 | Async | Evet (asyncio, anyio üzerinden trio) | Hayır | Evet (asyncio, anyio üzerinden trio) | Evet |
 | `verify=False` | **Bilinçli olarak desteklenmez** | Evet | Evet | Evet |
 | Oturum devamı / 0-RTT | TLS 1.3 PSK oturum devamı, **varsayılan kapalı**; 0-RTT yok | Evet (OpenSSL) | Evet (OpenSSL) | Evet |
-| Post-kuantum anahtar değişimi | Chrome ve Firefox profillerinde X25519MLKEM768, yalnızca `cryptography` >= 47 ile; HTTP/3'te yok | OpenSSL 3.5+ ile | OpenSSL 3.5+ ile | Evet |
+| Post-kuantum anahtar değişimi | Chrome, Firefox ve `safari_27` profillerinde X25519MLKEM768, yalnızca `cryptography` >= 47 ile; HTTP/3'te yok | OpenSSL 3.5+ ile | OpenSSL 3.5+ ile | Evet |
+| Post-kuantum imza (ML-DSA) | `chrome_158` ML-DSA-44/65/87 ilan eder ve doğrular (`cryptography` >= 48) | Hayır | Hayır | İlan eder (BoringSSL) |
 | Olgunluk / üretim kullanımı | **Alpha, genç; yalnızca iç inceleme, bağımsız denetim yok** | Çok olgun | Olgun | Olgun |
 | Gerçek dünyada sertleşme yılı | Yok | >10 | >5 | Birkaç |
 | Hız | Pure Python: büyük aktarımlarda daha yavaş | Yeterince hızlı | Yeterince hızlı | En hızlı |
@@ -109,6 +119,13 @@ Sertifika doğrulamayı kapatmanın bir yolu yoktur; bu kasıtlıdır.
 kullanmaz: Python'un `ssl` modülünü `ssl.create_default_context()` ile kullanır;
 orada da sertifika zinciri ve hostname her zaman doğrulanır.
 
+`http://` adresleri düz metin HTTP/1.1 ile gider (requests/httpx gibi); bu
+isteklerde ne kimlik doğrulama ne gizlilik vardır. `https://` → `http://`
+yönlendirmesi izlenir ama o adımda HİÇBİR kimlik bilgisi (`Authorization`,
+`Proxy-Authorization`, `auth=`, `.netrc`, `kullanici:parola@`) ve `Secure` çerez
+gönderilmez; düz HTTP yanıtı `Secure` çerez koyamaz, var olanın üzerine yazamaz.
+HSTS yoktur: `http://` adresi sizin yerinize `https://`'e yükseltilmez.
+
 ### `verify`: özel CA bundle
 
 Kurumsal ağlarda (iç CA, TLS denetleyen proxy) kendi CA'nızı verebilirsiniz:
@@ -131,12 +148,19 @@ with Session(verify="/etc/kurum/ca.pem") as s:   # yalnızca bu CA'lara güvenil
 `AsyncSession(verify=...)` da aynı kuralları uygular (`impersonate=None` ile
 stdlib `ssl`'e `cafile` olarak iletilir).
 
+`trust_env=True` (varsayılan) ve `verify=True` iken `REQUESTS_CA_BUNDLE`,
+`SSL_CERT_FILE` ya da `CURL_CA_BUNDLE` (bu sırayla) bir PEM dosyası gösteriyorsa
+güven kökü o dosyadır (`verify="yol"` ile aynı anlam; requests/httpx gibi).
+Bu yalnızca HANGİ CA'lara güvenileceğini değiştirir, doğrulama kapanmaz. Açık
+`verify="yol"` her zaman önceliklidir; dosya yoksa değişkenin adıyla
+`FileNotFoundError`. `SSL_CERT_DIR` desteklenmez.
+
 ## Hızlı başlangıç
 
 ```python
 from fasthttpc import Session
 
-with Session(impersonate="chrome_131") as s:
+with Session(impersonate="chrome_158") as s:
     r = s.get("https://httpbin.org/get")
     print(r.status_code, r.elapsed)
     print(r.json())
@@ -150,7 +174,7 @@ from fasthttpc import AsyncSession
 
 async def main():
     # Async tarafta da tarayıcı parmak izi taklidi var (kendi TLS yığını)
-    async with AsyncSession(impersonate="chrome_131") as s:
+    async with AsyncSession(impersonate="chrome_158") as s:
         r = await s.get("https://httpbin.org/get")
         print(r.status_code)
 
@@ -177,8 +201,10 @@ de çalışır).
   desteklenmez (bkz. Güvenlik modeli). `proxies={...}` sözlüğü requests ile aynı
   biçimdedir ama yalnızca oturum düzeyindedir. `timeout=`, `params=`, `auth=`,
   `cookies=`, `hooks=` ve `stream=True` istek başına da verilebilir.
-- Proxy ortam değişkenleri (`HTTPS_PROXY` ...) okunmaz; `trust_env` yalnızca
-  `.netrc`'yi etkiler.
+- `trust_env=True` (varsayılan, requests gibi) iken proxy ortam değişkenleri
+  okunur (bkz. Proxy); `trust_env=False` hepsini (ve `.netrc`'yi) kapatır.
+- `http://` adresleri artık (requests/httpx gibi) düz HTTP/1.1 ile istenir;
+  0.6.2'ye kadar TLS ile isteniyordu.
 
 ### Timeout ve Limits
 
@@ -201,7 +227,12 @@ with Session(
 | `read` | Sunucudan veri bekleme |
 | `write` | Veri gönderme (şimdilik senkron tarafta `read` ile aynı soket zaman aşımını paylaşır) |
 | `pool` | Havuzdan boş bağlantı bekleme (diğer alanlar gibi ilk argümanı alır; yine de `None` ise `Session` `connect` süresini kullanır, `AsyncSession` sınırsız bekler) |
-| `total` | Gövde dahil tüm isteğin süre sınırı (varsayılan `None`, sınırsız) |
+| `total` | Bağlantı alma/kurma + yanıt (gövde dahil) için istek başına toplam süre sınırı (varsayılan `None`, sınırsız); `read`'in aksine damla damla veri yollayan sunucuyu da keser. `stream=True` iken yanıt başlıklarına kadar geçerlidir; akış gövdesinin her okuması `read` ile sınırlıdır |
+
+İstek düzeyi `timeout=` (sayı, `(connect, read)` ya da `Timeout`) o istek için
+oturumunkini geçersiz kılar. Zaman aşımları bağlantıya değil isteğe aittir: açık
+kalan keep-alive HTTP/1.1 ya da HTTP/2 bağlantısından giden istekler de kendi
+`read`/`write`/`total` sürelerine uyar (senkron ve async, akışlı ve akışsız).
 
 Geriye dönük uyumluluk: `Session(timeout=30)` ve `Timeout(connect=5, read=30)`
 eskisi gibi çalışır; `from fasthttpc.timeout import Timeout` aynı sınıftır.
@@ -311,7 +342,22 @@ with Session(proxies={"https": "socks5://u:p@127.0.0.1:1080"}) as s:
 
 TLS (ve parmak izi) her zaman tünelin İÇİNDE fasthttpc'nin kendi TLS yığınıyla
 kurulur (`AsyncSession(impersonate=None)` ile stdlib `ssl`); proxy yalnızca TCP
-baytlarını taşır.
+baytlarını taşır. Düz `http://` hedefler HTTP proxy'sine CONNECT'siz, mutlak
+biçimli istekle (`GET http://host/yol HTTP/1.1`, `Proxy-Authorization` dahil)
+gider; SOCKS5'te tünelin içinde düz HTTP konuşulur.
+
+**Ortam değişkenleri** (`trust_env=True`, varsayılan; requests/httpx gibi):
+`proxy=`/`proxies=` verilmemişse `http://` için `HTTP_PROXY`, `https://` için
+`HTTPS_PROXY`, ikisi de yoksa `ALL_PROXY` kullanılır (küçük harfli adlar
+önceliklidir; şemasız değer `http://` sayılır). `NO_PROXY` virgülle ayrılmış
+liste: `*`, host (`example.com` alt alan adlarını da kapsar; `.example.com`,
+`*.example.com` aynı), IP, CIDR (`10.0.0.0/8`, yalnızca IP hedefe), port
+(`host:8080`, `[::1]:8080`). Açık `proxy=`/`proxies=` ortamı tamamen ezer;
+`proxies={}` "proxy yok" demektir; `trust_env=False` ortamı hiç okumaz.
+Değişkenler oturum kurulurken okunur. Desteklenmeyen şema (ör. `https://`
+proxy, `socks4://`) sessizce yok sayılmaz: o proxy kullanılacağı istekte
+değişkenin adını içeren `ValueError` verilir. CGI ortamında (`REQUEST_METHOD`
+tanımlı) büyük harfli `HTTP_PROXY` okunmaz (httpoxy).
 
 ### Logging
 
@@ -330,21 +376,27 @@ telde giden byte'ları parse eder:
 ```python
 from fasthttpc import ja3_for_profile
 
-ja3_str, ja3_hash = ja3_for_profile("chrome_131")
+ja3_str, ja3_hash = ja3_for_profile("chrome_158")
 print(ja3_hash)
 ```
 
 ## Profiller
 
-| Profil | Takma adlar |
-|---|---|
-| `chrome_131` | `chrome` |
-| `firefox_133` | `firefox`, `firefox_120` |
-| `safari_18` | `safari`, `safari_17` |
-| `default` | — (tarayıcı taklidi yok; `impersonate=None`) |
+| Profil | Tarayıcı | Takma adlar |
+|---|---|---|
+| `chrome_158` | Chrome 158 (Windows) | `chrome` |
+| `firefox_160` | Firefox 160 (Windows) | `firefox` |
+| `safari_27` | Safari 27.2 (macOS) | `safari`, `safari_27_2` |
+| `chrome_131` | Chrome 131 (geriye dönük uyumluluk) | — |
+| `firefox_133` | Firefox 133 (geriye dönük uyumluluk) | `firefox_120` |
+| `safari_18` | Safari 18.0 (geriye dönük uyumluluk) | `safari_17` |
+| `default` | — (tarayıcı taklidi yok; `impersonate=None`) | — |
 
 Bilinmeyen bir profil adı `ValueError` fırlatır; sessizce `default`'a düşmez.
-`Session` ve `AsyncSession`'ın varsayılanı `"chrome_131"`'dir.
+`Session` ve `AsyncSession`'ın varsayılanı `"chrome_158"`'dir (0.6.2'ye kadar
+`"chrome_131"`; eski parmak izi için adı açıkça verin). Ayrı bir Edge profili
+yoktur: Edge'in TLS/HTTP/2 katmanı Chromium'dur, ancak Edge'in trust anchor ID
+uzantısını gönderip göndermediği doğrulanamadı (bkz. docs/profiles.md).
 
 ## Bilinen sınırlar
 
@@ -385,10 +437,8 @@ verir veya belgelenmiştir:
   kullanımdaki bağlantıları sınırlar; boştaki keep-alive bağlantılar slot
   tutmaz ve `max_keepalive_connections` (varsayılan `max_connections`) ile
   sınırlıdır. Async'te `keepalive_expiry=0` keep-alive'ı kapatır.
-- Proxy ortam değişkenleri (`HTTP_PROXY`, `HTTPS_PROXY`, `NO_PROXY`) okunmaz.
-- **Düz HTTP yok:** `http://` adresleri de TLS ile istenir (adreste port yoksa
-  80'e), bu yüzden yalnızca düz HTTP konuşan sunuculara ulaşılamaz. `ws://`
-  WebSocket'leri düz TCP kullanır.
+- **Düz HTTP yalnızca HTTP/1.1:** `http://` için h2c (düz HTTP/2) ve HTTP/3
+  yoktur; HSTS uygulanmaz (`http://` adresi `https://`'e yükseltilmez).
 - HTTP/2'de (senkron ve async) sunucu PUSH_PROMISE'i protokol hatasıdır (ENABLE_PUSH=0 ilan
   edilir); PRIORITY frame'i gönderilmez, gelirse yok sayılır (HEADERS'ın öncelik
   alanı profili izler).
@@ -423,10 +473,10 @@ verir veya belgelenmiştir:
 - **HPACK huffman ENCODE yok** (decode var). Protokolde geçerli, ama h2 parmak
   izinde küçük bir sapma yaratır.
 - **key_share grupları:** x25519, secp256r1, secp384r1 ve hibrit post-kuantum
-  X25519MLKEM768. X25519MLKEM768 yalnızca `chrome_131` ve `firefox_133`
-  profillerinde ve yalnızca kurulu `cryptography` ML-KEM sunuyorsa (47 ve üstü)
-  gönderilir; aksi halde supported_groups'tan da çıkarılır ve ClientHello gerçek
-  tarayıcıdan ayrışır. secp521r1/x448/ffdhe implemente edilmedi: bunlar için
+  X25519MLKEM768. X25519MLKEM768 Chrome ve Firefox profillerinde ve `safari_27`'de,
+  yalnızca kurulu `cryptography` ML-KEM sunuyorsa (47 ve üstü) gönderilir; aksi
+  halde supported_groups'tan da çıkarılır ve ClientHello gerçek tarayıcıdan
+  ayrışır. `chrome_158`'in ML-DSA imza şemaları da `cryptography` 48+ ister. secp521r1/x448/ffdhe implemente edilmedi: bunlar için
   key_share *gönderilmez*; profil supported_groups'ta ilan ediyorsa (Firefox,
   Safari) ve sunucu HRR ile bunları isterse açık hata verilir.
 - **HTTP/3 deneyseldir:** proxy üzerinden ve `cert=` ile kullanılmaz, trio
@@ -438,6 +488,8 @@ verir veya belgelenmiştir:
 - **`verify=False` yok** (bilinçli; yukarıya bakın).
 - `Timeout.write` senkron tarafta ayrı uygulanmıyor (soket `read` zaman aşımını
   kullanır); `AsyncSession` `write`'ı drain süresine uygular.
+- `Timeout.total`, başlıklar geldikten sonra akış (`stream=True`) gövdesinin
+  okunmasını sınırlamaz (oradaki her okuma `read` ile sınırlıdır).
 - İç güvenlik incelemesinin açık bulguları (ör. açılmış gövde boyutuna sınır
   yok, çerezlerde Public Suffix List yok) [docs/security-audit.md](docs/security-audit.md)'de.
 

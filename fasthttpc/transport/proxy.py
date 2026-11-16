@@ -14,11 +14,20 @@ SOCKS5'te hedef adı her zaman DOMAIN (ATYP=3) olarak gönderilir, yani DNS
 çözümlemesi proxy tarafında yapılır (yerel DNS sızıntısı olmaz). Hedef bir IP
 literal'i ise ATYP=1/4 kullanılır. TLS ile proxy'ye bağlanma (https://proxy)
 desteklenmez.
+
+Düz ``http://`` hedefler HTTP proxy'si üzerinden CONNECT ile DEĞİL, mutlak biçimli
+istek satırıyla (``GET http://host/yol HTTP/1.1``, RFC 9112 §3.2.2) gönderilir
+(requests/httpx gibi); SOCKS5'te tünelin içinde düz HTTP konuşulur.
+
+Ortam değişkenleri (``trust_env=True``): ``HTTP_PROXY`` / ``HTTPS_PROXY`` /
+``ALL_PROXY`` / ``NO_PROXY`` (küçük harfli biçimleri önceliklidir) — bkz.
+:func:`environ_proxies`, :func:`proxy_bypass`, :func:`select_proxy`.
 """
 from __future__ import annotations
 
 import base64
 import ipaddress
+import os
 import socket
 import struct
 from dataclasses import dataclass
@@ -91,6 +100,183 @@ def resolve_proxy(proxies: ProxySpec, target_scheme: str = "https") -> Optional[
         return parse_proxy_url(proxies)
     url = proxies.get(target_scheme) or proxies.get("all")
     return parse_proxy_url(url) if url else None
+
+
+# ---- ortam değişkenleri (trust_env) ---------------------------------------------
+
+@dataclass(frozen=True)
+class EnvProxies:
+    """Ortamdan okunan proxy ayarları (bkz. :func:`environ_proxies`).
+
+    ``proxies``: şema (``http`` | ``https`` | ``all``) -> proxy URL'i;
+    ``sources``: şema -> değişkenin adı (hata mesajları için); ``no_proxy``: ham değer.
+    """
+    proxies: Mapping[str, str]
+    sources: Mapping[str, str]
+    no_proxy: str = ""
+
+
+def environ_proxies(environ: Optional[Mapping[str, str]] = None) -> Optional[EnvProxies]:
+    """``HTTP_PROXY``/``HTTPS_PROXY``/``ALL_PROXY``/``NO_PROXY`` değişkenlerini okur.
+
+    urllib/requests/httpx ile aynı kurallar: küçük harfli ad büyük harfliden
+    önceliklidir; boş değer yok sayılır; şemasız değer (``proxy:3128``) ``http://``
+    kabul edilir. CGI ortamında (``REQUEST_METHOD`` tanımlı) büyük harfli
+    ``HTTP_PROXY`` yok sayılır: istemcinin ``Proxy:`` başlığı oraya düşer (httpoxy).
+    Hiçbir proxy ayarı yoksa ``None`` döner. URL'ler burada doğrulanmaz; desteklenmeyen
+    şema, proxy gerçekten kullanılacağı zaman :func:`select_proxy` içinde hata verir.
+    """
+    env = os.environ if environ is None else environ
+    # Adlar TAM eşleşmeyle aranır. Windows'ta os.environ büyük/küçük harfe duyarsızdır
+    # (anahtarlar büyük harfle saklanır): env.get("http_proxy") orada HTTP_PROXY'yi
+    # döndürür ve CGI'daki httpoxy korumasını delerdi. Anahtar kümesine bakmak,
+    # yalnızca gerçekten var olan adı (Windows'ta büyük harfli olanı) bulur.
+    keys = set(env.keys())
+
+    def _get(name: str) -> str:
+        return (env[name] or "").strip() if name in keys else ""
+
+    cgi = "REQUEST_METHOD" in keys
+    proxies: dict[str, str] = {}
+    sources: dict[str, str] = {}
+    for scheme in ("http", "https", "all"):
+        names = [f"{scheme}_proxy"]
+        if not (cgi and scheme == "http"):
+            names.append(f"{scheme.upper()}_PROXY")
+        for name in names:
+            val = _get(name)
+            if val:
+                proxies[scheme] = val if "://" in val else "http://" + val
+                sources[scheme] = name
+                break
+    no_proxy = ""
+    for name in ("no_proxy", "NO_PROXY"):
+        val = _get(name)
+        if val:
+            no_proxy = val
+            break
+    if not proxies:
+        return None
+    return EnvProxies(proxies=proxies, sources=sources, no_proxy=no_proxy)
+
+
+def _split_host_port(entry: str) -> "tuple[str, Optional[int]]":
+    """``host``, ``host:port``, ``[v6]``, ``[v6]:port`` ya da çıplak IPv6 / CIDR."""
+    if entry.startswith("["):
+        host, _, rest = entry[1:].partition("]")
+        port = rest[1:] if rest.startswith(":") else ""
+        return host, int(port) if port.isdigit() else None
+    if entry.count(":") == 1:
+        host, _, port = entry.partition(":")
+        if port.isdigit():
+            return host, int(port)
+    return entry, None
+
+
+def proxy_bypass(host: str, port: Optional[int], no_proxy: str) -> bool:
+    """``NO_PROXY`` değeri bu hedef için proxy'yi devre dışı bırakıyor mu?
+
+    Girdiler virgül (ya da boşluk) ile ayrılır, büyük/küçük harf duyarsızdır:
+
+    * ``*`` — her hedef doğrudan.
+    * ``example.com`` — ``example.com`` ve tüm alt alan adları (curl/requests gibi);
+      ``.example.com`` ve ``*.example.com`` aynı anlamdadır.
+    * ``10.0.0.1``, ``::1`` / ``[::1]`` — tam IP; ``10.0.0.0/8``, ``fd00::/8`` — CIDR
+      (yalnızca hedef bir IP literal'i ise; ad çözümlenmez).
+    * ``host:8080`` / ``[::1]:8080`` — yalnızca o port.
+    """
+    if not no_proxy:
+        return False
+    host = host.strip("[]").lower().rstrip(".")
+    host_ip: "Optional[Union[ipaddress.IPv4Address, ipaddress.IPv6Address]]"
+    try:
+        host_ip = ipaddress.ip_address(host)
+    except ValueError:
+        host_ip = None
+    for raw in no_proxy.replace(" ", ",").split(","):
+        entry = raw.strip().lower()
+        if not entry:
+            continue
+        if entry == "*":
+            return True
+        name, eport = _split_host_port(entry)
+        if eport is not None and eport != port:
+            continue
+        name = name.rstrip(".")
+        if "/" in name:
+            if host_ip is not None:
+                try:
+                    if host_ip in ipaddress.ip_network(name, strict=False):
+                        return True
+                except ValueError:
+                    pass
+            continue
+        try:
+            entry_ip: "Optional[Union[ipaddress.IPv4Address, ipaddress.IPv6Address]]" = (
+                ipaddress.ip_address(name))
+        except ValueError:
+            entry_ip = None
+        if entry_ip is not None or host_ip is not None:
+            if entry_ip is not None and entry_ip == host_ip:
+                return True
+            continue
+        if name.startswith("*."):
+            name = name[1:]
+        name = name.lstrip(".")
+        if name and (host == name or host.endswith("." + name)):
+            return True
+    return False
+
+
+# ws/wss bağlantıları ortam değişkenlerinde http/https proxy'sini kullanır.
+_ENV_SCHEME = {"ws": "http", "wss": "https"}
+
+
+def select_proxy(scheme: str, host: str, port: Optional[int], spec: ProxySpec,
+                 env: Optional[EnvProxies]) -> Optional[ProxyConfig]:
+    """Bir istek için kullanılacak proxy.
+
+    Öncelik: açık ``proxy=``/``proxies=`` (``spec`` ``None`` değilse ortam HİÇ okunmaz;
+    ``proxies={}`` "proxy yok" demektir) > ortam değişkenleri (``env``; ``NO_PROXY``
+    eşleşirse doğrudan) > doğrudan.
+    """
+    if spec is not None:
+        return resolve_proxy(spec, scheme)
+    if env is None or proxy_bypass(host, port, env.no_proxy):
+        return None
+    key = _ENV_SCHEME.get(scheme, scheme)
+    if key not in env.proxies:
+        key = "all"
+    url = env.proxies.get(key)
+    if not url:
+        return None
+    try:
+        return parse_proxy_url(url)
+    except ValueError as e:
+        raise ValueError(
+            f"{env.sources.get(key, 'proxy')} ortam değişkenindeki proxy kullanılamıyor: {e} "
+            f"Ortam proxy'lerini yok saymak için trust_env=False ya da proxies={{}} verin."
+        ) from None
+
+
+def forward_proxy_headers(proxy: ProxyConfig) -> "list[tuple[str, str]]":
+    """Mutlak biçimli (proxy'ye düz HTTP) istek için ek başlıklar (Basic kimlik)."""
+    if proxy.username is None:
+        return []
+    cred = f"{proxy.username}:{proxy.password or ''}".encode("utf-8")
+    return [("Proxy-Authorization", "Basic " + base64.b64encode(cred).decode("ascii"))]
+
+
+def authority(host: str, port: int, scheme: str) -> str:
+    """``Host`` başlığı / authority: varsayılan port yazılmaz, IPv6 köşeli parantezli."""
+    h = f"[{host}]" if ":" in host else host
+    default = 443 if scheme in ("https", "wss") else 80
+    return h if port == default else f"{h}:{port}"
+
+
+def absolute_form(host: str, port: int, raw_path: str) -> str:
+    """``http://`` hedefin mutlak biçimli istek hedefi (RFC 9112 §3.2.2)."""
+    return f"http://{authority(host, port, 'http')}{raw_path}"
 
 
 # ---- düşük seviye yardımcılar ------------------------------------------------
@@ -216,21 +402,28 @@ def open_tunnel(sock: socket.socket, proxy: ProxyConfig, host: str, port: int) -
         socks5_connect(sock, proxy, host, port)
 
 
+def connect_to_proxy(proxy: ProxyConfig, timeout: Optional[float] = 30.0) -> socket.socket:
+    """Proxy'nin kendisine TCP bağlantısı (tünel YOK). Düz ``http://`` hedefler HTTP
+    proxy'sine bu soket üzerinden mutlak biçimli istekle gönderilir."""
+    try:
+        sock = create_connection((proxy.host, proxy.port), timeout=timeout)
+    except OSError as e:
+        raise ProxyError(f"Proxy'ye bağlanılamadı ({proxy.host}:{proxy.port}): {e}") from e
+    try:
+        sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+    except OSError:
+        pass
+    return sock
+
+
 def connect_via_proxy(proxy: ProxyConfig, host: str, port: int,
                       timeout: Optional[float] = 30.0) -> socket.socket:
     """Proxy'ye TCP bağlanır, tüneli kurar ve ham soketi döner.
 
     Dönen soket üzerinde doğrudan ``TLSAdapter.negotiate`` çalıştırılabilir.
     """
+    sock = connect_to_proxy(proxy, timeout=timeout)
     try:
-        sock = create_connection((proxy.host, proxy.port), timeout=timeout)
-    except OSError as e:
-        raise ProxyError(f"Proxy'ye bağlanılamadı ({proxy.host}:{proxy.port}): {e}") from e
-    try:
-        try:
-            sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-        except OSError:
-            pass
         open_tunnel(sock, proxy, host, port)
     except BaseException:
         sock.close()
@@ -408,3 +601,24 @@ async def async_connect_via_proxy(proxy: ProxyConfig, host: str, port: int,
         return reader, writer
 
     return await B.wait_for(_tunnel(), left)
+
+
+async def async_connect_to_proxy(proxy: ProxyConfig, timeout: Optional[float] = 30.0,
+                                 progress: Optional[dict] = None):
+    """Proxy'nin kendisine TCP bağlantısı (tünel YOK); ``(reader, writer)`` döner.
+
+    Düz ``http://`` hedefler HTTP proxy'sine bu akış üzerinden mutlak biçimli istekle
+    gönderilir. Hata/zaman aşımı :func:`async_connect_via_proxy` ile aynı: ProxyError.
+    """
+    import asyncio
+
+    from .. import _backend as B
+
+    try:
+        reader, writer = await B.wait_for(B.open_connection(proxy.host, proxy.port), timeout)
+    except (OSError, asyncio.TimeoutError) as e:
+        raise ProxyError(f"Proxy'ye bağlanılamadı ({proxy.host}:{proxy.port}): "
+                         f"{str(e) or type(e).__name__}") from e
+    if progress is not None:
+        progress["proxy_tcp"] = True
+    return reader, writer

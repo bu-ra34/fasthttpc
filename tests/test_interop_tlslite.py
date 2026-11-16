@@ -57,7 +57,10 @@ def test_tlslite_suite_ve_sertifika(tenv, key, cipher, suite, mode):
 
 
 @pytest.mark.parametrize("mode", MODES)
-@pytest.mark.parametrize("alg,profile", [("zlib", "safari_18"), ("brotli", "chrome_131"), ("zlib", "firefox_133")])
+@pytest.mark.parametrize("alg,profile", [
+    ("zlib", "safari_18"), ("brotli", "chrome_131"), ("zlib", "firefox_133"),
+    ("zlib", "safari_27"), ("brotli", "chrome_158"), ("brotli", "firefox_160"), ("zstd", "firefox_160"),
+])
 def test_sertifika_sikistirma(tenv, alg, profile, mode):
     """Sunucu CompressedCertificate (RFC 8879) gönderir; istemci açıp doğrular."""
     with _srv(tenv, "rsa2048", _settings(certificate_compression_send=[alg],

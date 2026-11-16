@@ -317,6 +317,10 @@ def test_session_goaway_islenmeyen_istegi_yeni_baglantida_tekrarlar(monkeypatch)
             self.tls_established = True
             self.h2_conn = FakeH2(red)
             self.closed = False
+            # Session her istekte zaman aşımını bağlantıya uygular (_arm_timeouts)
+            self.conn_data = {}
+            self.is_closed = False
+            self.socket = type("S", (), {"raw_socket": type("R", (), {"settimeout": lambda self, t: None})()})()
 
         def close(self):
             self.closed = True

@@ -341,10 +341,17 @@ def test_sertifika_sikistirma_yalniz_acabildiklerimiz():
         brotli_var = True
     except ImportError:
         brotli_var = False
-    # brotli kurulu değilse ilan edilmez (sunucu seçerse sertifikayı açamazdık)
+    try:
+        import zstandard  # noqa: F401
+        zstd_var = True
+    except ImportError:
+        zstd_var = False
+    # brotli/zstandard kurulu değilse ilan edilmez (sunucu seçerse sertifikayı açamazdık)
     assert algs("chrome_131") == ([2] if brotli_var else [1])
     assert algs("safari_18") == [1]                         # zlib
-    assert algs("firefox_133") == ([1, 2] if brotli_var else [1])   # zstd (3) HİÇ ilan edilmez
+    ff = [1] + ([2] if brotli_var else []) + ([3] if zstd_var else [])
+    assert algs("firefox_133") == ff
+    assert algs("firefox_160") == ff
 
 
 def test_key_share_grease_ve_hibrit():

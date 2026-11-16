@@ -332,7 +332,11 @@ class HandshakeOrderValidator:
 
 
 def _nonce(iv: bytes, seq: int) -> bytes:
-    return bytes(a ^ b for a, b in zip(iv, b"\x00" * 4 + seq.to_bytes(8, "big")))
+    """RFC 8446 §5.3: iv XOR (seq, 12 bayta sola sıfır doldurulmuş).
+
+    Tamsayı XOR'u, bayt bayt üreteçten (~13 Python adımı/record) belirgin hızlıdır;
+    seq 2^64'ten küçük olduğu için sonuç her zaman 12 bayta sığar."""
+    return (int.from_bytes(iv, "big") ^ seq).to_bytes(len(iv), "big")
 
 
 class EncryptedSocket:
@@ -365,11 +369,16 @@ class EncryptedSocket:
         """Anahtar değiştiğinde (KeyUpdate) eski AEAD nesnelerini bırakır."""
         self._cipher_cache.clear()
 
+    # Tek recv() ile istenen en fazla bayt. 16 KiB, tam boy bir record'u (16 KiB + 22)
+    # bile İKİ sistem çağrısına bölüyordu; 64 KiB ~4 record'u tek çağrıda alır. Tampon
+    # yine de sınırlı kalır (bkz. _read_raw_record'daki sıkıştırma).
+    _RECV_SIZE = 65536
+
     def _fill(self, need: int, eof_msg: str) -> None:
         """Tamponda okunmamış en az `need` bayt olana kadar soketten okur."""
         buf = self.read_buffer
         while len(buf) - self._rbuf_off < need:
-            chunk = self.raw_socket.recv(16384)
+            chunk = self.raw_socket.recv(self._RECV_SIZE)
             if not chunk:
                 raise ConnectionResetError(eof_msg)
             buf += chunk
@@ -379,7 +388,8 @@ class EncryptedSocket:
         self._fill(5, "TLS şifreli paket beklenirken bağlantı koptu!")
         off = self._rbuf_off
         buf = self.read_buffer
-        record_header = bytes(buf[off:off + 5])
+        with memoryview(buf) as mv:
+            record_header = mv[off:off + 5].tobytes()
         rec_type = record_header[0]
         rec_len = (record_header[3] << 8) | record_header[4]
         if rec_len > MAX_CIPHERTEXT:
@@ -390,7 +400,10 @@ class EncryptedSocket:
 
         self._fill(5 + rec_len, "TLS paket gövdesi okunurken koptu.")
         off = self._rbuf_off
-        payload = bytes(self.read_buffer[off + 5:off + 5 + rec_len])
+        # memoryview üzerinden TEK kopya (bytearray dilimi + bytes() iki kopyaydı).
+        # Görünüm, tampon yeniden boyutlanmadan önce bırakılır.
+        with memoryview(self.read_buffer) as mv:
+            payload = mv[off + 5:off + 5 + rec_len].tobytes()
         off += 5 + rec_len
         if off == len(self.read_buffer):
             self.read_buffer.clear()
@@ -424,18 +437,15 @@ class EncryptedSocket:
                 "Gönderim sequence number'ı 2^64-1'i aştı — bağlantı kapatıldı (RFC 8446 §5.3)."
             )
 
-        inner = data + struct.pack("!B", content_type)
+        inner = data + bytes((content_type,))
         nonce = _nonce(iv, seq)
         header = struct.pack("!BHH", 0x17, 0x0303, len(inner) + 16)
 
-        cipher, is_aes = self._cipher(key)
-        if is_aes:
-            ct, tag = cipher.encrypt_gcm(nonce, inner, header)
-        else:
-            ct, tag = cipher.encrypt_aead(nonce, inner, header)
+        cipher, _is_aes = self._cipher(key)
+        sealed = cipher.seal(nonce, inner, header)     # ct || tag
 
         self.state[seq_name] = seq + 1
-        self.raw_socket.sendall(header + ct + tag)
+        self.raw_socket.sendall(header + sealed)
 
     def close(self) -> None:
         try:
@@ -492,16 +502,13 @@ class EncryptedSocket:
                 )
 
             nonce = _nonce(iv, seq)
-            ct, tag = payload[:-16], payload[-16:]
 
             # AAD, telde GELEN record header'ının birebir kendisidir (RFC 8446 §5.2).
             # Sabit 0x17/0x0303 varsaymak, farklı legacy_record_version gönderen
             # sunucularda tag doğrulamasını hatalı biçimde başarısız kılar.
-            cipher, is_aes = self._cipher(key)
-            if is_aes:
-                pt = cipher.decrypt_gcm(nonce, ct, record_header, tag)
-            else:
-                pt = cipher.decrypt_aead(nonce, ct, record_header, tag)
+            # payload = ct || tag; AEAD doğrulaması başarısızsa ValueError (seq artmaz).
+            cipher, _is_aes = self._cipher(key)
+            pt = cipher.open(nonce, payload, record_header)
 
             self.state[seq_name] = seq + 1
 
@@ -510,15 +517,14 @@ class EncryptedSocket:
                 raise TLSProtocolError("record_overflow: çözülmüş TLSInnerPlaintext 2^14+1'i aşıyor.")
 
             # TLSInnerPlaintext: content || content_type || zero-padding
-            idx = len(pt) - 1
-            while idx >= 0 and pt[idx] == 0:
-                idx -= 1
-            if idx < 0:
+            # (sondaki sıfırlar C hızında atılır; bayt bayt Python döngüsü yerine).
+            stripped = pt.rstrip(b"\x00")
+            if not stripped:
                 raise ConnectionError(
                     "TLS record'u yalnızca padding içeriyor, content_type yok — protokol hatası."
                 )
-            inner = pt[:idx]
-            inner_type = pt[idx]
+            inner = stripped[:-1]
+            inner_type = stripped[-1]
 
             # Application aşamasında gelen post-handshake handshake
             # mesajlarını (NewSessionTicket=4, KeyUpdate=24) işle/yut.
@@ -992,7 +998,8 @@ class TLSAdapter:
                 if hs_type == _HS_ENCRYPTED_EXTENSIONS:
                     state["alpn"] = _parse_alpn_from_encrypted_extensions(hs_payload)
                     send_client_ee = alps_accepted(
-                        impersonator.alps_advertised, hs_payload, state["alpn"])
+                        impersonator.alps_advertised, hs_payload, state["alpn"],
+                        impersonator.alps_codepoint)
                     rsl = _parse_record_size_limit(hs_payload)
                     if rsl:
                         if rsl < 64:  # RFC 8449 §4
@@ -1067,7 +1074,7 @@ class TLSAdapter:
         if send_client_ee:
             # Sunucu ALPS'i kabul etti: istemci EE'yi Finished'tan önce yollar
             # (transcript'e girer; Finished MAC'i onu da kapsar).
-            client_ee = build_client_encrypted_extensions()
+            client_ee = build_client_encrypted_extensions(codepoint=impersonator.alps_codepoint)
             esock.send_record(client_ee, content_type=0x16, use_app_keys=False)
             state["handshake_messages"] += client_ee
         if cert_req is not None:

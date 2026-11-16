@@ -135,8 +135,19 @@ class AsyncTLSStream:
                 self._eof = True
                 if content[1:2] != b"\x00":
                     raise ConnectionError(f"Sunucudan TLS alert: {content.hex()}")
-        if n is None or n < 0:
-            n = len(self._appbuf)
+        # Çekirdeğin zaten çözdüğü sıradaki uygulama verisi record'larını da (await
+        # etmeden) ekle: tek read() çağrısı record başına bir tur yerine elde ne
+        # varsa (en çok n bayt) döner. Alert/kapanış kuyrukta bırakılır.
+        unbounded = n is None or n < 0
+        while unbounded or len(self._appbuf) < n:
+            more = self._records.pop_data()
+            if more is None:
+                break
+            self._appbuf += more
+        if unbounded or n >= len(self._appbuf):
+            out = bytes(self._appbuf)
+            self._appbuf.clear()
+            return out
         out = bytes(self._appbuf[:n])
         del self._appbuf[:n]
         return out

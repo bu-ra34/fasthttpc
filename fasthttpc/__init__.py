@@ -39,6 +39,7 @@ from .retry         import Retry
 from .transport.mock import MockTransport, BaseTransport
 from .multipart     import encode_multipart
 from .models.response import Response, HTTPStatusError
+from .streaming     import DecodeError, MissingDecoderError
 from .models.request  import Request
 from .models.headers  import Headers
 from .models.urls     import URL
@@ -63,7 +64,7 @@ from .plugins import Plugin, RetryPlugin, LoggingPlugin, RateLimitPlugin
 from .auth import Auth, BasicAuth, BearerAuth, DigestAuth
 from ._api import USE_CLIENT_DEFAULT
 
-__version__ = "0.6.2"
+__version__ = "0.7.0"
 __author__  = "Buğra"
 __all__ = [
     "Session",
@@ -76,6 +77,8 @@ __all__ = [
     "encode_multipart",
     "Response",
     "HTTPStatusError",
+    "DecodeError",
+    "MissingDecoderError",
     "Request",
     "Headers",
     "URL",

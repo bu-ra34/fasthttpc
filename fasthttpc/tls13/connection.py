@@ -127,28 +127,22 @@ class _Direction:
         self.aead = _AESGCM(key) if self.is_aes else _ChaCha(key)
 
     def nonce(self) -> bytes:
-        seq = self.seq.to_bytes(12, "big")
-        return bytes(a ^ b for a, b in zip(self.iv, seq))
+        # RFC 8446 §5.3: iv XOR seq (tamsayı XOR'u; bayt bayt üreteçten hızlı).
+        return (int.from_bytes(self.iv, "big") ^ self.seq).to_bytes(len(self.iv), "big")
 
     def seal(self, inner: bytes, header: bytes) -> bytes:
         if self.seq >= (1 << 64) - 1:
             raise TLSError("Sequence number taştı; KeyUpdate gerekli.")
         n = self.nonce()
-        if self.is_aes:
-            ct, tag = self.aead.encrypt_gcm(n, inner, header)
-        else:
-            ct, tag = self.aead.encrypt_aead(n, inner, header)
+        out = self.aead.seal(n, inner, header)       # ct || tag, tek parça
         self.seq += 1
-        return ct + tag
+        return out
 
     def open(self, payload: bytes, header: bytes) -> bytes:
         n = self.nonce()
-        ct, tag = payload[:-16], payload[-16:]
         try:
-            if self.is_aes:
-                pt = self.aead.decrypt_gcm(n, ct, header, tag)
-            else:
-                pt = self.aead.decrypt_aead(n, ct, header, tag)
+            # payload = ct || tag; bölüp yeniden birleştirmeden doğrudan doğrulanır.
+            pt = self.aead.open(n, payload, header)
         except ValueError as e:
             raise TLSError(f"bad_record_mac: TLS record'u doğrulanamadı ({e})") from e
         self.seq += 1
@@ -362,9 +356,11 @@ class TLSClientConnection:
                     raise TLSError(f"record_overflow: record uzunluğu {rlen} > {C.MAX_CIPHERTEXT}")
                 if len(self._inbuf) < 5 + rlen:
                     break
-                header = bytes(self._inbuf[:5])
-                payload = bytes(self._inbuf[5:5 + rlen])
-                del self._inbuf[:5 + rlen]
+                # memoryview ile tek kopya (bytearray dilimi + bytes() iki kopyaydı).
+                with memoryview(self._inbuf) as mv:
+                    header = mv[:5].tobytes()
+                    payload = mv[5:5 + rlen].tobytes()
+                del self._inbuf[:5 + rlen]          # baştan silme CPython'da O(1) (ob_start)
                 self._handle_record(rtype, header, payload, events)
                 if self._t12 is not None:
                     # ServerHello TLS 1.2 seçti: kalan baytlar TLS 1.2 çekirdeğinindir.
@@ -411,12 +407,11 @@ class TLSClientConnection:
             raise TLSError("TLS record'u AEAD tag'i için fazla kısa — bozuk veri.")
 
         pt = self._read.open(payload, header)
-        idx = len(pt) - 1
-        while idx >= 0 and pt[idx] == 0:
-            idx -= 1
-        if idx < 0:
+        # Sondaki sıfır padding C hızında atılır (bayt bayt Python döngüsü yerine).
+        stripped = pt.rstrip(b"\x00")
+        if not stripped:
             raise TLSError("unexpected_message: record yalnızca padding içeriyor, content_type yok")
-        inner, itype = pt[:idx], pt[idx]
+        inner, itype = stripped[:-1], stripped[-1]
         if len(inner) > C.MAX_PLAINTEXT:
             raise TLSError("record_overflow: çözülmüş düz metin 2^14 byte'ı aşıyor")
 
@@ -646,7 +641,8 @@ class TLSClientConnection:
         if hs_type == HS_ENCRYPTED_EXTENSIONS:
             self.alpn = parse_alpn(msg)
             self._send_client_ee = alps_accepted(
-                getattr(self._imp, "alps_advertised", False), msg, self.alpn)
+                getattr(self._imp, "alps_advertised", False), msg, self.alpn,
+                self._imp.alps_codepoint)
             limit = parse_record_size_limit(msg)
             if limit:
                 if limit < 64:  # RFC 8449 §4: 64'ten küçük değer illegal_parameter
@@ -727,7 +723,7 @@ class TLSClientConnection:
             # ALPS kabul edildi: istemci EncryptedExtensions Finished'tan ÖNCE
             # gider, transcript'e girer (application secret'lar ise SERVER
             # Finished'a kadar olan th_sf'ten türer).
-            cee = build_client_encrypted_extensions()
+            cee = build_client_encrypted_extensions(codepoint=self._imp.alps_codepoint)
             self._seal(cee, CT_HANDSHAKE)
             self._transcript += cee
         if self._cert_req is not None:
