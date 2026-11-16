@@ -18,7 +18,7 @@ Geriye dönük uyumluluk: ``Session(timeout=30)`` (float/int) hâlâ geçerlidir
 from __future__ import annotations
 
 import os
-from typing import Any, Optional, Union
+from typing import Any, Mapping, Optional, Union
 
 _DEFAULT_TIMEOUT = 30.0
 _UNSET = object()
@@ -205,3 +205,29 @@ def resolve_verify(verify: "bool | str | os.PathLike[str]") -> Optional[str]:
             raise FileNotFoundError(f"verify için verilen CA bundle bulunamadı: {path!r}")
         return os.path.abspath(path)
     raise TypeError(f"verify True veya bir PEM dosya yolu olmalı, {type(verify).__name__} verildi.")
+
+
+# requests: REQUESTS_CA_BUNDLE, CURL_CA_BUNDLE; httpx/OpenSSL: SSL_CERT_FILE.
+CA_BUNDLE_ENV_VARS = ("REQUESTS_CA_BUNDLE", "SSL_CERT_FILE", "CURL_CA_BUNDLE")
+
+
+def environ_ca_bundle(environ: "Optional[Mapping[str, str]]" = None) -> Optional[str]:
+    """``trust_env=True`` + ``verify=True`` iken ortamdaki CA bundle yolu (yoksa ``None``).
+
+    Yalnızca HANGİ güven deposunun kullanılacağını değiştirir (``verify="yol"`` ile aynı
+    semantik: yalnızca o PEM dosyası); doğrulama hiçbir zaman kapanmaz. Açık
+    ``verify="yol"`` her zaman önceliklidir (bu fonksiyon o durumda çağrılmaz).
+    Değişken var olmayan bir dosyayı gösteriyorsa sessizce varsayılana dönülmez:
+    değişkenin adıyla :class:`FileNotFoundError`. ``SSL_CERT_DIR`` desteklenmez.
+    """
+    env = os.environ if environ is None else environ
+    for name in CA_BUNDLE_ENV_VARS:
+        path = (env.get(name) or "").strip()
+        if not path:
+            continue
+        if not os.path.isfile(path):
+            raise FileNotFoundError(
+                f"{name} ortam değişkenindeki CA bundle bulunamadı: {path!r} "
+                f"(düzeltin ya da trust_env=False / verify=\"yol\" verin).")
+        return os.path.abspath(path)
+    return None

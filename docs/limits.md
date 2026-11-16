@@ -21,9 +21,9 @@
 
 ## HTTP
 
-- No cleartext HTTP: `http://` URLs are also fetched over TLS (port 80 unless
-  the URL gives one), so servers that only speak plain HTTP cannot be reached.
-  `ws://` WebSockets do use plain TCP.
+- `http://` is plain HTTP/1.1 only: no h2c (cleartext HTTP/2) and no HTTP/3.
+  There is no HSTS, so an `http://` URL is never upgraded to `https://`. (Up to
+  0.6.2, `http://` URLs were fetched over TLS.)
 - HPACK Huffman encoding missing (small HTTP/2 fingerprint deviation).
 - HTTP/2 server push is disabled (`ENABLE_PUSH=0`). PRIORITY frames are not
   sent; the HEADERS priority field follows the profile.
@@ -44,9 +44,10 @@
   the headers have arrived; each read there is bounded by `read`.
 - On PyPy, zstd decoding needs `pip install "fasthttpc[zstd]"` (zstandard has no
   PyPy wheels); without it a zstd-encoded response raises `MissingDecoderError`.
-- `https://` proxies are not supported; proxy environment variables
-  (`HTTP_PROXY`, `HTTPS_PROXY`, `NO_PROXY`) are not read (`trust_env` only
-  controls `.netrc`).
+- `https://` proxies are not supported (an explicit or environment proxy with
+  that scheme raises `ValueError`). Proxy and CA bundle environment variables
+  are read once, when the session is created; `SSL_CERT_DIR` is not supported.
+  `NO_PROXY` CIDR entries only match IP-literal targets (names are not resolved).
 - `AsyncSession(impersonate=None)` uses Python's `ssl` module: HTTP/1.1 only, no
   `cert=`, and `legacy_tls` has no effect there.
 - Three browser families are modelled; profiles age.

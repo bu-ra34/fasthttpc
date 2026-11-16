@@ -380,14 +380,27 @@ drop tickets whose `peer_certificate.not_valid_after_utc` has passed.
   when the origin (scheme, host, port) changes. Explicit and session `auth=` and
   per-request `cookies=` are only applied to the original origin. `.netrc` is
   looked up per host. 301/302/303 drop the body, and `max_redirects` defaults
-  to 10. `http://` URLs are still fetched over TLS in the HTTP paths, so a
-  redirect cannot downgrade to cleartext.
+  to 10. *Update (after 0.6.2):* `http://` URLs are now plain HTTP/1.1 (they
+  used to be fetched over TLS, which made a downgrade impossible). An
+  `https://` to `http://` redirect is followed like in requests, but that hop
+  (and any later one in the chain on `http://`) carries no credential at all:
+  no `Authorization`/`Proxy-Authorization`/`Cookie` header, no `auth=`, no URL
+  `user:pass@` and, unlike requests, no `.netrc` credential. There is no HSTS.
 * Cookies: `Secure` cookies are only sent over https, host-only matching works,
-  and path matching follows RFC 6265 section 5.1.4.
+  and path matching follows RFC 6265 section 5.1.4. *Update (after 0.6.2):* a
+  plain-HTTP response can neither set a `Secure` cookie nor overwrite or
+  delete an existing one with the same name (RFC 6265bis section 5.7).
 * Proxies: the CONNECT response size is capped (64 KiB), only a 2xx answer
   opens the tunnel, 407 is reported, and TLS to the target runs inside the
   tunnel (the proxy never sees plaintext). SOCKS5 field lengths are checked.
-  The proxy password is masked in `repr`.
+  The proxy password is masked in `repr`. *Update (after 0.6.2):* plain
+  `http://` requests go to an HTTP proxy in absolute form (no CONNECT), so that
+  proxy sees them in full. With `trust_env=True` proxies come from
+  `HTTP(S)_PROXY`/`ALL_PROXY`/`NO_PROXY`; uppercase `HTTP_PROXY` is ignored in
+  CGI environments (httpoxy), and unsupported proxy schemes raise instead of
+  being ignored. `REQUESTS_CA_BUNDLE`/`SSL_CERT_FILE`/`CURL_CA_BUNDLE` only
+  select the trust store when `verify=True`; a missing file is an error, and
+  verification is never disabled.
 * Digest auth: the strongest offered algorithm is chosen (SHA-256 over MD5). A
   rejected preemptive credential is not retried. The state is per origin, and
   the cnonce comes from `os.urandom`.
