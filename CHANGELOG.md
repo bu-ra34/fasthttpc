@@ -43,6 +43,42 @@
   `FASTHTTPC_BENCH_SRC` ile eski sürümle karşılaştırıyor.
 - `tests/test_perf_regresyon.py`: zamanlama eşiği olmadan sistem çağrısı,
   record ve frame sayılarını ölçen regresyon testleri.
+### Düzeltmeler
+- **Yeniden kullanılan bağlantıda zaman aşımı:** soket/bağlantı zaman aşımı
+  yalnızca bağlantı kurulurken ayarlandığından, aynı sunucuya giden sonraki
+  istekler (keep-alive HTTP/1.1 ya da açık HTTP/2 bağlantısı) bağlantıyı açan
+  ilk isteğin süresini kullanıyordu: istek düzeyi `timeout=` ve oturumun süresi
+  yok sayılıyor, ilk istek `timeout=None` ise async HTTP/2'de istek sonsuza dek
+  takılabiliyordu. Senkron HTTP/2'de `Timeout.total` hiç uygulanmıyordu;
+  `AsyncSession` `total`'ı hiç uygulamıyordu. Artık her istek kendi etkin
+  `read`/`write`/`total` sürelerini her okuma/yazmada uygular (senkron ve async,
+  HTTP/1.1 ve HTTP/2, akışlı ve akışsız). `total` bağlantı alma/kurmayı da
+  kapsar; `stream=True` iken yanıt başlıklarına kadar geçerlidir.
+- **Senkron akış + istek düzeyi timeout:** HTTP/1.1 `stream=True` yolu soketi
+  oturumun `read` süresine döndürüyordu (`self.timeout`); akış gövdesi artık
+  isteğin `read` süresiyle okunur. HTTP/3 denemesi de istek düzeyi `timeout=`'u
+  kullanır.
+- **Sıkıştırılmış gövde sessizce bozuk dönüyordu:** `br`/`zstd` açıcısı kurulu
+  değilse gövde uyarısız, sıkıştırılmış haliyle dönüyor ve `.json()`
+  `UnicodeDecodeError` veriyordu. Artık kurulacak paketi ve `pip install`
+  komutunu söyleyen `fasthttpc.MissingDecoderError` (`DecodeError` ->
+  `ValueError` alt sınıfı; ikisi de dışa aktarıldı) yükselir; senkron/async,
+  akışlı (`iter_bytes`/`iter_text`/`aiter_*`) ve akışsız yollar aynı davranır
+  (`iter_raw()` ham gövdeyi vermeye devam eder). Gövdesiz yanıtlar hata vermez.
+- **zstd:** akışsız yol tek seferlik `ZstdDecompressor().decompress()` kullandığı
+  için çerçevesinde içerik boyutu olmayan (akış sıkıştırıcısıyla üretilmiş)
+  gövdeleri açamıyor, ham döndürüyordu. Akışsız gövde artık akışlı yolla aynı
+  açıcıdan geçer (virgüllü zincirler dahil).
+
+### Bağımlılıklar
+- `brotli` (PyPy'de `brotlicffi`) ve `zstandard` artık normal bağımlılık
+  (CPython 3.10 - 3.13 için Linux/macOS/Windows wheel'leri var); tarayıcı
+  profillerinin `Accept-Encoding`'i değişmedi. `fasthttpc[brotli]` ve
+  `fasthttpc[zstd]` ekleri uyumluluk için duruyor (PyPy'de zstd için gerekli).
+
+### Dokümantasyon
+- README, README.tr, kurulum, zaman aşımı, akış, sınırlar ve API sayfaları
+  güncellendi.
 
 ## [0.6.2] — 2026-11-16
 
