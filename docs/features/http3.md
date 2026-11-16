@@ -61,7 +61,8 @@ No session tickets are used: there is no resumption and no 0-RTT over HTTP/3.
   `http3="force"` and a proxy the request raises `ConnectionError`.
 - Not used when `cert=` (mTLS) is set: the HTTP/3 path cannot send a client
   certificate. `http3="force"` together with `cert=` raises `ValueError`.
-- `AsyncSession` HTTP/3 needs asyncio; it does not work under trio.
+- `AsyncSession` HTTP/3 needs asyncio. Under trio, `http3=True` falls back to
+  HTTP/2 or HTTP/1.1 and `http3="force"` raises `Http3ConnectError`.
 - Response bodies are read completely before the response is returned, also
   with `stream=True`.
 

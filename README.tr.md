@@ -370,9 +370,10 @@ verir veya belgelenmiştir:
   `wss://` desteklenir. `pre_warm` ısıttığı HTTP/1.1 bağlantılarını keep-alive
   havuzuna, h2 bağlantısını h2 önbelleğine koyar. Senkron `Session` bir HTTP/2
   bağlantısında istekleri sırayla yürütür.
-- **Senkron WebSocket:** `Session.websocket()` daha az test edilmiştir: `ws://`
-  adresi şu an `TypeError` veriyor ve `wss://`'de ALPN profilin tam listesidir
-  (`h2, http/1.1`). WebSocket için `AsyncSession` tercih edin.
+- **Senkron WebSocket:** `Session.websocket()` `ws://` ve `wss://` destekler;
+  `wss://` tarayıcı ClientHello'su ile ALPN yalnızca `http/1.1` önerir, okuma
+  zaman aşımı oturumun `Timeout`'undan alınır. Proxy ve eşzamanlı kullanım
+  için `AsyncSession` daha kapsamlıdır.
 - **AsyncSession proxy:** `proxy=` / `proxies=` senkron `Session` ile aynı
   anlamdadır (HTTP CONNECT + Basic, SOCKS5 / RFC 1929; `https://` proxy yok).
   Tünelin içinde hem `impersonate` (kendi TLS yığını) hem stdlib `ssl`
@@ -387,8 +388,8 @@ verir veya belgelenmiştir:
 - Proxy ortam değişkenleri (`HTTP_PROXY`, `HTTPS_PROXY`, `NO_PROXY`) okunmaz.
 - **Düz HTTP yok:** `http://` adresleri de TLS ile istenir (adreste port yoksa
   80'e), bu yüzden yalnızca düz HTTP konuşan sunuculara ulaşılamaz. `ws://`
-  WebSocket'leri (async) düz TCP kullanır.
-- Async HTTP/2'de sunucu PUSH_PROMISE'i protokol hatasıdır (ENABLE_PUSH=0 ilan
+  WebSocket'leri düz TCP kullanır.
+- HTTP/2'de (senkron ve async) sunucu PUSH_PROMISE'i protokol hatasıdır (ENABLE_PUSH=0 ilan
   edilir); PRIORITY frame'i gönderilmez, gelirse yok sayılır (HEADERS'ın öncelik
   alanı profili izler).
 - **TLS 1.2: varsayılan olarak yalnızca güvenli bir alt küme desteklenir**
@@ -429,7 +430,8 @@ verir veya belgelenmiştir:
   key_share *gönderilmez*; profil supported_groups'ta ilan ediyorsa (Firefox,
   Safari) ve sunucu HRR ile bunları isterse açık hata verilir.
 - **HTTP/3 deneyseldir:** proxy üzerinden ve `cert=` ile kullanılmaz, trio
-  altında çalışmaz, yanıt gövdesini tamamen okur (`stream=True` ile de), QUIC
+  altında kullanılmaz (`http3=True` HTTP/2'ye ya da 1.1'e düşer, `"force"` açık
+  `Http3ConnectError` verir), yanıt gövdesini tamamen okur (`stream=True` ile de), QUIC
   içindeki ClientHello aioquic'indir (tarayıcı parmak izi yok). Yalnızca yerel
   aioquic sunucusuyla test edildi.
 - `Session` thread-safe değildir; thread başına bir tane kullanın.

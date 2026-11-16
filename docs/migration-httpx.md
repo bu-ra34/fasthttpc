@@ -19,4 +19,4 @@ New in fasthttpc: `impersonate=` for browser TLS/HTTP/2 fingerprints, and
 experimental opt-in [HTTP/3](features/http3.md). Differences: `params=` is
 appended to the existing query string (httpx replaces it); `verify`, `cert` and
 `proxies` are session-level only; `http://` URLs are fetched over TLS;
-HTTP/3 does not work under trio; the TLS stack is young and not battle-tested.
+HTTP/3 is not used under trio (it falls back to HTTP/2 or HTTP/1.1); the TLS stack is young and not battle-tested.

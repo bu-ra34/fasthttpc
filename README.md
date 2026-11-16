@@ -178,7 +178,8 @@ privately via GitHub security advisories.
   unless the URL gives a port), so plain-HTTP-only servers cannot be reached.
   `ws://` WebSockets do use plain TCP.
 - HTTP/3 is experimental: it is not used through proxies or together with
-  `cert=`, does not work under trio, buffers the whole response body (also
+  `cert=`, is not used under trio (`http3=True` falls back, `"force"` raises
+  `Http3ConnectError`), buffers the whole response body (also
   with `stream=True`), and never uses resumption or 0-RTT.
 - `https://` proxies (TLS to the proxy) are not supported, and proxy
   environment variables (`HTTPS_PROXY`, ...) are not read.
