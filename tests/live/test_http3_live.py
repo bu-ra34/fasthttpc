@@ -27,7 +27,12 @@ pytestmark = [
     ),
 ]
 
-pytest.importorskip("aioquic")
+if LIVE:
+    # Opted in: a missing HTTP/3 backend is a setup error, not a reason to skip (a
+    # live run that silently skips every test would look green).
+    import aioquic  # noqa: F401
+else:
+    pytest.importorskip("aioquic")
 
 from fasthttpc import AsyncSession, Session  # noqa: E402
 from fasthttpc.http3 import Http3Options  # noqa: E402
@@ -57,6 +62,16 @@ BAD_TLS = (
 
 def _opts(mode: str) -> Http3Options:
     return Http3Options(mode=mode, connect_timeout=H3_CONNECT_TIMEOUT)
+
+
+def _describe(r) -> str:
+    """Context for assertion messages: status, protocol, server and Alt-Svc."""
+    return (f"{r.request.url} -> {r.status_code} {r.http_version} "
+            f"server={r.headers.get('server')!r} alt-svc={r.headers.get('alt-svc')!r}")
+
+
+def _assert_h3_ok(r) -> None:
+    assert r.status_code == 200 and r.http_version == "HTTP/3", _describe(r)
 
 
 def _trace(text: str) -> dict:
@@ -101,14 +116,14 @@ def test_alt_svc_discovery_then_h3(origin):
     """mode=auto: the first request (TCP) learns Alt-Svc, the next one uses HTTP/3."""
     with Session(http3=_opts("auto")) as s:
         r1 = s.get(origin, timeout=TIMEOUT)
-        assert r1.status_code == 200
-        assert r1.http_version in ("HTTP/2", "HTTP/1.1")
+        assert r1.status_code == 200, _describe(r1)
+        assert r1.http_version in ("HTTP/2", "HTTP/1.1"), _describe(r1)
         alt_svc = ", ".join(r1.headers.get_list("alt-svc"))
         assert "h3=" in alt_svc, f"{origin} did not advertise h3 over TCP: {alt_svc!r}"
         assert s._h3.state.altsvc.get((r1.request.url.host, 443)) is not None
 
         r2 = s.get(origin, timeout=TIMEOUT)
-        assert r2.status_code == 200
+        assert r2.status_code == 200, _describe(r2)
         assert r2.http_version == "HTTP/3", (
             f"Alt-Svc advertised h3 but the request fell back to {r2.http_version}; "
             "is outbound UDP/443 blocked? (test_h3_force_* show the exact QUIC error)")
@@ -118,26 +133,26 @@ def test_h3_force_get_body_verified_by_server():
     """Force HTTP/3 and verify the body: Cloudflare echoes the protocol it received."""
     with Session(http3=_opts("force")) as s:
         r = s.get(CF_TRACE, timeout=TIMEOUT)
-    assert r.status_code == 200 and r.http_version == "HTTP/3"
+    _assert_h3_ok(r)
     fields = _trace(r.text)
-    assert fields.get("h") == "cloudflare-quic.com"
+    assert fields.get("h") == "cloudflare-quic.com", r.text
     assert fields.get("http") == "http/3", r.text
-    assert fields.get("tls") == "TLSv1.3"
+    assert fields.get("tls") == "TLSv1.3", r.text
 
 
 def test_h3_force_requests_reuse_connection():
     with Session(http3=_opts("force")) as s:
         responses = [s.get("https://quic.nginx.org/", timeout=TIMEOUT) for _ in range(3)]
-        assert len(s._h3._conns) == 1
+        assert len(s._h3._conns) == 1, f"expected one pooled QUIC connection: {s._h3._conns!r}"
     for r in responses:
-        assert r.status_code == 200 and r.http_version == "HTTP/3"
+        _assert_h3_ok(r)
         assert b"NGINX QUIC" in r.content
 
 
 def test_h3_force_google():
     with Session(http3=_opts("force")) as s:
         r = s.get("https://www.google.com/", timeout=TIMEOUT)
-    assert r.status_code == 200 and r.http_version == "HTTP/3"
+    _assert_h3_ok(r)
     assert b"<html" in r.content.lower()
 
 
@@ -146,7 +161,7 @@ def test_h3_force_async_get_body():
         async with AsyncSession(http3=_opts("force")) as s:
             return await s.get(CF_TRACE, timeout=TIMEOUT)
     r = asyncio.run(go())
-    assert r.status_code == 200 and r.http_version == "HTTP/3"
+    _assert_h3_ok(r)
     assert _trace(r.text).get("http") == "http/3", r.text
 
 
@@ -160,11 +175,11 @@ def test_fallback_to_h2_when_h3_unreachable():
     origin = "https://cloudflare-quic.com/"
     with Session(http3=_opts("auto")) as s:
         r1 = s.get(origin, timeout=TIMEOUT)
-        assert r1.http_version == "HTTP/2"
+        assert r1.http_version == "HTTP/2", _describe(r1)
         # Replace the discovered entry with an unreachable alternative (UDP port 1).
         s._h3.state.altsvc.update(("cloudflare-quic.com", 443), ['h3=":1"; ma=60'])
         r2 = s.get(origin, timeout=TIMEOUT)
-        assert r2.status_code == 200 and r2.http_version == "HTTP/2"
+        assert r2.status_code == 200 and r2.http_version == "HTTP/2", _describe(r2)
         assert b"QUIC" in r2.content
         # h3 is now disabled for this origin; the next request does not retry QUIC.
         assert s._h3.state.target_for("cloudflare-quic.com", 443) is None

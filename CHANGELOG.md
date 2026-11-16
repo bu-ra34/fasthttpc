@@ -2,6 +2,16 @@
 
 ## [Unreleased]
 
+### Testler / CI
+- Canlı HTTP/3 testleri (`tests/live`, `FASTHTTPC_LIVE=1`) için ayrı bir GitHub
+  Actions iş akışı eklendi (`.github/workflows/live.yml`, "Live tests"): yalnızca
+  elle (Actions → Live tests → Run workflow) ve haftada bir çalışır, push/PR'da
+  çalışmaz. Ubuntu'da Python 3.10 + aioquic 1.3 (GOAWAY ara katmanı) ve Python
+  3.13 + güncel aioquic, macOS ve Windows'ta Python 3.12. Test başına 120 sn
+  sınırı var, yeniden deneme yok. `FASTHTTPC_LIVE=1` iken aioquic eksikse modül
+  artık sessizce atlanmıyor, hata veriyor; doğrulama mesajları durum kodu,
+  protokol ve `Alt-Svc` bilgisini gösteriyor. Ayrıntılar `docs/testing.md`'de.
+
 ## [0.6.2] — 2026-11-16
 
 ### Düzeltmeler
