@@ -38,7 +38,12 @@
 ## Client
 
 - `Session` is not thread-safe.
-- `Timeout.write` is not enforced separately on the sync side.
+- `Timeout.write` is not enforced separately on the sync side (sends use the
+  request's `read` socket timeout, capped by the remaining `total`).
+- `Timeout.total` does not bound reading a streamed (`stream=True`) body after
+  the headers have arrived; each read there is bounded by `read`.
+- On PyPy, zstd decoding needs `pip install "fasthttpc[zstd]"` (zstandard has no
+  PyPy wheels); without it a zstd-encoded response raises `MissingDecoderError`.
 - `https://` proxies are not supported; proxy environment variables
   (`HTTP_PROXY`, `HTTPS_PROXY`, `NO_PROXY`) are not read (`trust_env` only
   controls `.netrc`).

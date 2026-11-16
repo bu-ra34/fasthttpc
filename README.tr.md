@@ -5,10 +5,11 @@
 Pure-Python HTTP istemcisi: kendi TLS 1.3 / TLS 1.2 yığını, tarayıcı TLS ve
 HTTP/2 parmak izi taklidi (Chrome, Firefox, Safari), HTTP/2 multiplexing,
 senkron ve async API (asyncio ya da anyio üzerinden trio). Deneysel HTTP/3
-isteğe bağlı bir ek paket olarak gelir. Kendine ait C eklentisi yoktur: tek
-derlenmiş çalışma zamanı bağımlılığı primitifler (AEAD, X25519, ML-KEM,
-sertifika ayrıştırma) için `cryptography`'dir; isteğe bağlı ekler (`http3`,
-`brotli`, `zstd`) kendi derlenmiş paketlerini getirir.
+isteğe bağlı bir ek paket olarak gelir. Kendine ait C eklentisi yoktur:
+derlenmiş çalışma zamanı bağımlılıkları primitifler (AEAD, X25519, ML-KEM,
+sertifika ayrıştırma) için `cryptography` ile `brotli` / `zstandard` içerik
+kod çözücüleridir (hepsi hazır wheel ile gelir); isteğe bağlı `http3` eki
+aioquic'i getirir.
 
 > **Durum: deneysel (alpha).** TLS yığını sıfırdan yazılmıştır. v0.2.0 ile sunucu
 > kimlik doğrulaması tam hâle geldi (aşağıya bakın). Kod kendi içimizde bir
@@ -19,14 +20,22 @@ sertifika ayrıştırma) için `cryptography`'dir; isteğe bağlı ekler (`http3
 ## Kurulum
 
 ```bash
-pip install fasthttpc
-pip install "fasthttpc[brotli,zstd]"   # isteğe bağlı içerik kod çözücüleri
+pip install fasthttpc                  # brotli ve zstd kod çözücüleri dahil
 pip install "fasthttpc[trio]"          # AsyncSession'ı trio altında çalıştırmak için (anyio + trio)
 pip install "fasthttpc[http3]"         # deneysel HTTP/3 (aioquic)
 ```
 
 Python 3.10+. CI testleri Linux'ta Python 3.10 - 3.13, Windows ve macOS'ta
 Python 3.12 ile çalıştırır.
+
+Tarayıcı profilleri `Accept-Encoding`'de `br` (Chrome/Firefox ayrıca `zstd`)
+ilan ettiğinden `brotli` ve `zstandard` normal bağımlılıktır (PyPy'de
+`brotlicffi`; orada zstd için `pip install "fasthttpc[zstd]"`). Eski
+`fasthttpc[brotli]` / `fasthttpc[zstd]` ekleri çalışmaya devam eder. Bir kod
+çözücü yine de eksikse, o `Content-Encoding` ile gelen yanıt sıkıştırılmış
+baytları sessizce döndürmez; kurulacak paketi ve `pip install` komutunu söyleyen
+`fasthttpc.MissingDecoderError` (`DecodeError` -> `ValueError` alt sınıfı)
+yükselir. Ham gövde gerekiyorsa `stream=True` + `iter_raw()` kullanılabilir.
 
 Geliştirme için:
 
@@ -201,7 +210,12 @@ with Session(
 | `read` | Sunucudan veri bekleme |
 | `write` | Veri gönderme (şimdilik senkron tarafta `read` ile aynı soket zaman aşımını paylaşır) |
 | `pool` | Havuzdan boş bağlantı bekleme (diğer alanlar gibi ilk argümanı alır; yine de `None` ise `Session` `connect` süresini kullanır, `AsyncSession` sınırsız bekler) |
-| `total` | Gövde dahil tüm isteğin süre sınırı (varsayılan `None`, sınırsız) |
+| `total` | Bağlantı alma/kurma + yanıt (gövde dahil) için istek başına toplam süre sınırı (varsayılan `None`, sınırsız); `read`'in aksine damla damla veri yollayan sunucuyu da keser. `stream=True` iken yanıt başlıklarına kadar geçerlidir; akış gövdesinin her okuması `read` ile sınırlıdır |
+
+İstek düzeyi `timeout=` (sayı, `(connect, read)` ya da `Timeout`) o istek için
+oturumunkini geçersiz kılar. Zaman aşımları bağlantıya değil isteğe aittir: açık
+kalan keep-alive HTTP/1.1 ya da HTTP/2 bağlantısından giden istekler de kendi
+`read`/`write`/`total` sürelerine uyar (senkron ve async, akışlı ve akışsız).
 
 Geriye dönük uyumluluk: `Session(timeout=30)` ve `Timeout(connect=5, read=30)`
 eskisi gibi çalışır; `from fasthttpc.timeout import Timeout` aynı sınıftır.
@@ -438,6 +452,8 @@ verir veya belgelenmiştir:
 - **`verify=False` yok** (bilinçli; yukarıya bakın).
 - `Timeout.write` senkron tarafta ayrı uygulanmıyor (soket `read` zaman aşımını
   kullanır); `AsyncSession` `write`'ı drain süresine uygular.
+- `Timeout.total`, başlıklar geldikten sonra akış (`stream=True`) gövdesinin
+  okunmasını sınırlamaz (oradaki her okuma `read` ile sınırlıdır).
 - İç güvenlik incelemesinin açık bulguları (ör. açılmış gövde boyutuna sınır
   yok, çerezlerde Public Suffix List yok) [docs/security-audit.md](docs/security-audit.md)'de.
 

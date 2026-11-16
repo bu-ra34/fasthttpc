@@ -33,6 +33,13 @@ with Session() as s:
 | `r.raw` | file-like reader of the raw body |
 | `r.read()` | the rest of the body |
 
+Decoding (gzip, deflate, br, zstd and chains such as `gzip, br`) behaves the
+same as for non-streamed responses: if the decoder for a `Content-Encoding` is
+not installed, the decoded iterators raise `fasthttpc.MissingDecoderError`
+instead of yielding compressed bytes; `iter_raw()` is unaffected. Each read of a
+streamed body is bounded by the request's own `read` timeout (also on a reused
+keep-alive or HTTP/2 connection).
+
 ## Async
 
 ```python

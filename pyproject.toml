@@ -34,20 +34,31 @@ classifiers = [
     "Topic :: Security :: Cryptography",
     "Typing :: Typed",
 ]
+# brotli/zstandard: browser profiles advertise "br"/"zstd" in Accept-Encoding, so
+# the decoders are regular dependencies (both ship wheels for CPython 3.10-3.13 on
+# Linux/macOS/Windows). PyPy: brotlicffi (has PyPy wheels); zstandard has no PyPy
+# wheels, so there it stays opt-in via the "zstd" extra.
 dependencies = [
     "cryptography>=41.0",
     "certifi>=2023.7.22",
+    "brotli>=1.1; platform_python_implementation == 'CPython'",
+    "brotlicffi>=1.1; platform_python_implementation != 'CPython'",
+    "zstandard>=0.23; platform_python_implementation == 'CPython'",
 ]
 
 [project.optional-dependencies]
-brotli = ["brotli>=1.0"]
-zstd   = ["zstandard>=0.21"]
+# Kept for compatibility (decoders are now installed by default on CPython).
+brotli = ["brotli>=1.1; platform_python_implementation == 'CPython'",
+          "brotlicffi>=1.1; platform_python_implementation != 'CPython'"]
+zstd   = ["zstandard>=0.23"]
 # http3: experimental HTTP/3 backend (aioquic). trio: AsyncSession under trio.
 http3  = ["aioquic>=1.3"]
 trio   = ["anyio>=4.0", "trio>=0.22"]
 docs   = ["mkdocs>=1.6", "mkdocs-material>=9.5", "mkdocstrings[python]>=0.26"]
-dev    = ["pytest>=7.0", "h2>=4", "tlslite-ng>=0.8", "brotli>=1.0", "aioquic>=1.3", "anyio>=4.0", "trio>=0.22", "requests", "httpx", "ruff", "mypy>=1.10", "build", "twine"]
-all    = ["brotli>=1.0", "zstandard>=0.21", "aioquic>=1.3", "anyio>=4.0", "trio>=0.22"]
+dev    = ["pytest>=7.0", "h2>=4", "tlslite-ng>=0.8", "brotli>=1.1", "zstandard>=0.23", "aioquic>=1.3", "anyio>=4.0", "trio>=0.22", "requests", "httpx", "ruff", "mypy>=1.10", "build", "twine"]
+all    = ["brotli>=1.1; platform_python_implementation == 'CPython'",
+          "brotlicffi>=1.1; platform_python_implementation != 'CPython'",
+          "zstandard>=0.23", "aioquic>=1.3", "anyio>=4.0", "trio>=0.22"]
 
 [project.urls]
 Homepage      = "https://github.com/bu-ra34/fasthttpc"

@@ -30,7 +30,7 @@ import collections
 import struct
 import time
 from dataclasses import dataclass, field
-from typing import Callable, Optional
+from typing import Any, Callable, Optional
 
 from .. import _backend as B
 from .._log import get_logger
@@ -69,6 +69,12 @@ _ERR_NAMES = {
     9: "COMPRESSION_ERROR", 10: "CONNECT_ERROR", 11: "ENHANCE_YOUR_CALM",
     12: "INADEQUATE_SECURITY", 13: "HTTP_1_1_REQUIRED",
 }
+
+
+#: request()/request_stream() zaman aşımı verilmezse bağlantının varsayılanı kullanılır.
+#: Session her istekte KENDİ etkin süresini geçirir: bağlantı, onu açan ilk isteğin
+#: süresiyle (ör. ``timeout=None``) yeniden kullanılan isteklere taşınmamalı.
+_CONN_DEFAULT: Any = object()
 
 
 class H2StreamRefused(Http2ConnectionError):
@@ -138,12 +144,18 @@ class _ReaderWriter:
 class H2StreamHandle:
     """``request_stream`` dönüşü: başlıklar hazır; ``read_chunk()`` ile gövde (``b""`` = bitti)."""
 
-    def __init__(self, conn: "AsyncHttp2Connection", st: _Stream):
+    def __init__(self, conn: "AsyncHttp2Connection", st: _Stream,
+                 read_timeout: Any = _CONN_DEFAULT, write_timeout: Any = _CONN_DEFAULT):
         self._c, self._st = conn, st
         self.status = 0
         self.headers: "list[tuple[str, str]]" = []
         self.first_byte_time = 0.0
         self._closed = False
+        # Gövde okumaları akışı açan İSTEĞİN süreleriyle sınırlıdır (bağlantınınkiyle değil).
+        self.read_timeout: Optional[float] = (
+            conn.read_timeout if read_timeout is _CONN_DEFAULT else read_timeout)
+        self.write_timeout: Optional[float] = (
+            conn.write_timeout if write_timeout is _CONN_DEFAULT else write_timeout)
 
     async def read_chunk(self) -> bytes:
         st, c = self._st, self._c
@@ -153,7 +165,7 @@ class H2StreamHandle:
                 if raw_len and not st.fut.done() and not c._closed:
                     try:
                         c._write(_frame(FrameType.WINDOW_UPDATE, 0, st.id, struct.pack("!I", raw_len)))
-                        await c._drain()
+                        await c._drain(self.write_timeout)
                     except (OSError, Http2ConnectionError):
                         pass        # bağlantı koptu: sıradaki okuma hatayı bildirir
                 if data:
@@ -168,7 +180,7 @@ class H2StreamHandle:
             fut = B.new_future()
             st.waiter = fut
             try:
-                await B.wait_for(fut, c.read_timeout)
+                await B.wait_for(fut, self.read_timeout)
             except asyncio.TimeoutError:
                 st.waiter = None
                 if st.activity:
@@ -176,7 +188,7 @@ class H2StreamHandle:
                     continue
                 self.close_nowait()
                 raise asyncio.TimeoutError(
-                    f"HTTP/2 gövdesi {c.read_timeout} sn içinde gelmedi (stream {st.id}).") from None
+                    f"HTTP/2 gövdesi {self.read_timeout} sn içinde gelmedi (stream {st.id}).") from None
 
     def close_nowait(self) -> None:
         """Bitmemiş stream'i RST_STREAM(CANCEL) ile iptal eder; bağlantı yaşar."""
@@ -296,12 +308,13 @@ class AsyncHttp2Connection:
         self._task = B.spawn(self._read_loop(), name="fasthttpc-h2-reader")
 
     # ------------------------------------------------------- düşük seviye
-    async def _drain(self) -> None:
+    async def _drain(self, timeout: Any = _CONN_DEFAULT) -> None:
+        wt = self.write_timeout if timeout is _CONN_DEFAULT else timeout
         async with self._drain_lock:
-            if self.write_timeout is None:
+            if wt is None:
                 await self._s.drain()
             else:
-                await B.wait_for(self._s.drain(), self.write_timeout)
+                await B.wait_for(self._s.drain(), wt)
 
     def _write(self, data: bytes) -> None:
         if self._closed:
@@ -632,7 +645,8 @@ class AsyncHttp2Connection:
         # Tek write: HEADERS+CONTINUATION arasına başka frame giremez.
         self._write(bytes(out))
 
-    async def _send_body(self, st: _Stream, body: bytes) -> None:
+    async def _send_body(self, st: _Stream, body: bytes, write_timeout: Any = _CONN_DEFAULT) -> None:
+        wt = self.write_timeout if write_timeout is _CONN_DEFAULT else write_timeout
         off = 0
         total = len(body)
         while off < total:
@@ -642,7 +656,7 @@ class AsyncHttp2Connection:
                 raise Http2ConnectionError("Gövde gönderilirken bağlantı kapandı.")
             avail = min(self._conn_send, st.send_window, self._peer_max_frame)
             if avail <= 0:
-                await self._wait_change(self.write_timeout)
+                await self._wait_change(wt)
                 continue
             n = min(avail, total - off)
             last = off + n >= total
@@ -651,7 +665,11 @@ class AsyncHttp2Connection:
             self._conn_send -= n
             st.send_window -= n
             off += n
-            await self._drain()
+            await self._drain(wt)
+
+    def _timeouts(self, read_timeout: Any, write_timeout: Any) -> "tuple[Optional[float], Optional[float]]":
+        return (self.read_timeout if read_timeout is _CONN_DEFAULT else read_timeout,
+                self.write_timeout if write_timeout is _CONN_DEFAULT else write_timeout)
 
     async def request(
         self,
@@ -661,15 +679,22 @@ class AsyncHttp2Connection:
         headers: "list[tuple[str, str]]",
         body: bytes = b"",
         scheme: str = "https",
+        *,
+        read_timeout: Any = _CONN_DEFAULT,
+        write_timeout: Any = _CONN_DEFAULT,
     ) -> H2Response:
-        """Tek bir isteği gönderir ve yanıtı bekler. Eşzamanlı çağrılabilir."""
+        """Tek bir isteği gönderir ve yanıtı bekler. Eşzamanlı çağrılabilir.
+
+        ``read_timeout``/``write_timeout`` bu isteğin süreleridir (verilmezse
+        bağlantınınkiler); bağlantıyı açan isteğin süresi sonrakilere taşınmaz."""
+        rt, wt = self._timeouts(read_timeout, write_timeout)
         # Eşzamanlı stream sınırı (sunucunun MAX_CONCURRENT_STREAMS'i)
         while True:
             if not self.usable:
                 raise H2StreamRefused("HTTP/2 bağlantısı yeni stream kabul etmiyor.")
             if len(self._streams) < self._max_streams:
                 break
-            await self._wait_change(self.write_timeout)
+            await self._wait_change(wt)
 
         # Pseudo-header ve başlık sırası: senkron taraftakiyle AYNI fonksiyon.
         full = h2_request_headers(self._h2, method, authority, scheme, path, headers)
@@ -684,18 +709,18 @@ class AsyncHttp2Connection:
             self._streams.pop(st.id, None)
             raise
         try:
-            await self._drain()
+            await self._drain(wt)
             if body:
-                await self._send_body(st, body)
+                await self._send_body(st, body, wt)
             while True:
-                done = await B.wait_future(st.fut, self.read_timeout)
+                done = await B.wait_future(st.fut, rt)
                 if done:
                     return st.fut.result()
                 if st.activity:          # son aralıkta veri geldi: hareketsizlik süresi sıfırlanır
                     st.activity = False
                     continue
                 raise asyncio.TimeoutError(
-                    f"HTTP/2 yanıtı {self.read_timeout} sn içinde gelmedi (stream {st.id}).")
+                    f"HTTP/2 yanıtı {rt} sn içinde gelmedi (stream {st.id}).")
         finally:
             if not st.fut.done():
                 # iptal / zaman aşımı / hata: stream'i bırak ve sunucuya bildir
@@ -714,37 +739,42 @@ class AsyncHttp2Connection:
         headers: "list[tuple[str, str]]",
         body: bytes = b"",
         scheme: str = "https",
+        *,
+        read_timeout: Any = _CONN_DEFAULT,
+        write_timeout: Any = _CONN_DEFAULT,
     ) -> "H2StreamHandle":
         """İsteği gönderir, yanıt BAŞLIKLARI gelince döner; gövde
-        :meth:`H2StreamHandle.read_chunk` ile parça parça okunur.
+        :meth:`H2StreamHandle.read_chunk` ile parça parça okunur (bu isteğin
+        ``read_timeout``'u ile; verilmezse bağlantınınki).
 
         Geri basınç: stream WINDOW_UPDATE'i tüketici okudukça gönderilir
         (bağlantı penceresi hemen açılır ki aynı bağlantıdaki diğer stream'ler
         aç kalmasın); okunmayan veri ilan edilen stream penceresiyle sınırlıdır."""
+        rt, wt = self._timeouts(read_timeout, write_timeout)
         while True:
             if not self.usable:
                 raise H2StreamRefused("HTTP/2 bağlantısı yeni stream kabul etmiyor.")
             if len(self._streams) < self._max_streams:
                 break
-            await self._wait_change(self.write_timeout)
+            await self._wait_change(wt)
 
         full = h2_request_headers(self._h2, method, authority, scheme, path, headers)
         st = self._alloc_stream()
         st.streaming = True
         st.hdr_fut = B.new_future()
         self.last_used = time.perf_counter()
-        handle = H2StreamHandle(self, st)
+        handle = H2StreamHandle(self, st, rt, wt)
         try:
             self._send_headers(st.id, full, end_stream=not body)
         except BaseException:
             self._streams.pop(st.id, None)
             raise
         try:
-            await self._drain()
+            await self._drain(wt)
             if body:
-                await self._send_body(st, body)
+                await self._send_body(st, body, wt)
             while True:
-                done = await B.wait_future(st.hdr_fut, self.read_timeout)
+                done = await B.wait_future(st.hdr_fut, rt)
                 if done:
                     st.hdr_fut.result()
                     break
@@ -752,7 +782,7 @@ class AsyncHttp2Connection:
                     st.activity = False
                     continue
                 raise asyncio.TimeoutError(
-                    f"HTTP/2 yanıtı {self.read_timeout} sn içinde gelmedi (stream {st.id}).")
+                    f"HTTP/2 yanıtı {rt} sn içinde gelmedi (stream {st.id}).")
         except BaseException:
             handle.close_nowait()
             raise

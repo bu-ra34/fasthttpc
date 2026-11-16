@@ -11,22 +11,32 @@ from ..models.headers import Headers
 from ..models.response import Response
 from ..buffer import ZeroCopyReader
 from .._log import get_logger
+from ..streaming import _DECODER_PACKAGES, MissingDecoderError
 
 logger = get_logger("http1")
 
-                              
+# brotli ve zstandard varsayılan bağımlılıklardır (PyPy'de brotli yerine brotlicffi);
+# yine de kurulu değilse sıkıştırılmış gövde sessizce ham dönmez: MissingDecoderError.
 try:
     import brotli as _brotli
     _BROTLI = True
 except ImportError:
-    _BROTLI = False
+    try:
+        import brotlicffi as _brotli
+        _BROTLI = True
+    except ImportError:
+        _BROTLI = False
 
 try:
     import zstandard as _zstd
     _ZSTD = True
-    _zstd_dctx = _zstd.ZstdDecompressor()
 except ImportError:
     _ZSTD = False
+
+
+def _missing(enc: str) -> MissingDecoderError:
+    _mods, package, extra = _DECODER_PACKAGES[enc]
+    return MissingDecoderError(enc, package, extra)
 
 # Bozuk sıkıştırılmış veride beklenen hata tipleri (gerisi yukarı yükselir).
 _DECOMPRESS_ERRORS: tuple = (zlib.error, ValueError, EOFError)
@@ -140,28 +150,25 @@ class HTTP1Parser:
 
         if "br" in encoding:
             if not _BROTLI:
-                                                                         
-                                                                             
+                raise _missing("br")      # ham (sıkıştırılmış) gövde sessizce dönmez
+            try:
+                return _brotli.decompress(data)
+            except _DECOMPRESS_ERRORS as e:
+                logger.warning("Brotli açılamadı, ham gövde döndürülüyor: %s", e)
                 return data
-            if _BROTLI:
-                try:
-                    return _brotli.decompress(data)
-                except _DECOMPRESS_ERRORS as e:
-                    logger.warning("Brotli açılamadı, ham gövde döndürülüyor: %s", e)
-                    return data
-                                                      
-            return data
 
         if "zstd" in encoding:
             if not _ZSTD:
+                raise _missing("zstd")
+            try:
+                # decompressobj: çerçeve başlığında içerik boyutu olmayan (akış
+                # sıkıştırıcısıyla üretilmiş) gövdeler de açılır; tek seferlik
+                # ZstdDecompressor().decompress() onları reddediyordu.
+                out: bytes = _zstd.ZstdDecompressor().decompressobj().decompress(data)
+                return out
+            except _DECOMPRESS_ERRORS as e:
+                logger.warning("Zstd açılamadı, ham gövde döndürülüyor: %s", e)
                 return data
-            if _ZSTD:
-                try:
-                    return _zstd_dctx.decompress(data)
-                except _DECOMPRESS_ERRORS as e:
-                    logger.warning("Zstd açılamadı, ham gövde döndürülüyor: %s", e)
-                    return data
-            return data
 
         return data
 

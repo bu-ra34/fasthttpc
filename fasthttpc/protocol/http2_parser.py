@@ -11,6 +11,7 @@ from __future__ import annotations
 import struct
 import zlib
 import socket
+import time
 import threading
 from enum import IntEnum
 from typing import Iterator, Optional, Generator
@@ -913,6 +914,10 @@ class Http2Connection:
         self._pending_frames: list[HTTP2Frame] = []
         self._lock = threading.Lock()
         self._foreign_hblock = bytearray()
+        # İstek başına zaman aşımı (Session._arm_timeouts her istekte ayarlar):
+        # okuma süresi ve Timeout.total'ın bitiş anı (perf_counter; None = yok).
+        self.read_timeout: Optional[float] = None
+        self.deadline: Optional[float] = None
         self.debug = debug or __import__("os").environ.get("FASTHTTPC_H2_DEBUG") == "1"
 
     def _dbg(self, msg: str) -> None:
@@ -944,12 +949,26 @@ class Http2Connection:
         except OSError as e:
             self._dbg(f"GOAWAY gönderilemedi: {e}")
 
+    def _recv_record(self) -> tuple[bytes, int]:
+        """``sock.recv_record``; istek başına toplam süre sınırı (``deadline``,
+        ``time.perf_counter`` cinsinden; Session ayarlar) varsa soketin zaman
+        aşımı her okumadan önce kalan süreye kısaltılır."""
+        dl = self.deadline
+        if dl is not None:
+            left = dl - time.perf_counter()
+            if left <= 0:
+                raise TimeoutError("İstek toplam süre sınırını (Timeout.total) aştı.")
+            rt = self.read_timeout
+            self.sock.raw_socket.settimeout(left if rt is None else min(rt, left))
+        rec: tuple[bytes, int] = self.sock.recv_record(skip_post_handshake=True)
+        return rec
+
     def _read_frame(self) -> HTTP2Frame:
         # Gövde gönderirken pencere beklerken okunmuş ama işlenmemiş frame'ler
         if self._pending_frames:
             return self._pending_frames.pop(0)
         while len(self._recv_buf) < HTTP2Frame.HEADER_SIZE:
-            msg, m_type = self.sock.recv_record(skip_post_handshake=True)
+            msg, m_type = self._recv_record()
             if m_type != 23:
                 continue
             if not msg:
@@ -958,7 +977,7 @@ class Http2Connection:
 
         length = struct.unpack("!I", b"\x00" + bytes(self._recv_buf[0:3]))[0]
         while len(self._recv_buf) < HTTP2Frame.HEADER_SIZE + length:
-            msg, m_type = self.sock.recv_record(skip_post_handshake=True)
+            msg, m_type = self._recv_record()
             if m_type != 23:
                 continue
             if not msg:
@@ -1714,7 +1733,10 @@ class StreamingDecompressor:
             self._obj = brotli.Decompressor()
         elif "zstd" in self._enc and _ZSTD:
             self._obj = _zstd.ZstdDecompressor().stream_reader(b"")
-                                    
+        elif "br" in self._enc or "zstd" in self._enc:
+            # Açıcı kurulu değil: sıkıştırılmış veri sessizce ham geçirilmez.
+            from ..streaming import _decoder_module
+            _decoder_module("br" if "br" in self._enc else "zstd")   # MissingDecoderError
 
     def decompress(self, chunk: bytes) -> bytes:
         if not self._obj or not chunk:

@@ -39,6 +39,7 @@ from .retry         import Retry
 from .transport.mock import MockTransport, BaseTransport
 from .multipart     import encode_multipart
 from .models.response import Response, HTTPStatusError
+from .streaming     import DecodeError, MissingDecoderError
 from .models.request  import Request
 from .models.headers  import Headers
 from .models.urls     import URL
@@ -76,6 +77,8 @@ __all__ = [
     "encode_multipart",
     "Response",
     "HTTPStatusError",
+    "DecodeError",
+    "MissingDecoderError",
     "Request",
     "Headers",
     "URL",
