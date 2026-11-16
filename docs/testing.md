@@ -49,8 +49,25 @@ does **not** intercept TLS. The tests use `cloudflare-quic.com`, `quic.nginx.org
 | `test_h3_rejects_chain_from_untrusted_ca` | the QUIC handshake rejects a real server whose root is not trusted (`verify=` set to an unrelated CA) |
 | `test_auto_mode_with_untrusted_ca_never_fetches` | in auto mode with an unrelated CA the request fails with a certificate error instead of falling back to an unverified fetch |
 
-These tests are not run in CI. So far HTTP/3 has only been verified against
-the local aioquic server of the offline suite.
+These tests never run on push or pull requests. They run in the separate
+**Live tests** GitHub Actions workflow (`.github/workflows/live.yml`), on
+GitHub-hosted runners, which allow outbound UDP/443 and do not intercept TLS:
+
+- **When:** manually, and automatically once a week (Monday 05:17 UTC). A
+  failure there never blocks CI or a merge.
+- **Run it by hand:** on GitHub open the **Actions** tab → **Live tests** →
+  **Run workflow** (choose the branch) → **Run workflow**. Each job's log shows
+  the installed aioquic version and the result of every test (`-rA`).
+- **Matrix:** Ubuntu with Python 3.10 and aioquic 1.3 (oldest supported
+  version, uses fasthttpc's GOAWAY shim), Ubuntu with Python 3.13 and the latest
+  aioquic (native GOAWAY), and macOS and Windows with Python 3.12 and the latest
+  aioquic. The package is installed with the `http3`, `brotli` and `zstd` extras.
+- **Limits:** each test has a 120 s hard limit (`pytest-timeout`) and each job
+  15 minutes. Tests are not retried: a retry could hide a real handshake or
+  fallback bug. If a third-party server is down, re-run the failed job.
+
+With `FASTHTTPC_LIVE=1` a missing aioquic is an import error, not a skip, so a
+live run cannot pass by skipping everything.
 
 How to read failures:
 
