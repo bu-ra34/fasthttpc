@@ -54,7 +54,86 @@ def _random_grease() -> int:
 #        Chrome 133'te; Chrome 131 ESKİ kod noktası 17513'ü kullanır).
 #  [SW]  blog.send.win Akamai h2 yazısı (Chrome/Firefox/Safari h2 dizeleri,
 #        JA4 önekleri t13d1516h2 / t13d1715h2 / t13d2014h2).
+#
+# 2026-11 profilleri (chrome_158 / firefox_160 / safari_27) için kaynaklar:
+#  [CR]  Chromium 158.0.8127.37 kaynağı: net/socket/ssl_client_socket_impl.cc
+#        (kVerifyPrefs = ML-DSA-44/65/87 + 8 klasik şema; SSL_set_permute_
+#        extensions; trust anchor IDs; ECH GREASE), net/base/features.cc
+#        (kUseNewAlpsCodepointHttp2 ve kTLSTrustAnchorIDs varsayılan AÇIK,
+#        kAddTLSServerHandshakePadding KAPALI), net/ssl/ssl_config_service.cc,
+#        net/data/ssl/chrome_root_store/root_store.textproto (28 trust anchor
+#        ID'si), components/embedder_support/user_agent_utils.cc (sec-ch-ua
+#        GREASE marka algoritması).
+#  [BS]  BoringSSL ea9f3a34 (Chromium 158 DEPS): include/openssl/tls1.h
+#        (TLSEXT_TYPE_trust_anchors 0xca34 = 51764, application_settings 17613),
+#        ssl/extensions.cc (signature_algorithms başına GREASE şeması,
+#        trust_anchors gövdesi), ssl/encrypted_client_hello.cc (ECH GREASE
+#        uzunluğu 32*{4..7}+16, AEAD 1 veya 3).
+#  [CAP] Bu depoda gerçek Google Chrome for Testing 153.0.8010.12 ile yerel
+#        yakalama (--disable-field-trial-config): ClientHello (GREASE sigalg +
+#        ML-DSA, 17613, 51764 / 186 bayt, X25519MLKEM768 key_share) ve h2
+#        SETTINGS/WINDOW_UPDATE/HEADERS (Chrome 131 ile aynı).
+#  [FF]  Firefox FIREFOX_160_0_RELEASE kaynağı (NSS 3.132):
+#        security/manager/ssl/nsNSSIOLayer.cpp (gruplar, FFDHE yalnızca DHE
+#        suite'leri açıksa; 3 key_share), nsNSSComponent.cpp + StaticPrefList
+#        (ECDSA-CBC ve DHE suite'leri kapalı; security.tls.enable_mldsa=false
+#        -> ML-DSA ClientHello'ya GİRMEZ), EnabledSignatureSchemes.h,
+#        netwerk/protocol/http/nsHttpHandler.cpp (belge Accept değeri),
+#        security/nss/lib/ssl/tls13ech.c (ECH GREASE AEAD 1/3, yük 32k+16).
+#  [CI2] lexiforest/curl-impersonate 5b1c3542 (2026-10-29): patches/curl.patch
+#        hedefleri chrome152 / firefox155 / safari270 ve tests/signatures/
+#        (chrome_150.0.7871.127_macOS, safari_26.0.1_macOS gerçek yakalamaları;
+#        safari270, firefox155 kısmi imzaları).
+#  [WK]  webkit.org "WebKit Features for Safari 27.2" (2026-10-26): güncel
+#        kararlı Safari 27.2.
 # ---------------------------------------------------------------------------
+
+
+def _tai(dotted: str) -> bytes:
+    """Göreli OID (``1.3.6.1.4.1`` altı, noktalı) -> TrustAnchorID baytları (base-128)."""
+    out = b""
+    for arc in (int(a) for a in dotted.split(".")):
+        enc = [arc & 0x7F]
+        arc >>= 7
+        while arc:
+            enc.append(0x80 | (arc & 0x7F))
+            arc >>= 7
+        out += bytes(reversed(enc))
+    return out
+
+
+# Chrome Root Store'daki 28 trust anchor ID'si [CR] root_store.textproto
+# (Chromium 158 ile 153 arasında küme AYNI; [CAP] yakalaması bu kümeyi taşır).
+# Chrome sırayı süreç başına değiştirir ([CAP]: farklı süreçlerde farklı sıra),
+# bu yüzden sıra süreç başına bir kez karıştırılır (tls_crafter).
+CHROME_TRUST_ANCHOR_IDS = [_tai(o) for o in (
+    "52580.200109.1.10", "52580.200109.1.9", "11129.9.1", "11129.9.4", "44947.2.1",
+    "52580.200109.1.8", "52580.200109.1.7", "44947.2.6", "52580.200109.1.19",
+    "52580.200109.1.18", "52580.200109.1.11", "52580.200109.1.12", "52580.200109.1.13",
+    "11129.9.5", "11129.9.6", "11129.9.7", "11129.9.8", "11129.9.10", "11129.9.11",
+    "11129.9.12", "11129.9.13", "11129.9.15", "44947.2.13", "44947.2.14", "44947.2.15",
+    "44947.2.18", "44947.2.19", "44947.2.20",
+)]
+
+
+def chrome_sec_ch_ua(major: int, brand: "str | None" = "Google Chrome") -> str:
+    """Chromium'un sec-ch-ua GREASE marka algoritması [CR] user_agent_utils.cc
+    (GetGreasedUserAgentBrandVersion + GetRandomOrder/ShuffleBrandList, tohum = ana
+    sürüm). ``brand=None``: markasız Chromium (ör. Chrome for Testing) — 2 marka.
+    Doğrulama: (152, "Google Chrome") -> curl-impersonate chrome152 değeri;
+    (153, None) -> [CAP] yakalaması."""
+    chars = [" ", "(", ":", "-", ".", "/", ")", ";", "=", "?", "_"]
+    grease = (f"Not{chars[major % 11]}A{chars[(major + 1) % 11]}Brand",
+              ["8", "99", "24"][major % 3])
+    brands = [grease, ("Chromium", str(major))] + ([(brand, str(major))] if brand else [])
+    if len(brands) == 2:
+        order: tuple = (major % 2, (major + 1) % 2)
+    else:
+        order = [(0, 1, 2), (0, 2, 1), (1, 0, 2), (1, 2, 0), (2, 0, 1), (2, 1, 0)][major % 6]
+    shuffled: list = [None] * len(brands)
+    for i, pos in enumerate(order):
+        shuffled[pos] = brands[i]
+    return ", ".join(f'"{b}";v="{v}"' for b, v in shuffled)
 
 PROFILES = {
 
@@ -303,6 +382,249 @@ PROFILES = {
         },
     },
 
+    # Chrome 158 (Windows) — 2026-11-16 itibarıyla kararlı sürüm
+    # (chromiumdash: 158.0.8127.37). TLS: [CR][BS][CAP]; h2: [CAP][CI2].
+    # Chrome 131'e göre farklar: ALPS 17613 (yeni kod noktası), trust_anchors
+    # (51764 = 0xca34, Trust Anchor IDs; PQ kripto DEĞİL), signature_algorithms
+    # başında GREASE + ML-DSA-44/65/87. Akamai h2 Chrome 131 ile AYNI.
+    # JA4: t13d1517h2_8daaf6152771_<c> (17 extension; c, ML-DSA'lı imza listesi
+    # yüzünden değişir — testte sabitlenir).
+    "chrome_158": {
+        "user_agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/158.0.0.0 Safari/537.36"
+        ),
+        "cipher_suites": [
+            "GREASE",
+            0x1301, 0x1302, 0x1303,
+            0xC02B, 0xC02F, 0xC02C, 0xC030, 0xCCA9, 0xCCA8,
+            0xC013, 0xC014, 0x009C, 0x009D, 0x002F, 0x0035,
+        ],
+        "extensions_order": [
+            "GREASE", "sni", "extended_master_secret", "renegotiation_info",
+            "supported_groups", "ec_point_formats", "session_ticket",
+            "alpn", "status_request", "signature_algorithms",
+            "signed_certificate_timestamp", "key_share",
+            "psk_key_exchange_modes", "supported_versions",
+            "compress_certificate", "alps", "trust_anchors", "ech_grease", "GREASE",
+        ],
+        "shuffle_extensions": True,
+        "supported_groups": ["GREASE", 0x11EC, 0x001D, 0x0017, 0x0018],
+        "key_share_groups": ["GREASE", 0x11EC, 0x001D],
+        "supported_versions": ["GREASE", 0x0304, 0x0303],
+        # [CR] kVerifyPrefs + [BS] ext_sigalgs_add_clienthello (başta GREASE).
+        "signature_algorithms": [
+            "GREASE", 0x0904, 0x0905, 0x0906,
+            0x0403, 0x0804, 0x0401, 0x0503, 0x0805,
+            0x0501, 0x0806, 0x0601,
+        ],
+        "alpn": ["h2", "http/1.1"],
+        "cert_compression": [0x0002],                # brotli
+        "alps_protocols": ["h2"],
+        "alps_codepoint": 17613,
+        "trust_anchors": CHROME_TRUST_ANCHOR_IDS,
+        "ech_grease": {"aead_ids": [0x0001, 0x0003], "payload_lens": [144, 176, 208, 240]},
+        "h2": {
+            "settings": [(1, 65536), (2, 0), (4, 6291456), (6, 262144)],
+            "window_update": 15663105,
+            "priority_frames": [],
+            "headers_priority": (0, True, 256),
+            "pseudo_header_order": [":method", ":authority", ":scheme", ":path"],
+            "header_order": [
+                "sec-ch-ua", "sec-ch-ua-mobile", "sec-ch-ua-platform",
+                "upgrade-insecure-requests", "user-agent", "accept",
+                "sec-fetch-site", "sec-fetch-mode", "sec-fetch-user",
+                "sec-fetch-dest", "accept-encoding", "accept-language",
+                "cookie", "priority",
+            ],
+        },
+        # [CAP] (Chrome 153 gezinme isteği, başlık sırası/değerleri) + sec-ch-ua
+        # 158 için chrome_sec_ch_ua() ile hesaplandı.
+        "http_headers": {
+            "default": [
+                ("sec-ch-ua", chrome_sec_ch_ua(158)),
+                ("sec-ch-ua-mobile", "?0"),
+                ("sec-ch-ua-platform", '"Windows"'),
+                ("Upgrade-Insecure-Requests", "1"),
+                ("User-Agent", None),
+                ("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,"
+                           "image/avif,image/webp,image/apng,*/*;q=0.8,"
+                           "application/signed-exchange;v=b3;q=0.7"),
+                ("Sec-Fetch-Site", "none"),
+                ("Sec-Fetch-Mode", "navigate"),
+                ("Sec-Fetch-User", "?1"),
+                ("Sec-Fetch-Dest", "document"),
+                ("Accept-Encoding", None),
+                ("Accept-Language", "en-US,en;q=0.9"),
+                ("Priority", "u=0, i"),
+            ],
+            "accept_encoding": ["gzip", "deflate", "br", "zstd"],
+            "h1_header_order": [
+                "host", "connection", "content-length", "sec-ch-ua",
+                "sec-ch-ua-mobile", "sec-ch-ua-platform",
+                "upgrade-insecure-requests", "user-agent", "content-type",
+                "accept", "origin", "sec-fetch-site", "sec-fetch-mode",
+                "sec-fetch-user", "sec-fetch-dest", "referer",
+                "accept-encoding", "accept-language", "cookie",
+            ],
+        },
+    },
+
+    # Firefox 160 (Windows) — product-details LATEST_FIREFOX_VERSION=160.0
+    # (2026-11-10). TLS: [FF][CI2]; h2: [CI2] firefox155 + [FF].
+    # Firefox 133'e göre farklar: ECDSA-CBC suite'leri (0xC00A/0xC009) yok
+    # (15 suite), ffdhe2048/3072 supported_groups'ta yok (DHE suite'leri kapalı),
+    # ECH GREASE AEAD yalnızca 1/3. ML-DSA ilan EDİLMEZ (enable_mldsa=false).
+    # Akamai h2: 1:65536;2:0;4:131072;5:16384|12517377|0|m,p,a,s (değişmedi).
+    "firefox_160": {
+        "user_agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:160.0) "
+            "Gecko/20100101 Firefox/160.0"
+        ),
+        "cipher_suites": [
+            0x1301, 0x1303, 0x1302,
+            0xC02B, 0xC02F, 0xCCA9, 0xCCA8, 0xC02C, 0xC030,
+            0xC013, 0xC014, 0x009C, 0x009D, 0x002F, 0x0035,
+        ],
+        "extensions_order": [
+            "sni", "extended_master_secret", "renegotiation_info",
+            "supported_groups", "ec_point_formats", "session_ticket",
+            "alpn", "status_request", "delegated_credentials",
+            "signed_certificate_timestamp", "key_share", "supported_versions",
+            "signature_algorithms", "psk_key_exchange_modes",
+            "record_size_limit", "compress_certificate", "ech_grease",
+        ],
+        "supported_groups": [0x11EC, 0x001D, 0x0017, 0x0018, 0x0019],
+        "key_share_groups": [0x11EC, 0x001D, 0x0017],
+        "supported_versions": [0x0304, 0x0303],
+        "signature_algorithms": [
+            0x0403, 0x0503, 0x0603,
+            0x0804, 0x0805, 0x0806,
+            0x0401, 0x0501, 0x0601,
+            0x0203, 0x0201,
+        ],
+        "delegated_credentials": [0x0403, 0x0503, 0x0603, 0x0203],
+        "record_size_limit": 0x4001,
+        "alpn": ["h2", "http/1.1"],
+        "cert_compression": [0x0001, 0x0002, 0x0003],
+        # [FF] tls13ech.c: AEAD = 1 ya da 3; yük = 32'nin katına yuvarlanmış iç
+        # CH (ad 100 bayta dolgulanır) + 16. 240 TAHMİNDİR (yakalama yok).
+        "ech_grease": {"aead_ids": [0x0001, 0x0003], "payload_lens": [240]},
+        "h2": {
+            "settings": [(1, 65536), (2, 0), (4, 131072), (5, 16384)],
+            "window_update": 12517377,
+            "priority_frames": [],
+            # Http2StreamBase::SetPriority: ağırlık = 21 - öncelik; belge = 42.
+            "headers_priority": (0, False, 42),
+            "pseudo_header_order": [":method", ":path", ":authority", ":scheme"],
+            "header_order": [
+                "user-agent", "accept", "accept-language", "accept-encoding",
+                "upgrade-insecure-requests", "sec-fetch-dest", "sec-fetch-mode",
+                "sec-fetch-site", "sec-fetch-user", "cookie", "priority", "te",
+            ],
+        },
+        # Accept: [FF] DocumentAcceptHeader (accept_include_images=false).
+        # Accept-Language: en-US + en için Firefox q=0.5 üretir (PrepareAcceptLanguages).
+        "http_headers": {
+            "default": [
+                ("User-Agent", None),
+                ("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"),
+                ("Accept-Language", "en-US,en;q=0.5"),
+                ("Accept-Encoding", None),
+                ("Upgrade-Insecure-Requests", "1"),
+                ("Sec-Fetch-Dest", "document"),
+                ("Sec-Fetch-Mode", "navigate"),
+                ("Sec-Fetch-Site", "none"),
+                ("Sec-Fetch-User", "?1"),
+                ("Priority", "u=0, i"),
+                ("TE", "trailers"),
+            ],
+            "accept_encoding": ["gzip", "deflate", "br", "zstd"],
+            "h1_header_order": [
+                "host", "user-agent", "accept", "accept-language",
+                "accept-encoding", "content-type", "content-length", "origin",
+                "referer", "cookie", "connection", "upgrade-insecure-requests",
+                "sec-fetch-dest", "sec-fetch-mode", "sec-fetch-site",
+                "sec-fetch-user",
+            ],
+        },
+    },
+
+    # Safari 27.2 (macOS) — [WK] güncel kararlı sürüm. TLS/h2: [CI2] safari270
+    # (27.0) + safari_26.0.1_macOS gerçek yakalaması; 27.1/27.2 sürüm notlarında
+    # ağ yığını değişikliği yok (UA dışında 27.0 ile aynı varsayıldı).
+    # Safari 18'e göre farklar: X25519MLKEM768 (grup + key_share), TLS 1.3
+    # suite sırası 1302,1303,1301, supported_versions yalnızca 1.3/1.2,
+    # 0x0203 imzası yok; h2'de SETTINGS 8 (ENABLE_CONNECT_PROTOCOL) yok ve
+    # HEADERS'ta PRIORITY bayrağı YOK; zstd ilan edilir; Upgrade-Insecure-
+    # Requests gönderilmez.
+    # Akamai h2: 2:0;3:100;4:2097152;9:1|10420225|0|m,s,a,p
+    "safari_27": {
+        "user_agent": (
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+            "AppleWebKit/605.1.15 (KHTML, like Gecko) "
+            "Version/27.2 Safari/605.1.15"
+        ),
+        "cipher_suites": [
+            "GREASE",
+            0x1302, 0x1303, 0x1301,
+            0xC02C, 0xC02B, 0xCCA9, 0xC030, 0xC02F, 0xCCA8,
+            0xC00A, 0xC009, 0xC014, 0xC013,
+            0x009D, 0x009C, 0x0035, 0x002F,
+            0xC008, 0xC012, 0x000A,
+        ],
+        "extensions_order": [
+            "GREASE", "sni", "extended_master_secret", "renegotiation_info",
+            "supported_groups", "ec_point_formats", "alpn", "status_request",
+            "signature_algorithms", "signed_certificate_timestamp",
+            "key_share", "psk_key_exchange_modes", "supported_versions",
+            "compress_certificate", "GREASE", "padding",
+        ],
+        "supported_groups": ["GREASE", 0x11EC, 0x001D, 0x0017, 0x0018, 0x0019],
+        "key_share_groups": ["GREASE", 0x11EC, 0x001D],
+        "supported_versions": ["GREASE", 0x0304, 0x0303],
+        "signature_algorithms": [
+            0x0403, 0x0804, 0x0401, 0x0503,
+            0x0805, 0x0805, 0x0501, 0x0806, 0x0601, 0x0201,
+        ],
+        "alpn": ["h2", "http/1.1"],
+        "cert_compression": [0x0001],                   # zlib
+        "h2": {
+            "settings": [(2, 0), (3, 100), (4, 2097152), (9, 1)],
+            "window_update": 10420225,
+            "priority_frames": [],
+            "headers_priority": None,                   # PRIORITY bayrağı yok [CI2]
+            "pseudo_header_order": [":method", ":scheme", ":authority", ":path"],
+            "header_order": [
+                "sec-fetch-dest", "user-agent", "accept", "referer",
+                "sec-fetch-site", "sec-fetch-mode", "accept-language",
+                "priority", "accept-encoding", "cookie",
+            ],
+        },
+        # [CI2] safari270 (sec-fetch-site doğrudan gezinme için "none":
+        # safari_26.0.1 yakalamasıyla aynı).
+        "http_headers": {
+            "default": [
+                ("Sec-Fetch-Dest", "document"),
+                ("User-Agent", None),
+                ("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"),
+                ("Sec-Fetch-Site", "none"),
+                ("Sec-Fetch-Mode", "navigate"),
+                ("Accept-Language", "en-US,en;q=0.9"),
+                ("Priority", "u=0, i"),
+                ("Accept-Encoding", None),
+            ],
+            "accept_encoding": ["gzip", "deflate", "br", "zstd"],
+            "h1_header_order": [
+                "host", "sec-fetch-dest", "user-agent", "accept",
+                "content-type", "content-length", "origin", "referer",
+                "sec-fetch-site", "sec-fetch-mode", "accept-language",
+                "priority", "accept-encoding", "cookie", "connection",
+            ],
+        },
+    },
+
     # Tarayıcı taklidi yapmayan yalın profil: h2 değerleri ESKİ sabit
     # davranışla aynıdır (connection WINDOW_UPDATE yok, PRIORITY yok).
     # Parmak izi önemsizdir, UYUMLULUK önemlidir: TLS 1.2 sunucularla da
@@ -352,12 +674,13 @@ PROFILES = {
 
 # Eski/yaygın yazımlar için takma adlar. Yeni isim eklerken buraya da ekle.
 PROFILE_ALIASES = {
-    "chrome": "chrome_131",
+    "chrome": "chrome_158",
     "chrome_131": "chrome_131",
-    "firefox": "firefox_133",
+    "firefox": "firefox_160",
     "firefox_120": "firefox_133",
-    "safari": "safari_18",
+    "safari": "safari_27",
     "safari_17": "safari_18",
+    "safari_27_2": "safari_27",
 }
 
 
@@ -414,7 +737,8 @@ def ja3_hash(profile_name: str | None = None, resolved_grease: int | None = None
         "psk_key_exchange_modes": 45, "supported_versions": 43,
         "compress_certificate": 27, "padding": 21,
         "delegated_credentials": 34, "record_size_limit": 28,
-        "alps": 17513, "ech_grease": 65037,
+        "alps": profile.get("alps_codepoint", 17513), "ech_grease": 65037,
+        "trust_anchors": 0xCA34,
         "GREASE": grease,
     }
     exts = [
@@ -559,7 +883,8 @@ def ja3n_hash(profile_name: str | None = None, resolved_grease: int | None = Non
         "psk_key_exchange_modes": 45, "supported_versions": 43,
         "compress_certificate": 27, "padding": 21,
         "delegated_credentials": 34, "record_size_limit": 28,
-        "alps": 17513, "ech_grease": 65037,
+        "alps": profile.get("alps_codepoint", 17513), "ech_grease": 65037,
+        "trust_anchors": 0xCA34,
         "GREASE": grease,
     }
                                     
@@ -681,7 +1006,9 @@ def ja4_from_client_hello(client_hello: bytes, alpn_first: str | None = None) ->
     sig = ""
     if sa:
         n = struct.unpack("!H", sa[:2])[0]
-        sig = ",".join(f"{struct.unpack('!H', sa[2 + i:4 + i])[0]:04x}" for i in range(0, n, 2))
+        # JA4: GREASE "her yerde" yok sayılır (FoxIO JA4.md) — imza listesi dahil.
+        algs = [struct.unpack("!H", sa[2 + i:4 + i])[0] for i in range(0, n, 2)]
+        sig = ",".join(f"{a:04x}" for a in algs if a not in _GREASE_VALUES)
     c_src = ext_part + ("_" + sig if sig else "")
     c = hashlib.sha256(c_src.encode()).hexdigest()[:12]
     return f"{a}_{b}_{c}"

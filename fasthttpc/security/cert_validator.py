@@ -85,10 +85,24 @@ def decompress_certificate_message(hs_payload: bytes) -> bytes:
             decompressed = brotli.decompress(compressed_data)
         except Exception as e:
             raise CertificateValidationError(f"brotli ile sertifika açılamadı: {e}") from e
+    elif algorithm == 3:  # zstd (RFC 8879) — yalnızca 'zstandard' kuruluysa İLAN edilir
+        try:
+            import zstandard
+        except ImportError as e:
+            raise CertificateValidationError(
+                "Sunucu zstd-sıkıştırılmış sertifika gönderdi ancak 'zstandard' paketi "
+                "kurulu değil. Kurmak için: pip install zstandard"
+            ) from e
+        try:
+            # Çıktı, ilan edilen uncompressed_length ile sınırlı (sıkıştırma bombası koruması).
+            decompressed = zstandard.ZstdDecompressor().decompress(
+                compressed_data, max_output_size=max(uncompressed_length, 1))
+        except Exception as e:
+            raise CertificateValidationError(f"zstd ile sertifika açılamadı: {e}") from e
     else:
         raise CertificateValidationError(
             f"Desteklenmeyen sertifika sıkıştırma algoritması: {algorithm} "
-            f"(sadece zlib=1 ve brotli=2 destekleniyor)."
+            f"(sadece zlib=1, brotli=2 ve zstd=3 destekleniyor)."
         )
 
     if len(decompressed) != uncompressed_length:
@@ -335,6 +349,10 @@ _SIG_SCHEMES = {
     0x080B: ("rsa_pss_pss", "sha512"),
     0x0807: ("ed25519", None),
     0x0808: ("ed448", None),
+    # draft-ietf-tls-mldsa: saf ML-DSA (FIPS 204 Alg. 2/3), ctx = boş dize.
+    0x0904: ("mldsa", "MLDSA44"),
+    0x0905: ("mldsa", "MLDSA65"),
+    0x0906: ("mldsa", "MLDSA87"),
 }
 
 
@@ -447,6 +465,22 @@ def verify_certificate_verify(
             if not isinstance(pubkey, ed448.Ed448PublicKey):
                 raise CertificateValidationError("Ed448 şeması bildirildi ama anahtar Ed448 değil.")
             pubkey.verify(signature, content)
+
+        elif kind == "mldsa":
+            try:
+                from cryptography.hazmat.primitives.asymmetric import mldsa
+            except ImportError as e:      # cryptography < 48: ML-DSA yok -> reddet
+                raise CertificateValidationError(
+                    f"ML-DSA şeması 0x{scheme:04x} bu 'cryptography' sürümünde desteklenmiyor."
+                ) from e
+            # Şema anahtarın parametre kümesine bağlıdır (ML-DSA-44/65/87).
+            want = getattr(mldsa, f"{hash_name}PublicKey", None)
+            if want is None or not isinstance(pubkey, want):
+                raise CertificateValidationError(
+                    f"Sunucu {hash_name} şeması (0x{scheme:04x}) bildirdi ama sertifikadaki "
+                    f"anahtar {type(pubkey).__name__}."
+                )
+            pubkey.verify(signature, content)      # context=None == boş bağlam
 
     except InvalidSignature as e:
         raise CertificateValidationError(

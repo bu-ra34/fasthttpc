@@ -8,6 +8,7 @@ Yollar (sorgu parametreleri ``?k=v``):
   /big?n=BAYT      n bayt deterministik gövde (Content-Length)
   /chunked?i=X     chunked yanıt (gövde: 3 parça, ``X`` ile biter)
   /gzip, /br       sıkıştırılmış JSON yanıt (Content-Encoding)
+  /zstd            zstd'li JSON (akış sıkıştırıcısı: çerçevede içerik boyutu yok)
   /setcookie?i=X   Set-Cookie: cX=vX (çerez kavanozu yarış testi)
   /sleep?d=SN      SN saniye bekleyip yanıtla
   /drip?n=N&d=SN   N parça, her biri arası SN sn (toplam süre N*SN)
@@ -41,10 +42,14 @@ import threading
 import time
 from urllib.parse import parse_qs, urlsplit
 
-try:  # opsiyonel bağımlılık; yalnızca /br yolu kullanır
+try:  # yalnızca /br yolu kullanır
     import brotli
 except ImportError:  # pragma: no cover
     brotli = None
+try:  # yalnızca /zstd yolu kullanır
+    import zstandard
+except ImportError:  # pragma: no cover
+    zstandard = None
 from cryptography import x509
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import ec
@@ -303,15 +308,19 @@ class YerelSunucu:
             parcalar = [b"parca1-", b"parca2-", i.encode()]
             out = b"".join(b"%x\r\n%s\r\n" % (len(p), p) for p in parcalar) + b"0\r\n\r\n"
             self._gonder(s, "200 OK", [("Transfer-Encoding", "chunked")], out, cl=False)
-        elif yol in ("/gzip", "/br"):
+        elif yol in ("/gzip", "/br", "/zstd"):
             ham = json.dumps({"id": q.get("i", ""), "dolgu": "a" * 5000}).encode()
             if yol == "/gzip":
                 z, enc = gzip.compress(ham), "gzip"
-            elif brotli is None:
-                self._gonder(s, "501 Not Implemented", [], b"brotli kurulu degil")
+            elif (brotli if yol == "/br" else zstandard) is None:
+                self._gonder(s, "501 Not Implemented", [], b"kodlayici kurulu degil")
                 return True
-            else:
+            elif yol == "/br":
                 z, enc = brotli.compress(ham), "br"
+            else:
+                # Akış sıkıştırıcısı: çerçeve başlığında içerik boyutu yok (sunucuların çoğu böyle)
+                co = zstandard.ZstdCompressor().compressobj()
+                z, enc = co.compress(ham) + co.flush(), "zstd"
             self._gonder(s, "200 OK", [("Content-Encoding", enc), ("Content-Type", "application/json")], z)
         elif yol == "/setcookie":
             i = q.get("i", "")

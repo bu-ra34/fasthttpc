@@ -123,17 +123,18 @@ class RateLimitPlugin(Plugin):
 
     def __init__(self, rps: float = 10.0):
         self._interval = 1.0 / rps
-        self._last_req = 0.0
+        self._last_req = float("-inf")
         self._tlock    = threading.Lock()
         # Döngüye bağlı; tembel oluşur. asyncio.Lock ya da (trio altında) anyio.Lock.
         self._alock: "AbstractAsyncContextManager[Any] | None" = None
 
     def on_request(self, request: "dict[str, Any]") -> "dict[str, Any]":
         with self._tlock:
-            wait = self._interval - (time.monotonic() - self._last_req)
-            if wait > 0:
+            # perf_counter: Windows'ta time.monotonic ~15,6 ms adımlıdır; aralık ölçümü
+            # yuvarlanır ve uyku erken bitebilir. Kalan süre kalmayana kadar bekle.
+            while (wait := self._interval - (time.perf_counter() - self._last_req)) > 0:
                 time.sleep(wait)
-            self._last_req = time.monotonic()
+            self._last_req = time.perf_counter()
         return request
 
     async def async_on_request(self, request: "dict[str, Any]") -> "dict[str, Any]":
@@ -141,8 +142,7 @@ class RateLimitPlugin(Plugin):
         if self._alock is None:
             self._alock = B.Lock()
         async with self._alock:
-            wait = self._interval - (time.monotonic() - self._last_req)
-            if wait > 0:
+            while (wait := self._interval - (time.perf_counter() - self._last_req)) > 0:
                 await B.sleep(wait)
-            self._last_req = time.monotonic()
+            self._last_req = time.perf_counter()
         return request

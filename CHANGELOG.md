@@ -2,7 +2,162 @@
 
 ## [Unreleased]
 
+## [0.7.0] — 2026-11-16
+
+Güncel tarayıcı profilleri (Chrome 158, Firefox 160, Safari 27), düz HTTP ve
+proxy ortam değişkenleri, açık bağlantıda zaman aşımı ve brotli/zstd
+düzeltmeleri, HTTP/2 indirmelerinde ~1,6–1,8x hızlanma ve gerçek internette
+çalışan HTTP/3 testleri.
+
+### Davranış değişikliği
+- **Varsayılan profil `chrome_158`:** `Session()`/`AsyncSession()` ve `chrome`,
+  `firefox`, `safari` takma adları artık `chrome_158`, `firefox_160`,
+  `safari_27`'yi gösterir. Eski parmak izi için adı açıkça verin
+  (`impersonate="chrome_131"`).
+- **brotli ve zstandard artık zorunlu bağımlılık;** bir çözücü yine de yoksa
+  sıkıştırılmış gövde sessizce döndürülmez, `MissingDecoderError` verilir.
+- **`http://` artık düz HTTP:** `http://` adresleri requests/httpx gibi TLS'siz,
+  düz TCP üzerinden HTTP/1.1 ile istenir (h2c ve HTTP/3 yok); 0.6.2'ye kadar TLS
+  ile (port 80'e) isteniyordu ve yalnızca düz HTTP konuşan sunuculara
+  ulaşılamıyordu. `Session` ve `AsyncSession` aynı; HTTP/1.1 başlık sırası
+  profili izler (TLS parmak izi düz HTTP'de söz konusu değildir).
+  `resp.tls_info` düz HTTP'de `None`'dır. Aynı host:port'taki `http://` ve
+  `https://` bağlantıları paylaşılmaz.
+- **Proxy ortam değişkenleri okunuyor:** `trust_env=True` (varsayılan) iken ve
+  `proxy=`/`proxies=` verilmemişse `HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY` ve
+  `NO_PROXY` (küçük harfli biçimleri önceliklidir) kullanılır. `HTTPS_PROXY`
+  tanımlı bir ortamda istekler artık o proxy'den geçer; eski davranış için
+  `trust_env=False` ya da `proxies={}`.
+- **CA bundle ortam değişkenleri:** `trust_env=True` ve `verify=True` iken
+  `REQUESTS_CA_BUNDLE`, `SSL_CERT_FILE` ya da `CURL_CA_BUNDLE` bir PEM
+  gösteriyorsa güven kökü odur (`verify="yol"` ile aynı anlam; doğrulama
+  kapanmaz, açık `verify="yol"` kazanır). Dosya yoksa değişkenin adıyla
+  `FileNotFoundError`.
+- HTTP/1.1 `Host` başlığı varsayılan olmayan portu içerir (`host:8080`).
+
+### Eklenenler
+- `NO_PROXY`: `*`, host ve alt alan adları (`example.com`, `.example.com`,
+  `*.example.com`), IP, CIDR (`10.0.0.0/8`, `fd00::/8`) ve port
+  (`host:8080`, `[::1]:8080`). Açık `proxy=`/`proxies=` ortamı tamamen ezer
+  (httpx gibi), `proxies={}` "proxy yok" demektir. Değişkenler oturum
+  kurulurken okunur. CGI ortamında büyük harfli `HTTP_PROXY` yok sayılır
+  (httpoxy).
+- Desteklenmeyen ortam proxy'si (`https://` proxy, `socks4://` ...) sessizce
+  yok sayılmaz: kullanılacağı istekte değişkenin adını içeren `ValueError`.
+- Proxy üzerinden düz HTTP: HTTP proxy'sine CONNECT'siz, mutlak biçimli istek
+  (`GET http://host/yol HTTP/1.1`, `Proxy-Authorization` dahil); SOCKS5'te
+  tünelin içinde düz HTTP. `https://` hedefler CONNECT tünelini kullanmaya
+  devam eder.
+- `fasthttpc.transport.proxy`: `environ_proxies`, `proxy_bypass`,
+  `select_proxy`; `fasthttpc.config.environ_ca_bundle`.
+- **Güncel tarayıcı profilleri (2026-11-16 kararlı sürümleri):** `chrome_158`,
+  `firefox_160`, `safari_27` (Safari 27.2). Değerler tarayıcı kaynak kodundan
+  (Chromium 158 + BoringSSL, Firefox 160 + NSS 3.132), curl-impersonate
+  yakalamalarından ve gerçek bir Chrome for Testing 153 yerel yakalamasından
+  alındı; her değerin kaynağı `fasthttpc/fingerprint.py` ve `docs/profiles.md`'de.
+  `chrome_158`'in JA4'ü (ECH GREASE kapalıyken) gerçek Chrome yakalamasıyla birebir.
+- Chrome 158: ALPS yeni kod noktası 17613 (istemci EncryptedExtensions dahil),
+  `trust_anchors` uzantısı (51764 = 0xca34, Chrome Root Store'un 28 trust anchor
+  ID'si; süreç başına karışık sıra), `signature_algorithms` başında GREASE ve
+  ML-DSA-44/65/87, sürüme göre hesaplanan `sec-ch-ua` (`chrome_sec_ch_ua()`).
+- **ML-DSA CertificateVerify doğrulaması** (draft-ietf-tls-mldsa; saf ML-DSA, boş
+  bağlam; `cryptography` >= 48). ML-DSA yalnızca doğrulanabiliyorsa ilan edilir.
+- **zstd sertifika sıkıştırması** (RFC 8879, algoritma 3): `zstandard` kuruluysa
+  ilan edilir ve açılır (çıktı ilan edilen boyutla sınırlı).
+
+### Değişti
+- `chrome`, `firefox`, `safari` takma adları ve `Session`/`AsyncSession`
+  varsayılanı artık `chrome_158`/`firefox_160`/`safari_27`'yi gösterir. Eski
+  `chrome_131`, `firefox_133`, `safari_18` profilleri aynen duruyor (adlarıyla seçilebilir).
+- Firefox 160: ECDSA-CBC suite'leri ve ffdhe grupları çıkarıldı, ECH GREASE
+  AEAD'i 1/3. Safari 27: X25519MLKEM768, TLS 1.3 suite sırası 1302/1303/1301,
+  yalnızca TLS 1.3/1.2, h2'de SETTINGS 8 ve HEADERS PRIORITY bayrağı yok,
+  `Upgrade-Insecure-Requests` gönderilmez.
+- JA4 hesabı imza algoritması listesindeki GREASE değerlerini artık yok sayıyor
+  (FoxIO JA4 tanımı).
+
+### Düzeltmeler
+- **Yeniden kullanılan bağlantıda zaman aşımı:** soket/bağlantı zaman aşımı
+  yalnızca bağlantı kurulurken ayarlandığından, aynı sunucuya giden sonraki
+  istekler (keep-alive HTTP/1.1 ya da açık HTTP/2 bağlantısı) bağlantıyı açan
+  ilk isteğin süresini kullanıyordu: istek düzeyi `timeout=` ve oturumun süresi
+  yok sayılıyor, ilk istek `timeout=None` ise async HTTP/2'de istek sonsuza dek
+  takılabiliyordu. Senkron HTTP/2'de `Timeout.total` hiç uygulanmıyordu;
+  `AsyncSession` `total`'ı hiç uygulamıyordu. Artık her istek kendi etkin
+  `read`/`write`/`total` sürelerini her okuma/yazmada uygular (senkron ve async,
+  HTTP/1.1 ve HTTP/2, akışlı ve akışsız). `total` bağlantı alma/kurmayı da
+  kapsar; `stream=True` iken yanıt başlıklarına kadar geçerlidir.
+- **Senkron akış + istek düzeyi timeout:** HTTP/1.1 `stream=True` yolu soketi
+  oturumun `read` süresine döndürüyordu (`self.timeout`); akış gövdesi artık
+  isteğin `read` süresiyle okunur. HTTP/3 denemesi de istek düzeyi `timeout=`'u
+  kullanır.
+- **Sıkıştırılmış gövde sessizce bozuk dönüyordu:** `br`/`zstd` açıcısı kurulu
+  değilse gövde uyarısız, sıkıştırılmış haliyle dönüyor ve `.json()`
+  `UnicodeDecodeError` veriyordu. Artık kurulacak paketi ve `pip install`
+  komutunu söyleyen `fasthttpc.MissingDecoderError` (`DecodeError` ->
+  `ValueError` alt sınıfı; ikisi de dışa aktarıldı) yükselir; senkron/async,
+  akışlı (`iter_bytes`/`iter_text`/`aiter_*`) ve akışsız yollar aynı davranır
+  (`iter_raw()` ham gövdeyi vermeye devam eder). Gövdesiz yanıtlar hata vermez.
+- **zstd:** akışsız yol tek seferlik `ZstdDecompressor().decompress()` kullandığı
+  için çerçevesinde içerik boyutu olmayan (akış sıkıştırıcısıyla üretilmiş)
+  gövdeleri açamıyor, ham döndürüyordu. Akışsız gövde artık akışlı yolla aynı
+  açıcıdan geçer (virgüllü zincirler dahil).
+
+### Güvenlik
+- `https://` → `http://` yönlendirmesi requests gibi izlenir ama o adımda
+  hiçbir kimlik bilgisi gitmez: `Authorization`, `Proxy-Authorization`,
+  `Cookie` başlıkları, `auth=`, URL'deki `kullanici:parola@` ve (requests'ten
+  farklı olarak) `.netrc` kimliği. `Secure` çerezler `http://` üzerinden
+  gönderilmez.
+- Düz HTTP yanıtı `Secure` çerez koyamaz, aynı adlı `Secure` çerezin üzerine
+  yazamaz ve onu silemez (RFC 6265bis §5.7).
+- Düz HTTP yanıtındaki `Alt-Svc` kaydedilmez; HTTP/3 yalnızca `https://` için
+  kullanılır (`http3="force"` olsa da `http://` düz HTTP/1.1 ile gider).
+- HSTS uygulanmaz (belgelendi).
+
+### Performans
+- **HTTP/2 alım akış kontrolü:** her 16 KiB'lik DATA frame'i için iki ayrı TLS
+  record'unda iki WINDOW_UPDATE gönderiliyordu. İlan edilen pencere 65535'ten
+  büyükse (tarayıcı profilleri) kredi artık tarayıcılar gibi toplu geri
+  veriliyor: eşik `min(pencere/2, 32 KiB)`. Stream bitince bağlantı kredisi
+  eksiksiz geri verilir, geri basınç korunur. Bağlantı ve stream güncellemesi
+  tek record'da gider. `default` profilinde (65535) davranış eskisiyle aynı.
+  İlan edilen SETTINGS ve önsöz değerleri, yani parmak izi değişmedi.
+- **Record katmanı:** nonce tamsayı XOR'u ile kuruluyor. `ct||tag`
+  bölünmeden `cryptography`'ye veriliyor (`seal`/`open`). Record tampondan
+  tek kopyayla alınıyor, padding `rstrip` ile atılıyor ve senkron yolda
+  `recv` 64 KiB okuyor. AEAD doğrulaması, record boyut sınırları ve sequence
+  denetimleri aynı. TLS 1.3 sans-IO çekirdeği ve TLS 1.2 de aynı yoldan geçiyor.
+- **HTTP/2 frame yolu:** frame yükü tek kopyayla alınıyor, gövde tek
+  `b"".join` ile birleştiriliyor ve kapalı debug f-string'leri artık her
+  frame'de değerlendirilmiyor. Async okuyucu yalnızca yazım yaptıysa drain
+  bekliyor. `AsyncTLSStream.read()` çözülmüş record'ların hepsini tek
+  çağrıda dönüyor.
+- **Küçük istekler:** `Headers(list)` kurulumu O(n²) yerine doğrusal.
+  `URL.params` ilk erişimde ayrıştırılıyor. `.netrc` her istekte yeniden
+  ayrıştırılmıyor; dosya değişirse yeniden okunuyor.
+- Yerel ölçümde (64 MiB, istemci CPU'su) HTTP/2 indirme ~255'ten ~440–475
+  MB/s'ye, async HTTP/2 indirme ~230'dan ~330–365 MB/s'ye, HTTP/1.1 indirme
+  ~%10–25 yükseldi. Ayrıntılar ve uyarılar `docs/performance.md`'de.
+
+### Bağımlılıklar
+- `brotli` (PyPy'de `brotlicffi`) ve `zstandard` artık normal bağımlılık
+  (CPython 3.10 - 3.13 için Linux/macOS/Windows wheel'leri var); tarayıcı
+  profillerinin `Accept-Encoding`'i değişmedi. `fasthttpc[brotli]` ve
+  `fasthttpc[zstd]` ekleri uyumluluk için duruyor (PyPy'de zstd için gerekli).
+
+### Araçlar
+- `benchmarks/local_bench.py`: ağsız uçtan uca benchmark. Sunucular ayrı
+  süreçte çalışıyor. HTTP/1.1, HTTP/2, akış, küçük istek, handshake ve async
+  senaryolarını ölçüyor, `--profile` ile cProfile çıktısı veriyor ve
+  `FASTHTTPC_BENCH_SRC` ile eski sürümle karşılaştırıyor.
+- `tests/test_perf_regresyon.py`: zamanlama eşiği olmadan sistem çağrısı,
+  record ve frame sayılarını ölçen regresyon testleri.
+
 ### Testler / CI
+- badssl.com, GitHub runner'larından gelen bağlantıları ara ara sıfırlıyor (Python'un
+  kendi `ssl` modülü dahil, bütün profillerde). `badssl` işaretli canlı testler
+  ayrı, işi düşürmeyen bir adımda çalışır; doğrulamaları değişmedi.
 - Canlı HTTP/3 testleri (`tests/live`, `FASTHTTPC_LIVE=1`) için ayrı bir GitHub
   Actions iş akışı eklendi (`.github/workflows/live.yml`, "Live tests"): yalnızca
   elle (Actions → Live tests → Run workflow) ve haftada bir çalışır, push/PR'da
@@ -11,6 +166,50 @@
   sınırı var, yeniden deneme yok. `FASTHTTPC_LIVE=1` iken aioquic eksikse modül
   artık sessizce atlanmıyor, hata veriyor; doğrulama mesajları durum kodu,
   protokol ve `Alt-Svc` bilgisini gösteriyor. Ayrıntılar `docs/testing.md`'de.
+- Canlı testler (`FASTHTTPC_LIVE=1`): `badssl.com` yalnızca Extended Master
+  Secret'sız TLS 1.2 sunduğu için fasthttpc onu sertifikaya bakmadan ServerHello'da
+  reddediyor; eski `test_bad_certificates_rejected` bu yüzden sertifika
+  doğrulamasını hiç görmüyordu. Yerine `test_badssl_bad_cert_hosts_refused` geldi:
+  yalnızca sertifika hatasını ya da tam olarak EMS reddini kabul eder,
+  bağlantı sıfırlanması/zaman aşımı başarısızlıktır (atlanmaz).
+  `test_badssl_valid_cert_host_refused_for_missing_ems`, geçerli sertifikalı
+  `badssl.com`'un da aynı nedenle reddedildiğini gösterir.
+- TCP yolunda sertifika doğrulaması artık TLS 1.3 sunan gerçek sunuculara karşı
+  sınanıyor: `test_tcp_rejects_chain_from_untrusted_ca` (`www.cloudflare.com`,
+  `www.google.com`, ilgisiz bir CA ile `CertificateValidationError`) ve
+  `test_tcp_rejects_hostname_mismatch` (`quic.nginx.org` adresine yanlış adla
+  bağlanınca "no matching subjectAltName"); her ikisinin de başarılı bir
+  kontrol isteği var (`test_tcp_tls13_baseline_succeeds`).
+- Canlı testler: `quic.nginx.org` tanımadığı SNI'a sertifika göndermek yerine
+  `unrecognized_name` (112) alert'iyle el sıkışmayı kestiği için hostname testi
+  sertifika doğrulamasına hiç ulaşmıyordu. `test_tcp_rejects_hostname_mismatch`
+  artık `www.google.com` ve `github.com` adreslerine sabitlenip `.invalid` adla
+  bağlanıyor. Hedef başına yalnızca "no matching subjectAltName" ya da tam olarak
+  `unrecognized_name` alert'i kabul ediliyor, en az bir hedefin SAN uyuşmazlığı
+  vermesi şart.
+- Canlı testler: `badssl.com` denetimleri artık `chrome_131`, `chrome_158`,
+  `firefox_160`, `safari_27` ve `default` profilleriyle ayrı ayrı çalışıyor.
+  Sıfırlanan bağlantının mesajında profil adı ve yaklaşık ClientHello boyutu
+  var. Yeni `test_badssl_reachable_with_stdlib_ssl` kontrolü aynı sunuculara
+  Python `ssl` (OpenSSL ClientHello'su, doğrulama açık) ile bağlanıyor. Böylece
+  sıfırlamanın belirli bir ClientHello'dan mı yoksa `badssl.com`'un kendisinden
+  mi kaynaklandığı CI çıktısında görülüyor.
+
+### Dokümantasyon
+- README, README.tr, kurulum, zaman aşımı, akış, sınırlar ve API sayfaları
+  güncellendi.
+- README, README.tr, `proxy.md`, `limits.md`, `security.md`,
+  `security-audit.md`, `migration-requests.md`, `migration-httpx.md` ve
+  auth/hook sayfası yeni davranışa göre güncellendi.
+- Kullanıcı bildirimi doğrulandı: "extension 51764" Trust Anchor IDs'dir (PQ
+  kripto değil); ML-DSA gerçekten Chrome 158'in imza listesinde; Firefox 160'ta
+  ise ML-DSA kodda var ama `security.tls.enable_mldsa=false` olduğu için
+  ClientHello'da YOK. Safari 18 h2 dizesi gerçek Safari 18.0 ile aynıydı; farklılık
+  güncel Safari 26/27'ye göreydi. Ayrı Edge profili eklenmedi (TLS farkı
+  doğrulanamadı). Bilinen sapmalar `docs/limits.md`'de tablo olarak.
+- `docs/testing.md`: `badssl.com`'un EMS'siz TLS 1.2 sunduğu ve testlerin bunu
+  nasıl ele aldığı. `docs/limits.md` ve README: EMS'siz TLS 1.2 sunucuları
+  (`legacy_tls=True` olmadan) reddedilir.
 
 ## [0.6.2] — 2026-11-16
 

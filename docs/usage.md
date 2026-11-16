@@ -5,7 +5,7 @@
 ```python
 from fasthttpc import Session
 
-with Session(impersonate="chrome_131", timeout=10, retries=3) as s:
+with Session(impersonate="chrome_158", timeout=10, retries=3) as s:
     s.headers["Authorization"] = "Bearer ..."     # session-level default headers
     r = s.get("https://api.example.com/items")
     for item in r.json():
@@ -28,7 +28,7 @@ import asyncio
 from fasthttpc import AsyncSession
 
 async def main():
-    async with AsyncSession(impersonate="chrome_131") as s:
+    async with AsyncSession(impersonate="chrome_158") as s:
         r = await s.get("https://httpbin.org/get")
         print(r.status_code)
 

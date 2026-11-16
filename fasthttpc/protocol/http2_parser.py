@@ -11,6 +11,7 @@ from __future__ import annotations
 import struct
 import zlib
 import socket
+import time
 import threading
 from enum import IntEnum
 from typing import Iterator, Optional, Generator
@@ -845,6 +846,39 @@ def h2_headers_priority_field(h2: dict) -> bytes:
     return _priority_payload(*hp) if hp else b""
 
 
+# Alım tarafı WINDOW_UPDATE toplama eşiğinin üst sınırı. Bkz. h2_wu_thresholds.
+WU_BATCH_MAX = 32768
+
+
+def _wu_threshold(window: int) -> int:
+    return 1 if window <= Http2Connection.DEFAULT_WINDOW else min(window // 2, WU_BATCH_MAX)
+
+
+def h2_wu_thresholds(h2: dict) -> "tuple[int, int]":
+    """(bağlantı, stream) için WINDOW_UPDATE gönderme eşiği (tüketilmiş, henüz geri
+    verilmemiş bayt).
+
+    Tarayıcılar her DATA frame'i için WINDOW_UPDATE göndermez: Chromium, geri
+    verilmemiş kredi pencerenin yarısını aşınca gönderir. İlan ettiğimiz pencere
+    RFC varsayılanından (65535) büyükse aynı şekilde toplarız; eşik
+    ``min(pencere // 2, WU_BATCH_MAX)``. Üst sınır, SETTINGS'imizi yok sayıp
+    pencereyi 65535 sanan uyumsuz bir eşin bile kilitlenmemesi içindir (eşik
+    65535'in altında kaldıkça o eş tükenmeden kredi alır). Varsayılan 65535
+    pencerede (``default`` profili) davranış eskisiyle aynıdır: her DATA'da hemen.
+    İlan edilen başlangıç değerleri (parmak izi) DEĞİŞMEZ; yalnızca kredinin
+    hangi sıklıkla geri verildiği değişir. Geri basınç korunur: kredi yalnızca
+    tüketilen veri için verilir.
+    """
+    stream_win = h2_setting(h2, 0x4, Http2Connection.DEFAULT_WINDOW)
+    conn_win = Http2Connection.DEFAULT_WINDOW + (h2.get("window_update") or 0)
+    return _wu_threshold(conn_win), _wu_threshold(stream_win)
+
+
+def _window_update_frame(stream_id: int, increment: int) -> bytes:
+    return (b"\x00\x00\x04\x08\x00" + (stream_id & 0x7FFFFFFF).to_bytes(4, "big")
+            + increment.to_bytes(4, "big"))
+
+
 
 class Http2StreamError(Exception):
     """Tek bir HTTP/2 stream seviyesinde hata (RST_STREAM vb.)."""
@@ -913,7 +947,15 @@ class Http2Connection:
         self._pending_frames: list[HTTP2Frame] = []
         self._lock = threading.Lock()
         self._foreign_hblock = bytearray()
+        # İstek başına zaman aşımı (Session._arm_timeouts her istekte ayarlar):
+        # okuma süresi ve Timeout.total'ın bitiş anı (perf_counter; None = yok).
+        self.read_timeout: Optional[float] = None
+        self.deadline: Optional[float] = None
         self.debug = debug or __import__("os").environ.get("FASTHTTPC_H2_DEBUG") == "1"
+        # Alım tarafı akış kontrolü: tüketilmiş ama henüz WINDOW_UPDATE ile geri
+        # verilmemiş bayt (bağlantı düzeyi) ve eşikler (bkz. h2_wu_thresholds).
+        self._conn_unacked = 0
+        self._wu_conn_threshold, self._wu_stream_threshold = h2_wu_thresholds(self._h2)
 
     def _dbg(self, msg: str) -> None:
         if self.debug:
@@ -944,30 +986,51 @@ class Http2Connection:
         except OSError as e:
             self._dbg(f"GOAWAY gönderilemedi: {e}")
 
+    def _recv_record(self) -> tuple[bytes, int]:
+        """``sock.recv_record``; istek başına toplam süre sınırı (``deadline``,
+        ``time.perf_counter`` cinsinden; Session ayarlar) varsa soketin zaman
+        aşımı her okumadan önce kalan süreye kısaltılır."""
+        dl = self.deadline
+        if dl is not None:
+            left = dl - time.perf_counter()
+            if left <= 0:
+                raise TimeoutError("İstek toplam süre sınırını (Timeout.total) aştı.")
+            rt = self.read_timeout
+            self.sock.raw_socket.settimeout(left if rt is None else min(rt, left))
+        rec: tuple[bytes, int] = self.sock.recv_record(skip_post_handshake=True)
+        return rec
+
     def _read_frame(self) -> HTTP2Frame:
         # Gövde gönderirken pencere beklerken okunmuş ama işlenmemiş frame'ler
         if self._pending_frames:
             return self._pending_frames.pop(0)
         while len(self._recv_buf) < HTTP2Frame.HEADER_SIZE:
-            msg, m_type = self.sock.recv_record(skip_post_handshake=True)
+            msg, m_type = self._recv_record()
             if m_type != 23:
                 continue
             if not msg:
                 raise Http2ConnectionError("Bağlantı beklenmedik şekilde kapandı.")
             self._recv_buf += msg
 
-        length = struct.unpack("!I", b"\x00" + bytes(self._recv_buf[0:3]))[0]
-        while len(self._recv_buf) < HTTP2Frame.HEADER_SIZE + length:
-            msg, m_type = self.sock.recv_record(skip_post_handshake=True)
+        buf = self._recv_buf
+        length = (buf[0] << 16) | (buf[1] << 8) | buf[2]
+        total = HTTP2Frame.HEADER_SIZE + length
+        while len(buf) < total:
+            msg, m_type = self._recv_record()
             if m_type != 23:
                 continue
             if not msg:
                 raise Http2ConnectionError("Frame gövdesi okunurken bağlantı kapandı.")
-            self._recv_buf += msg
+            buf += msg
 
-        raw = bytes(self._recv_buf[:HTTP2Frame.HEADER_SIZE + length])
-        del self._recv_buf[:HTTP2Frame.HEADER_SIZE + length]
-        return HTTP2Frame.parse(raw)
+        # Başlık alanları doğrudan tampondan; yük TEK kopyayla (eskiden frame önce
+        # bytes'a, sonra parse() içinde yeniden dilimleniyordu).
+        ftype, flags = buf[3], buf[4]
+        stream_id = ((buf[5] << 24) | (buf[6] << 16) | (buf[7] << 8) | buf[8]) & 0x7FFFFFFF
+        with memoryview(buf) as mv:
+            payload = mv[HTTP2Frame.HEADER_SIZE:total].tobytes()
+        del buf[:total]
+        return HTTP2Frame(length, ftype, flags, stream_id, payload)
 
     def _handle_settings(self, frame: HTTP2Frame) -> None:
         if frame.flags & 0x1:          # ACK
@@ -1123,12 +1186,14 @@ class Http2Connection:
                 raise Http2RefusedError(
                     f"Bağlantı GOAWAY almış (last_stream_id={self.goaway[0]}); yeni stream açılmaz.")
             stream_id = self._next_id()
-            self._dbg(f"--- REQUEST stream_id={stream_id} {method} {path} ---")
+            if self.debug:
+                self._dbg(f"--- REQUEST stream_id={stream_id} {method} {path} ---")
 
             # Pseudo-header ve başlık SIRASI birer parmak izidir; profilden gelir
             # (Chrome m,a,s,p; Firefox m,p,a,s; Safari m,s,a,p).
             full_headers = h2_request_headers(self._h2, method, authority, scheme, path, headers)
-            self._dbg(f"giden headers: {full_headers}")
+            if self.debug:
+                self._dbg(f"giden headers: {full_headers}")
 
             self._send_headers(stream_id, full_headers, end_stream=(len(body) == 0))
             if body:
@@ -1159,17 +1224,18 @@ class Http2Connection:
         Aynı bağlantı üzerinde ardışık çağrılabilir (her çağrı yeni stream_id alır).
         """
         st = self.request_stream(method, authority, path, headers, body, scheme)
-        out = bytearray()
+        parts: list[bytes] = []
         try:
             while True:
                 c = st.read_chunk()
                 if not c:
                     break
-                out += c
+                parts.append(c)
         except BaseException:
             st._release()
             raise
-        return st.status, st.headers, bytes(out)
+        # Tek kopya (bytearray'e ekleyip sonra bytes() almak büyümeler + bir kopya daha).
+        return st.status, st.headers, b"".join(parts)
 
     _ERR_NAMES = {
         0: "NO_ERROR", 1: "PROTOCOL_ERROR", 2: "INTERNAL_ERROR",
@@ -1179,12 +1245,25 @@ class Http2Connection:
         12: "INADEQUATE_SECURITY", 13: "HTTP_1_1_REQUIRED",
     }
 
-    def _send_window_updates(self, stream_id: int, n: int, stream: bool = True) -> None:
-        self.sock.send_record(HTTP2Frame(4, FrameType.WINDOW_UPDATE, 0, 0,
-                                         struct.pack("!I", n)).serialize())
-        if stream:
-            self.sock.send_record(HTTP2Frame(4, FrameType.WINDOW_UPDATE, 0, stream_id,
-                                             struct.pack("!I", n)).serialize())
+    def _credit(self, st: "Optional[H2ClientStream]", n: int, end_stream: bool) -> None:
+        """Tüketilen ``n`` baytlık DATA için kredi; eşiğe ulaşınca WINDOW_UPDATE.
+
+        Bağlantı kredisi stream bittiğinde de tamamen geri verilir (pencere sızmaz).
+        ``st`` None ise (yabancı/iptal edilmiş stream) yalnızca bağlantı kredisi."""
+        self._conn_unacked += n
+        out = b""
+        if self._conn_unacked >= self._wu_conn_threshold or (end_stream and self._conn_unacked):
+            out = _window_update_frame(0, self._conn_unacked)
+            self._conn_unacked = 0
+        if st is not None:
+            st._unacked += n
+            # Toplama modunda END_STREAM'den sonra stream kredisi anlamsız: gönderme.
+            if st._unacked >= self._wu_stream_threshold and not (
+                    end_stream and self._wu_stream_threshold > 1):
+                out += _window_update_frame(st.stream_id, st._unacked)
+                st._unacked = 0
+        if out:
+            self.sock.send_record(out)
 
     def _foreign_frame(self, frame: HTTP2Frame) -> None:
         """Bizim stream'imize ait olmayan frame (ör. CANCEL ile bırakılan eski stream).
@@ -1205,12 +1284,13 @@ class Http2Connection:
                     self._send_goaway(HpackDecodingError.error_code)
                     raise Http2ConnectionError(f"COMPRESSION_ERROR: {e}") from e
         elif frame.type == FrameType.DATA and frame.payload:
-            self._send_window_updates(frame.stream_id, len(frame.payload), stream=False)
+            self._credit(None, len(frame.payload), end_stream=False)
 
     def _step(self, st: "H2ClientStream") -> bytes:
         """Bir frame okur/işler; DATA ise (padding'siz) gövde baytlarını döner."""
         frame = self._read_frame()
-        self._dbg(f"gelen frame: {frame!r}")
+        if self.debug:      # f-string/repr her frame'de boşuna değerlendirilmesin
+            self._dbg(f"gelen frame: {frame!r}")
         stream_id = st.stream_id
 
         if frame.type == FrameType.PUSH_PROMISE:
@@ -1221,7 +1301,8 @@ class Http2Connection:
             raise Http2ConnectionError("PROTOCOL_ERROR: ENABLE_PUSH=0 iken PUSH_PROMISE alındı")
 
         if frame.stream_id != 0 and frame.stream_id != stream_id:
-            self._dbg(f"  -> beklenmeyen stream_id, yutuluyor (bizim stream={stream_id})")
+            if self.debug:
+                self._dbg(f"  -> beklenmeyen stream_id, yutuluyor (bizim stream={stream_id})")
             self._foreign_frame(frame)
             return b""
 
@@ -1280,6 +1361,8 @@ class Http2Connection:
                     st.headers.extend(block_headers)
             if frame.type == FrameType.HEADERS and frame.end_stream:
                 st.ended = True
+                if self._conn_unacked:       # trailer ile biten akış: bağlantı kredisini geri ver
+                    self._credit(None, 0, end_stream=True)
         elif frame.type == FrameType.DATA:
             # DATA da PADDED olabilir; pencere HAM uzunluk (padding dahil) üzerinden açılır.
             raw_len = len(frame.payload)
@@ -1288,7 +1371,9 @@ class Http2Connection:
                 st.ended = True
             if raw_len > 0:
                 # Tüketici bu veriyi isteyince (frame ancak o zaman okunur) pencere açılır.
-                self._send_window_updates(stream_id, raw_len)
+                self._credit(st, raw_len, frame.end_stream)
+            elif frame.end_stream and self._conn_unacked:
+                self._credit(None, 0, end_stream=True)
             return data
         # PRIORITY ve bilinmeyen frame türleri yok sayılır (RFC 9113 §4.1)
         return b""
@@ -1314,6 +1399,7 @@ class H2ClientStream:
         self._hblock = bytearray()
         self._early = bytearray()
         self._released = False
+        self._unacked = 0             # tüketilmiş, WINDOW_UPDATE ile geri verilmemiş bayt
 
     def _release(self) -> None:
         if not self._released:
@@ -1714,7 +1800,10 @@ class StreamingDecompressor:
             self._obj = brotli.Decompressor()
         elif "zstd" in self._enc and _ZSTD:
             self._obj = _zstd.ZstdDecompressor().stream_reader(b"")
-                                    
+        elif "br" in self._enc or "zstd" in self._enc:
+            # Açıcı kurulu değil: sıkıştırılmış veri sessizce ham geçirilmez.
+            from ..streaming import _decoder_module
+            _decoder_module("br" if "br" in self._enc else "zstd")   # MissingDecoderError
 
     def decompress(self, chunk: bytes) -> bytes:
         if not self._obj or not chunk:
