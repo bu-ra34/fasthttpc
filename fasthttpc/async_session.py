@@ -32,12 +32,14 @@ from .cookies         import CookieJar
 from .multipart       import encode_multipart
 from .protocol.http1_parser import HTTP1Parser, MAX_RESPONSE_HEADER_BYTES, parse_chunk_size
 from .models.request  import Request
-from .config          import Limits, Timeout, resolve_verify
+from .config          import Limits, Timeout, environ_ca_bundle, resolve_verify
 from .retry           import Retry
 from .tls13 import AsyncTLSStream
 from .protocol.async_h2 import AsyncHttp2Connection, H2StreamRefused
 from .protocol.http2_parser import Http2ConnectionError, Http2StreamError
-from .transport.proxy import ProxyConfig, ProxyError, async_connect_via_proxy, parse_proxy_url, resolve_proxy
+from .transport.proxy import (ProxyConfig, ProxyError, absolute_form, async_connect_to_proxy,
+                              async_connect_via_proxy, authority, forward_proxy_headers,
+                              parse_proxy_url, select_proxy)
 from .transport.happy_eyeballs import CONNECTION_ATTEMPT_DELAY
 
 if TYPE_CHECKING:
@@ -49,8 +51,11 @@ if TYPE_CHECKING:
     from .transport.mock import BaseTransport
     from .transport.proxy import ProxySpec
 
-# Havuz / h2 önbelleği anahtarları: (host, port, proxy[, impersonate-mi][, sertifika kimliği]).
+# Havuz / h2 önbelleği anahtarları: (host, port, proxy[, impersonate-mi][, _PLAIN]
+# [, sertifika kimliği]).
 _ConnKey = tuple[Any, ...]
+# Düz ``http://`` bağlantılarının anahtar işareti (aynı host:port'taki https'ten ayrılır).
+_PLAIN = "plain-http"
 # ``_exchange`` sonucu: (status, Headers, gövde | async akış, gönderim zamanı, http sürümü).
 _ExchangeResult = tuple[int, Headers, "bytes | AsyncBodyStream", float, str]
 
@@ -159,6 +164,8 @@ class _Opened:
     reused:  bool = False          # havuzdan gelen (bayat olabilir) bağlantı
     last_used: float = 0.0
     loop:    Any = None
+    # http:// + HTTP proxy: soket proxy'nin kendisine açık, istek mutlak biçimli gider.
+    forward_proxy: Optional[ProxyConfig] = None
 
 
 class _StaleConn(Exception):
@@ -363,7 +370,7 @@ class AsyncSession:
         # ClientHello'su) kurulur ve profilin ALPN'i (h2, http/1.1) kullanılır;
         # sunucu h2 seçerse HTTP/2 (multiplexing) konuşulur.
         # impersonate=None -> stdlib ssl, yalnızca HTTP/1.1.
-        from .session import _proxy_spec
+        from .session import _env_proxies, _proxy_spec
         self.impersonate   = impersonate
         # requests/httpx uyumu (Session ile aynı): kimlik, hook'lar, varsayılan params.
         self.auth          = auth
@@ -384,11 +391,15 @@ class AsyncSession:
         self.timeout       = Timeout.from_value(timeout)
         self.verify        = verify
         self._ca_path      = resolve_verify(verify)   # None → varsayılan güven deposu
+        if self._ca_path is None and trust_env:
+            self._ca_path = environ_ca_bundle()      # REQUESTS_CA_BUNDLE / SSL_CERT_FILE
         self.retries       = Retry.from_value(retries)
         self.transport     = transport
         self.max_redirects = max_redirects
         self.limits        = limits if limits is not None else Limits(max_connections=max_connections)
         self._proxy_spec   = _proxy_spec(proxy, proxies)
+        # trust_env: HTTP(S)_PROXY / ALL_PROXY / NO_PROXY (açık proxy verilmemişse; kurulumda okunur)
+        self._env_proxies  = _env_proxies(proxy, proxies, trust_env)
         self.resolver      = resolver      # opsiyonel DoHResolver (senkron Session ile aynı)
         self.cookie_jar    = CookieJar()
         self._plugins: list[Plugin]   = []
@@ -427,8 +438,11 @@ class AsyncSession:
                                                                                
 
     def _origin_key(self, u: URL, proxy: Optional[ProxyConfig]) -> _ConnKey:
-        """h2/protokol önbelleği anahtarı; mTLS'de sertifika kimliği anahtara girer."""
-        k = (u.host, u.port, proxy)
+        """h2/protokol önbelleği anahtarı; mTLS'de sertifika kimliği anahtara girer.
+        Düz ``http://`` aynı host:port'taki https bağlantısıyla ASLA paylaşılmaz."""
+        k: _ConnKey = (u.host, u.port, proxy)
+        if u.scheme == "http":
+            k += (_PLAIN,)
         return k + (self.client_cert.identity,) if self.client_cert is not None else k
 
     @property
@@ -451,6 +465,7 @@ class AsyncSession:
         self.cookie_jar.update_from_headers(
             response_headers.get_list("set-cookie"),
             request_host=url.host, request_path=url.path,
+            secure_origin=url.scheme in ("https", "wss"),
         )
 
     def _cookie_header(self, url: URL) -> str:
@@ -463,7 +478,8 @@ class AsyncSession:
         stats: dict[str, dict[str, int]] = {}
         # Anahtar: (host, port, proxy, impersonate-mi[, sertifika kimliği]) -> uzunluk değişken.
         for (host, port, *_rest), lst in self._idle.items():
-            stats.setdefault(f"https://{host}:{port}", {"idle": 0, "h2": 0})["idle"] += len(lst)
+            scheme = "http" if _PLAIN in _rest else "https"
+            stats.setdefault(f"{scheme}://{host}:{port}", {"idle": 0, "h2": 0})["idle"] += len(lst)
         for (host, port, *_rest), conn in self._h2.items():
             if conn.usable:
                 stats.setdefault(f"https://{host}:{port}", {"idle": 0, "h2": 0})["h2"] += 1
@@ -558,22 +574,26 @@ class AsyncSession:
     # --- proxy seçimi ve bağlantı kurulumu ---------------------------------
 
     def _select_proxy(self, u: URL) -> "tuple[Optional[ProxyConfig], Optional[str]]":
-        """(ProxyConfig, rotator URL'i). Rotasyon açıksa o, değilse proxy=/proxies=."""
+        """(ProxyConfig, rotator URL'i). Rotasyon açıksa o, değilse proxy=/proxies=,
+        o da yoksa (trust_env) ortam değişkenleri (NO_PROXY dahil)."""
         if self._rotator is not None:
             url = self._rotator.next()
             if url:
                 return parse_proxy_url(url), url
-        return resolve_proxy(self._proxy_spec, u.scheme), None
+        return select_proxy(u.scheme, u.host, u.port, self._proxy_spec, self._env_proxies), None
 
     async def _connect(self, host: str, port: int, proxy: Optional[ProxyConfig], *,
-                       alpn: "Optional[list[str]]" = None, tls: bool = True) -> "tuple[Any, Any, str]":
+                       alpn: "Optional[list[str]]" = None, tls: bool = True,
+                       forward: bool = False) -> "tuple[Any, Any, str]":
         """TCP (+ varsa proxy tüneli) + TLS. ``(reader, writer, alpn)`` döner.
 
         impersonate: tarayıcı ClientHello'su (ALPN = profilin h2, http/1.1
         listesi; ``alpn=`` ile geçersiz kılınabilir, ör. WebSocket için
         ``["http/1.1"]``); tünel varsa TLS tünelin İÇİNDE, hedef host'a karşı
         kurulur. impersonate=None: stdlib ssl, yalnızca http/1.1.
-        ``tls=False``: düz TCP (``ws://``), yine proxy tüneli üzerinden olabilir.
+        ``tls=False``: düz TCP (``ws://``, ``http://``), yine proxy tüneli üzerinden olabilir.
+        ``forward=True`` (yalnızca ``tls=False`` ile): HTTP proxy'sine tünelsiz bağlanılır
+        (düz ``http://`` istekleri proxy'ye mutlak biçimli gider; SOCKS5'te etkisi yok).
         """
         connect_to = self._tmo().connect
         sni = host
@@ -586,6 +606,9 @@ class AsyncSession:
             if not tls:
                 if proxy is None:
                     reader, writer = await B.open_connection(host, port)
+                elif forward and proxy.scheme == "http":
+                    reader, writer = await async_connect_to_proxy(
+                        proxy, timeout=connect_to, progress=progress)
                 else:
                     reader, writer = await async_connect_via_proxy(
                         proxy, host, port, timeout=connect_to, progress=progress)
@@ -663,7 +686,9 @@ class AsyncSession:
         return release
 
     def _h1_key(self, u: URL, proxy: Optional[ProxyConfig]) -> _ConnKey:
-        k = (u.host, u.port, proxy, self.impersonate is not None)
+        k: _ConnKey = (u.host, u.port, proxy, self.impersonate is not None)
+        if u.scheme == "http":
+            k += (_PLAIN,)
         return k + (self.client_cert.identity,) if self.client_cert is not None else k
 
     @staticmethod
@@ -746,15 +771,18 @@ class AsyncSession:
                     return o
             if metrics:
                 metrics.connect_start = time.perf_counter()
-            reader, writer, alpn = await self._connect(u.host, u.port, proxy)
+            plain = u.scheme == "http"      # düz HTTP/1.1: TLS yok, h2c yok
+            reader, writer, alpn = await self._connect(u.host, u.port, proxy, tls=not plain,
+                                                       forward=plain)
         except BaseException:
             release()
             raise
         if metrics:
             metrics.connect_end = time.perf_counter()
             metrics.tls_end     = time.perf_counter()
+        fwd = proxy if plain and proxy is not None and proxy.scheme == "http" else None
         return _Opened(reader, writer, alpn, release, key=key,
-                       loop=B.current_token())
+                       loop=B.current_token(), forward_proxy=fwd)
 
     async def _h1_finish(self, o: "_Opened", reusable: bool) -> None:
         """İstek bitti: bağlantıyı havuza koyar ya da kapatır; slot HER durumda geri verilir."""
@@ -826,7 +854,7 @@ class AsyncSession:
         check_request_line(method, u.raw_path.decode("latin-1"))
         for k, v in req_headers.items():
             check_header_field(k, str(v))
-        if self._h3 is not None:
+        if self._h3 is not None and u.scheme == "https":     # h3 yalnızca https
             if proxy is not None or self._rotator is not None:
                 if self._h3.state.force:
                     raise ConnectionError("http3='force' bir HTTP proxy ile kullanılamaz (UDP).")
@@ -850,7 +878,8 @@ class AsyncSession:
                 if metrics:
                     metrics.connection_reused = True
                     metrics.connect_start = metrics.connect_end = time.perf_counter()
-            elif self.impersonate is not None and self._origin_proto.get(key) != "h1":
+            elif (self.impersonate is not None and u.scheme != "http"
+                  and self._origin_proto.get(key) != "h1"):
                 # Protokol henüz bilinmiyor: aynı kaynağa eşzamanlı gelen isteklerin
                 # tek bir h2 bağlantısını paylaşabilmesi için ilk el sıkışma serileşir.
                 async with self._origin_locks.setdefault(key, B.Lock()):
@@ -1064,9 +1093,16 @@ class AsyncSession:
         finished = False
         got_bytes = False        # yanıttan en az 1 bayt geldi mi (yeniden deneme güvenliği)
         try:
-            req_line = f"{method} {u.raw_path.decode()} HTTP/1.1\r\n"
-            for k, v in order_h1(self.impersonate, drop_h2_only_defaults(
-                    self.impersonate, list(req_headers.items()))):
+            target = u.raw_path.decode()
+            fwd = opened.forward_proxy
+            if fwd is not None:          # http:// + HTTP proxy: mutlak biçim (CONNECT yok)
+                target = absolute_form(u.host, u.port, target)
+            req_line = f"{method} {target} HTTP/1.1\r\n"
+            pairs = order_h1(self.impersonate, drop_h2_only_defaults(
+                self.impersonate, list(req_headers.items())))
+            if fwd is not None and not any(k.lower() == "proxy-authorization" for k, _ in pairs):
+                pairs += forward_proxy_headers(fwd)
+            for k, v in pairs:
                 req_line += f"{k}: {v}\r\n"
             req_line += "\r\n"
             raw_request = req_line.encode("ascii") + (raw_body or b"")
@@ -1182,7 +1218,7 @@ class AsyncSession:
         # + kullanıcı başlıkları (geçersiz kılar); büyük/küçük harf duyarsız.
         hh = Headers(merge_default_headers(self.impersonate, req_dict.get("headers") or {}))
         if "host" not in hh:
-            hh["Host"] = u.host
+            hh["Host"] = authority(u.host, u.port, u.scheme)
         if "connection" not in hh:
             hh["Connection"] = "keep-alive"
         req_headers = {k.decode("latin-1"): v.decode("latin-1") for k, v in hh.raw}
@@ -1227,7 +1263,8 @@ class AsyncSession:
             else:
                 resp = Response(status_code=status_code, headers=resp_headers, astream=body_raw)
             resp.http_version = http_version
-            resp.tls_info = self._tls_infos.get((u.host, u.port, proxy_cfg))
+            resp.tls_info = (None if u.scheme == "http"
+                             else self._tls_infos.get((u.host, u.port, proxy_cfg)))
             resp.url = str(url)
             if metrics and metrics.request_start:
                 resp.elapsed = time.perf_counter() - metrics.request_start
@@ -1267,7 +1304,7 @@ class AsyncSession:
         if self.transport is None:
             resp = await self._raw_request(method, url, headers=headers, body=body,
                                            metrics=metrics, stream=stream)
-            if self._h3 is not None:
+            if self._h3 is not None and str(url).lower().startswith("https:"):
                 u = URL(str(url))
                 self._h3.state.observe(u.host, u.port, resp.headers)    # Alt-Svc keşfi
             return resp
@@ -1431,7 +1468,9 @@ class AsyncSession:
                 same_origin = cur.origin == first_origin
                 hop_auth, _src = self._auth_for(
                     auth if same_origin else None, url_creds if same_origin else None, cur.host)
-                if not same_origin and _src == "explicit":
+                if ((not same_origin and _src == "explicit")
+                        or _api.is_downgrade(first_origin[0], cur.scheme)):
+                    # https -> http: hiçbir kimlik (.netrc dahil) düz metin olarak gitmez.
                     hop_auth = None
                 hop_headers = dict(merged)
                 if same_origin and req_cookies and not _api._has(hop_headers, "cookie"):

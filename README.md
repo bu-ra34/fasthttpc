@@ -75,7 +75,7 @@ with Session(transport=transport) as s:
 
 | Area | Support |
 |---|---|
-| Protocols | HTTP/1.1 (keep-alive, chunked), HTTP/2 (flow control, GOAWAY; concurrent streams on `AsyncSession`), WebSocket (`ws://`, `wss://`), HTTP/3 (**experimental**, opt-in, see below) |
+| Protocols | HTTP/1.1 (keep-alive, chunked; also plain-text `http://`), HTTP/2 (flow control, GOAWAY; concurrent streams on `AsyncSession`), WebSocket (`ws://`, `wss://`), HTTP/3 (**experimental**, opt-in, see below) |
 | TLS | Own TLS 1.3 (HelloRetryRequest; key_share x25519, secp256r1, secp384r1, and hybrid post-quantum X25519MLKEM768 when `cryptography` provides ML-KEM) and a safe subset of TLS 1.2 (ECDHE + AEAD, EMS required). TLS 1.3 PSK resumption is implemented but off by default; no 0-RTT |
 | Server authentication | Chain + hostname, CertificateVerify, Finished, all mandatory; `verify=` custom CA bundle |
 | Client certificates | `cert=` (mTLS): PEM, encrypted PKCS#8 or PKCS#12; RSA >= 2048, P-256, P-384, Ed25519; TLS 1.3 and TLS 1.2 |
@@ -83,7 +83,7 @@ with Session(transport=transport) as s:
 | Async | `AsyncSession` under asyncio, or trio through anyio (`fasthttpc[trio]`), with the same fingerprinting and real HTTP/2 multiplexing |
 | Streaming | `stream=True` / `s.stream(...)`; `iter_bytes`, `iter_text`, `iter_lines`, `iter_raw` and the async `aiter_*` versions, over HTTP/1.1 and HTTP/2 |
 | Auth and hooks | Basic, Digest (RFC 7616), Bearer, `.netrc`, custom auth (requests or httpx style); requests-style `hooks=`, httpx-style `event_hooks=`; plugins on `Session` and `AsyncSession` |
-| Proxies | HTTP CONNECT (+Basic), SOCKS5 (RFC 1929), rotation; TLS always terminates inside the tunnel |
+| Proxies | HTTP CONNECT (+Basic), SOCKS5 (RFC 1929), rotation; `HTTP_PROXY`/`HTTPS_PROXY`/`ALL_PROXY`/`NO_PROXY` with `trust_env=True`; TLS always terminates inside the tunnel |
 | Timeouts / limits / retries | `Timeout` (including a `total` budget), `Limits`, urllib3-style `Retry` with `Retry-After` |
 | Cookies, cache, redirects | RFC 6265 cookie jar, response cache, redirect history |
 | DNS | Optional DNS-over-HTTPS resolver; Happy Eyeballs (RFC 8305) for hosts with several addresses |
@@ -137,7 +137,10 @@ checks, all mandatory:
 | **Server Finished** | The handshake transcript was not tampered with (section 4.4.4) |
 
 Trust anchors are the `certifi` bundle plus the system store, or exactly the
-PEM file you pass as `verify="ca.pem"`. **`verify=False` is not supported** and
+PEM file you pass as `verify="ca.pem"` (with `trust_env=True` and `verify=True`,
+the file named by `REQUESTS_CA_BUNDLE`, `SSL_CERT_FILE` or `CURL_CA_BUNDLE`
+replaces the default store, as in requests/httpx; verification itself never
+turns off). **`verify=False` is not supported** and
 raises `ValueError`; pass the CA (or the self-signed certificate) you want to
 trust instead. TLS 1.2 additionally enforces Extended Master Secret,
 renegotiation_info, `DOWNGRD` sentinel detection and rejects CBC, static RSA,
@@ -150,6 +153,13 @@ is sent.
 this stack: they use Python's `ssl` module with
 `ssl.create_default_context()`, which also always verifies the certificate
 chain and hostname.
+
+`http://` URLs are sent in plain text (HTTP/1.1, like requests and httpx), so
+nothing about them is authenticated or confidential. A redirect from `https://`
+to `http://` is followed, but that hop carries no credentials at all
+(`Authorization`, `Proxy-Authorization`, `auth=`, `.netrc`, `user:pass@`) and no
+`Secure` cookies; a plain-HTTP response cannot set or overwrite a `Secure`
+cookie. There is no HSTS: nothing upgrades `http://` to `https://` for you.
 
 What this does **not** give you: an independent audit (the internal review
 and its open findings are in the
@@ -174,15 +184,16 @@ privately via GitHub security advisories.
 - HPACK Huffman *encoding* is not implemented (decoding is); this causes a tiny HTTP/2 fingerprint deviation.
 - HTTP/2 server push is disabled (`ENABLE_PUSH=0`). PRIORITY frames are not
   sent; the priority field of the HEADERS frame follows the profile.
-- No cleartext HTTP: `http://` URLs are also fetched over TLS (on port 80
-  unless the URL gives a port), so plain-HTTP-only servers cannot be reached.
-  `ws://` WebSockets do use plain TCP.
+- `http://` is plain HTTP/1.1 only: no h2c (cleartext HTTP/2), no HTTP/3, and
+  no HSTS (an `http://` URL is never upgraded to `https://`). Up to 0.6.2
+  `http://` URLs were fetched over TLS instead.
 - HTTP/3 is experimental: it is not used through proxies or together with
   `cert=`, is not used under trio (`http3=True` falls back, `"force"` raises
   `Http3ConnectError`), buffers the whole response body (also
   with `stream=True`), and never uses resumption or 0-RTT.
-- `https://` proxies (TLS to the proxy) are not supported, and proxy
-  environment variables (`HTTPS_PROXY`, ...) are not read.
+- `https://` proxies (TLS to the proxy) are not supported; an explicit or
+  environment proxy URL with such a scheme raises `ValueError`. Proxy and CA
+  environment variables are read once, when the session is created.
 - `Session` is not thread-safe: use one per thread.
 - `Timeout.write` is not enforced separately on the sync side.
 - Only 3 browser families are modelled; profiles are snapshots and age.

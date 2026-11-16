@@ -295,3 +295,9 @@ def next_request(resp: "Response", method: str, current_url: object,
         hdrs = {k: v for k, v in hdrs.items() if k.lower() not in ("content-type", "content-length")}
     return Request(method, target, headers=hdrs, data=body or None)
 
+
+
+def is_downgrade(first_scheme: str, scheme: str) -> bool:
+    """https ile başlayan istek zinciri düz http'ye mi yönlendirildi? (Bu adımda hiçbir
+    kimlik — açık auth, URL'deki user:pass@, .netrc — gönderilmez.)"""
+    return first_scheme in ("https", "wss") and scheme == "http"

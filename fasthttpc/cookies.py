@@ -163,7 +163,11 @@ class CookieJar:
         self._lock = threading.RLock()
 
     def update_from_headers(self, set_cookie_values: Iterable[str],
-                            request_host: str, request_path: str) -> None:
+                            request_host: str, request_path: str,
+                            secure_origin: bool = True) -> None:
+        """``secure_origin=False`` (düz ``http://`` yanıtı): RFC 6265bis §5.7 gereği
+        ``Secure`` çerez KONULAMAZ ve aynı adlı, örtüşen bir ``Secure`` çerezin üzerine
+        yazılamaz/silinemez (ağdaki saldırgan https oturum çerezini değiştiremesin)."""
         for raw in set_cookie_values:
             if not raw:
                 continue
@@ -173,10 +177,23 @@ class CookieJar:
             key = (cookie.domain, cookie.path, cookie.name)
             # Boş değer + geçmiş tarih = silme talebi
             with self._lock:
+                if not secure_origin and (cookie.secure or self._shadows_secure(cookie)):
+                    continue
                 if cookie.is_expired():
                     self._cookies.pop(key, None)
                 else:
                     self._cookies[key] = cookie
+
+    def _shadows_secure(self, new: Cookie) -> bool:
+        """Aynı adlı, alan adı örtüşen ve yeni çerezin path'i onunkine path-match eden
+        Secure çerez var mı (RFC 6265bis §5.7)?"""
+        for c in self._cookies.values():
+            if (c.secure and c.name == new.name
+                    and (_domain_matches(c.domain, new.domain, False)
+                         or _domain_matches(new.domain, c.domain, False))
+                    and _path_matches(new.path, c.path)):
+                return True
+        return False
 
     def header_for(self, host: str, path: str, secure: bool) -> str:
         """Verilen istek için gönderilecek ``Cookie`` başlığı değerini üretir."""

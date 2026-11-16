@@ -313,7 +313,8 @@ def test_async_proxy_connect_zaman_asimi_proxyerror(monkeypatch):
 def test_async_session_proxy_connect_zaman_asimi_proxyerror(monkeypatch, url):
     """AsyncSession proxy yolunu aynı süreli DIŞ bir zaman aşımıyla da sarar; proxy'ye TCP
     bağlanırken süre dolunca dış zamanlayıcı içtekini geçer. Sonuç yine ProxyError olmalı
-    (Windows CI'da kapalı porta ret ~2 sn'de geldiği için görüldü)."""
+    (Windows CI'da kapalı porta ret ~2 sn'de geldiği için görüldü). https:// CONNECT tüneli
+    yolunu, http:// ise (düz HTTP desteğinden beri) tünelsiz mutlak biçim yolunu (async_connect_to_proxy) sınar."""
     import asyncio
 
     from fasthttpc import AsyncSession
