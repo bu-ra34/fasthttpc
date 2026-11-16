@@ -361,6 +361,7 @@ def test_tcp_rejects_hostname_mismatch():
         f"verification was never reached: {outcomes}")
 
 
+@pytest.mark.badssl
 @pytest.mark.parametrize("profile", BADSSL_PROFILES)
 @pytest.mark.parametrize("url", BADSSL_BAD_CERT)
 def test_badssl_bad_cert_hosts_refused(url, profile):
@@ -383,6 +384,7 @@ def test_badssl_bad_cert_hosts_refused(url, profile):
         f"(remote reset/timeout?): {ei.value!r}")
 
 
+@pytest.mark.badssl
 @pytest.mark.parametrize("profile", BADSSL_PROFILES)
 def test_badssl_valid_cert_host_refused_for_missing_ems(profile):
     """badssl.com's valid-certificate front page is refused by the EMS check too, which
@@ -399,6 +401,7 @@ def test_badssl_valid_cert_host_refused_for_missing_ems(profile):
         f"not the EMS refusal: {ei.value!r}")
 
 
+@pytest.mark.badssl
 @pytest.mark.parametrize("url", (*BADSSL_BAD_CERT, BADSSL_VALID_CERT))
 def test_badssl_reachable_with_stdlib_ssl(url):
     """Control for the badssl tests: the same hosts through Python's ssl module

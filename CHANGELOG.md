@@ -155,6 +155,9 @@ düzeltmeleri, HTTP/2 indirmelerinde ~1,6–1,8x hızlanma ve gerçek internette
   record ve frame sayılarını ölçen regresyon testleri.
 
 ### Testler / CI
+- badssl.com, GitHub runner'larından gelen bağlantıları ara ara sıfırlıyor (Python'un
+  kendi `ssl` modülü dahil, bütün profillerde). `badssl` işaretli canlı testler
+  ayrı, işi düşürmeyen bir adımda çalışır; doğrulamaları değişmedi.
 - Canlı HTTP/3 testleri (`tests/live`, `FASTHTTPC_LIVE=1`) için ayrı bir GitHub
   Actions iş akışı eklendi (`.github/workflows/live.yml`, "Live tests"): yalnızca
   elle (Actions → Live tests → Run workflow) ve haftada bir çalışır, push/PR'da
