@@ -23,7 +23,7 @@ pip install "fasthttpc[http3]"   # optional: experimental HTTP/3
 ```python
 from fasthttpc import Session
 
-with Session(impersonate="chrome_131") as s:
+with Session(impersonate="chrome_158") as s:
     print(s.get("https://httpbin.org/get").json())
 ```
 

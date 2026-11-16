@@ -330,7 +330,7 @@ class AsyncSession:
 
     def __init__(
         self,
-        impersonate:     str   = "chrome_131",
+        impersonate:     str   = "chrome_158",
         timeout:         "Union[float, int, Timeout]" = 30.0,
         max_redirects:   int   = 10,
         max_connections: int   = 100,

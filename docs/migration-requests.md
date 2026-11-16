@@ -22,4 +22,4 @@ Differences to know: `verify`, `cert` and `proxies` are session-level, not per
 request; `Session` is not thread-safe; proxy environment variables
 (`HTTPS_PROXY` ...) are not read; `http://` URLs are fetched over TLS (there is
 no cleartext HTTP); `Session()` impersonates Chrome by default
-(`impersonate="chrome_131"`).
+(`impersonate="chrome_158"`).

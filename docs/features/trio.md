@@ -9,7 +9,7 @@ import trio
 from fasthttpc import AsyncSession
 
 async def main():
-    async with AsyncSession(impersonate="chrome_131") as s:
+    async with AsyncSession(impersonate="chrome_158") as s:
         r = await s.get("https://httpbin.org/get")
         print(r.status_code)
 

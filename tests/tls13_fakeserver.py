@@ -30,9 +30,11 @@ _SUITES = {
 
 # ----------------------------------------------------------------- PKI
 class PKI:
-    """Kök CA + ondan imzalı leaf (ECDSA P-256)."""
+    """Kök CA + ondan imzalı leaf (varsayılan ECDSA P-256; ``leaf_key="mldsa44"`` /
+    ``"mldsa65"`` / ``"mldsa87"`` ile ML-DSA leaf — CA yine ECDSA)."""
 
-    def __init__(self, host: str = "example.com", *, expired: bool = False):
+    def __init__(self, host: str = "example.com", *, expired: bool = False,
+                 leaf_key: str = "p256"):
         now = datetime.datetime.now(datetime.timezone.utc)
         self.ca_key = ec.generate_private_key(ec.SECP256R1())
         ca_name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "fasthttpc test CA")])
@@ -52,7 +54,12 @@ class PKI:
             .add_extension(ca_ski, critical=False)
             .sign(self.ca_key, hashes.SHA256())
         )
-        self.key = ec.generate_private_key(ec.SECP256R1())
+        self.leaf_key = leaf_key
+        if leaf_key.startswith("mldsa"):
+            from cryptography.hazmat.primitives.asymmetric import mldsa
+            self.key = getattr(mldsa, f"MLDSA{leaf_key[5:]}PrivateKey").generate()
+        else:
+            self.key = ec.generate_private_key(ec.SECP256R1())
         nb, na = (now - datetime.timedelta(days=10), now - datetime.timedelta(days=1)) if expired \
             else (now - datetime.timedelta(days=1), now + datetime.timedelta(days=10))
         self.cert = (
@@ -322,6 +329,12 @@ class FakeTLS13Server:
             ee_ext += ext(16, struct.pack("!H", len(lst)) + lst)
         if "alps" in self.tamper:
             ee_ext += ext(17513, b"\x00\x00")          # ALPS kabul (sunucu ayarları boş)
+        if "alps_new" in self.tamper:
+            ee_ext += ext(17613, b"\x00\x00")          # ALPS yeni kod noktası (Chrome 133+)
+        if "trust_anchors" in self.tamper:
+            # draft-ietf-tls-trust-anchor-ids: sunucunun sunabildiği anchor listesi (EE).
+            ids = b"\x04\xd6\x79\x09\x01" + b"\x03\x82\x01\x02"
+            ee_ext += ext(0xCA34, struct.pack("!H", len(ids)) + ids)
         msgs.append(hs(8, struct.pack("!H", len(ee_ext)) + ee_ext))
         if "cert_request" in self.tamper:
             msgs.append(hs(13, getattr(self, "cr_body", None) or b"\x00\x00\x00"))
@@ -329,19 +342,28 @@ class FakeTLS13Server:
             self.transcript += m
         send_cert = psk is None or "psk_with_cert" in self.tamper
         if "skip_cert" not in self.tamper and send_cert:
-            certs = b"".join(len(d).to_bytes(3, "big") + d + b"\x00\x00"
+            # trust_anchors: CertificateEntry'de boş extension = "seçilen zincir eşleşti".
+            entry_ext = ext(0xCA34, b"") if "trust_anchors" in self.tamper else b""
+            certs = b"".join(len(d).to_bytes(3, "big") + d
+                             + struct.pack("!H", len(entry_ext)) + entry_ext
                              for d in self.pki.chain_der())
             cert_msg = hs(11, b"\x00" + len(certs).to_bytes(3, "big") + certs)
             self.transcript += cert_msg
             msgs.append(cert_msg)
         if "skip_cv" not in self.tamper and send_cert:
             content = b"\x20" * 64 + b"TLS 1.3, server CertificateVerify\x00" + self.th()
-            signer = ec.generate_private_key(ec.SECP256R1()) if "wrong_key_cv" in self.tamper \
-                else self.pki.key
-            sig = signer.sign(content, ec.ECDSA(hashes.SHA256()))
+            if self.pki.leaf_key.startswith("mldsa"):
+                # draft-ietf-tls-mldsa: saf ML-DSA, boş bağlam; şema = parametre kümesi.
+                scheme = {"mldsa44": 0x0904, "mldsa65": 0x0905, "mldsa87": 0x0906}[self.pki.leaf_key]
+                sig = self.pki.key.sign(content)
+            else:
+                scheme = 0x0403
+                signer = ec.generate_private_key(ec.SECP256R1()) if "wrong_key_cv" in self.tamper \
+                    else self.pki.key
+                sig = signer.sign(content, ec.ECDSA(hashes.SHA256()))
             if "bad_cv_sig" in self.tamper:
                 sig = sig[:-1] + bytes([sig[-1] ^ 1])
-            cv = hs(15, struct.pack("!HH", 0x0403, len(sig)) + sig)
+            cv = hs(15, struct.pack("!HH", scheme, len(sig)) + sig)
             self.transcript += cv
             msgs.append(cv)
         fkey = expand_label(self.h, self.s_hts, "finished", b"", hl)
@@ -406,14 +428,15 @@ class FakeTLS13Server:
         return None
 
     def _on_encrypted(self, content: bytes, ctype: int) -> bytes:
-        if self.state == "WAIT_FINISHED" and "alps" in self.tamper and content[:1] == b"\x08":
+        alps = "alps" in self.tamper or "alps_new" in self.tamper
+        if self.state == "WAIT_FINISHED" and alps and content[:1] == b"\x08":
             # ALPS: istemci EncryptedExtensions'ı Finished'tan ÖNCE gelir ve transcript'e girer.
             assert ctype == 22
             self.client_ee = content
             self.transcript += content
             return b""
         if self.state == "WAIT_FINISHED":
-            if "alps" in self.tamper:
+            if alps:
                 assert getattr(self, "client_ee", None), "ALPS kabul edildi ama istemci EE yollamadı"
             assert ctype == 22 and content[0] == 20, "client Finished bekleniyordu"
             hl = self.h.digest_size
