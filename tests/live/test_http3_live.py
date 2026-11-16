@@ -15,6 +15,7 @@ import asyncio
 import datetime
 import os
 import socket
+import ssl
 
 import pytest
 
@@ -40,6 +41,8 @@ from fasthttpc import AsyncSession, Session  # noqa: E402
 from fasthttpc.http3 import Http3Options  # noqa: E402
 from fasthttpc.security.cert_validator import CertificateValidationError  # noqa: E402
 from fasthttpc.security.tls12 import AL_HANDSHAKE_FAILURE, TLS12Error  # noqa: E402
+from fasthttpc.tls13.errors import TLSAlertError  # noqa: E402
+from fasthttpc.tls_crafter import TLSImpersonator  # noqa: E402
 
 TIMEOUT = 15
 # Short QUIC handshake budget so a blocked UDP path fails fast instead of hanging.
@@ -66,6 +69,11 @@ BADSSL_BAD_CERT = (
 )
 # badssl.com's own (valid-certificate) front page: same server, same missing EMS.
 BADSSL_VALID_CERT = "https://badssl.com/"
+# Every badssl check runs once per TLS profile, so a CI log shows exactly which
+# ClientHello (if any) a badssl.com server resets: chrome_131 (the 0.6.x default),
+# chrome_158 (the 0.7.0 default: trust_anchors 0xca34, ML-DSA sigalgs, ALPS 17613),
+# firefox_160, safari_27 and fasthttpc's own non-browser "default" profile.
+BADSSL_PROFILES = ("chrome_131", "chrome_158", "firefox_160", "safari_27", "default")
 
 # Real servers that negotiate TLS 1.3 over TCP: certificate validation on the TCP path
 # is exercised against these.
@@ -74,9 +82,18 @@ TCP_TLS13_ORIGINS = (
     "https://www.google.com/",
 )
 
-# Single-site nginx (serves its default certificate whatever the SNI): the
-# hostname-mismatch test reaches it under a name its certificate cannot cover.
-MISMATCH_TARGET_HOST = "quic.nginx.org"
+# TLS 1.3 front ends reached under a name their certificate cannot cover. A server
+# can react to an unknown SNI in two ways: serve its default certificate (fasthttpc
+# must then reject it with "no matching subjectAltName") or abort the handshake with
+# the unrecognized_name alert (RFC 6066 §3; quic.nginx.org does this, which is why it
+# is no longer used here). The alert never reaches certificate validation, so it
+# proves nothing about hostname verification: it is tolerated per target, but at
+# least one target must produce the SAN mismatch.
+#  - www.google.com: Google's front ends answer an SNI they do not host with their
+#    default *.google.com certificate.
+#  - github.com: single-tenant front end, serves the github.com certificate
+#    whatever the SNI.
+MISMATCH_TARGETS = ("www.google.com", "github.com")
 # RFC 2606 ``.invalid``: guaranteed never to appear in a publicly trusted certificate.
 MISMATCH_WRONG_NAME = "fasthttpc-hostname-mismatch.invalid"
 
@@ -87,6 +104,11 @@ _EMS_REFUSAL = "Extended Master Secret (RFC 7627) kabul etmedi"
 # name. It checks the leaf's SAN before building the chain, so this is reported for
 # a wrong name whether or not the chain itself would be trusted.
 _SAN_MISMATCH = "no matching subjectAltName"
+# TLS alert 112 (RFC 6066 §3): the server does not host the requested SNI name.
+AL_UNRECOGNIZED_NAME = 112
+# How fasthttpc.security.alerts.describe_alert renders it when the alert arrives as
+# a plaintext record before ServerHello (raised as a plain ConnectionError).
+_UNRECOGNIZED_NAME_TEXT = "fatal alert 112 (unrecognized_name)"
 
 
 def _opts(mode: str) -> Http3Options:
@@ -125,6 +147,23 @@ def _ems_refusal(exc: BaseException) -> TLS12Error | None:
     """The specific "server did not accept Extended Master Secret" refusal, nothing else."""
     return next((e for e in _chain(exc) if isinstance(e, TLS12Error)
                  and e.alert == AL_HANDSHAKE_FAILURE and _EMS_REFUSAL in str(e)), None)
+
+
+def _unrecognized_name_alert(exc: BaseException) -> BaseException | None:
+    """Exactly the server's unrecognized_name alert, nothing else."""
+    for e in _chain(exc):
+        if isinstance(e, TLSAlertError) and e.description == AL_UNRECOGNIZED_NAME:
+            return e
+        if isinstance(e, ConnectionError) and _UNRECOGNIZED_NAME_TEXT in str(e):
+            return e
+    return None
+
+
+def _hello_size(profile: str, host: str) -> int:
+    """Size of one ClientHello record of ``profile`` for ``host`` (varies by up to
+    ~100 bytes between connections: ECH GREASE length, extension permutation)."""
+    name = None if profile == "default" else profile
+    return len(TLSImpersonator(host, profile=name).build_client_hello()[0])
 
 
 def _assert_cert_rejected(excinfo) -> CertificateValidationError:
@@ -278,55 +317,108 @@ def test_tcp_rejects_chain_from_untrusted_ca(origin, tmp_path):
     _assert_cert_rejected(ei)
 
 
-def test_tcp_rejects_hostname_mismatch():
-    """A real TLS 1.3 server reached under a name its certificate does not cover.
-
-    The TCP destination is pinned to the IPv4 address of ``quic.nginx.org``; the URL
-    host (sent as SNI and verified) is either the right name (control: must succeed
-    over TLS 1.3 with the default trust store) or an RFC 2606 ``.invalid`` name, which
-    no publicly trusted certificate can contain. The failure must be the SAN mismatch
-    itself, not just any certificate error."""
-    resolver = _PinnedResolver(_ipv4_of(MISMATCH_TARGET_HOST))
+def _hostname_mismatch_outcome(target: str) -> str:
+    """Pin the TCP destination to ``target``'s IPv4 address. Under its own name the
+    request must succeed over TLS 1.3 (control); under the ``.invalid`` name it must
+    fail. Returns "san_mismatch" or "unrecognized_name"; anything else fails."""
+    resolver = _PinnedResolver(_ipv4_of(target))
     with Session(resolver=resolver) as s:
-        ok = s.get(f"https://{MISMATCH_TARGET_HOST}/", timeout=TIMEOUT)
-        assert ok.status_code == 200
-        assert ok.tls_info is not None and ok.tls_info["version"] == "TLSv1.3", ok.tls_info
+        ok = s.get(f"https://{target}/", timeout=TIMEOUT)
+        assert ok.status_code < 500, _describe(ok)
+        assert ok.tls_info is not None and ok.tls_info["version"] == "TLSv1.3", (
+            f"{target}: control request did not use TLS 1.3: {ok.tls_info}")
     with Session(resolver=resolver) as s:
         with pytest.raises((CertificateValidationError, ConnectionError)) as ei:
             s.get(f"https://{MISMATCH_WRONG_NAME}/", timeout=TIMEOUT)
-    err = _assert_cert_rejected(ei)
-    causes = " | ".join(str(e) for e in _chain(err))
-    assert _SAN_MISMATCH in causes, f"certificate error, but not a hostname mismatch: {causes}"
+    err = _cert_error(ei.value)
+    if err is not None:
+        causes = " | ".join(str(e) for e in _chain(err))
+        assert _SAN_MISMATCH in causes, (
+            f"{target}: certificate error, but not a hostname mismatch: {causes}")
+        return "san_mismatch"
+    assert _unrecognized_name_alert(ei.value) is not None, (
+        f"{target}: neither a certificate error nor the unrecognized_name alert "
+        f"(a reset/timeout/protocol error proves nothing): {ei.value!r}")
+    return "unrecognized_name"
 
 
+def test_tcp_rejects_hostname_mismatch():
+    """Real TLS 1.3 servers reached under a name their certificate does not cover.
+
+    For every target in MISMATCH_TARGETS the TCP destination is pinned to the target's
+    IPv4 address; the URL host (sent as SNI and verified) is either the right name
+    (control: must succeed over TLS 1.3 with the default trust store) or an RFC 2606
+    ``.invalid`` name, which no publicly trusted certificate can contain.
+
+    Per target the wrong name must give either the SAN mismatch itself or exactly the
+    unrecognized_name alert (the server refused the SNI before sending a certificate).
+    The alert proves nothing about hostname verification, so at least one target must
+    produce the SAN mismatch. Any other error (reset, timeout, a different certificate
+    error) fails the test."""
+    outcomes = {target: _hostname_mismatch_outcome(target) for target in MISMATCH_TARGETS}
+    assert "san_mismatch" in outcomes.values(), (
+        "no target served a certificate for the unknown name, so hostname "
+        f"verification was never reached: {outcomes}")
+
+
+@pytest.mark.parametrize("profile", BADSSL_PROFILES)
 @pytest.mark.parametrize("url", BADSSL_BAD_CERT)
-def test_badssl_bad_cert_hosts_refused(url):
-    """badssl.com bad-certificate hosts must be refused (nothing fetched).
+def test_badssl_bad_cert_hosts_refused(url, profile):
+    """badssl.com bad-certificate hosts must be refused (nothing fetched), per profile.
 
     This does NOT test certificate validation: badssl.com serves only TLS 1.2 without
     Extended Master Secret, so fasthttpc refuses it at ServerHello, before the
     certificate is examined. Accepted outcomes: a certificate error (should badssl ever
     add TLS 1.3/EMS) or exactly the EMS refusal. A reset, timeout or any other error is
-    a FAILURE: it does not show why the host was refused. Flakiness of badssl.com is
-    therefore visible here, under this name, and not hidden by a skip."""
-    with Session() as s:
+    a FAILURE that names the profile: it does not show why the host was refused. If
+    only some profiles are reset, their ClientHello is the suspect; compare with
+    test_badssl_reachable_with_stdlib_ssl (OpenSSL's ClientHello, same hosts)."""
+    host = url.split("/")[2]
+    with Session(impersonate=profile) as s:
         with pytest.raises(Exception) as ei:
             s.get(url, timeout=TIMEOUT)
     assert _cert_error(ei.value) is not None or _ems_refusal(ei.value) is not None, (
-        f"{url}: refused, but neither by certificate validation nor by the EMS check "
+        f"{url} with profile {profile} (ClientHello ~{_hello_size(profile, host)} bytes): "
+        f"refused, but neither by certificate validation nor by the EMS check "
         f"(remote reset/timeout?): {ei.value!r}")
 
 
-def test_badssl_valid_cert_host_refused_for_missing_ems():
+@pytest.mark.parametrize("profile", BADSSL_PROFILES)
+def test_badssl_valid_cert_host_refused_for_missing_ems(profile):
     """badssl.com's valid-certificate front page is refused by the EMS check too, which
     shows the refusals above are independent of the certificates. If this starts
     failing because badssl.com now succeeds, it has gained TLS 1.3 or EMS: the
     bad-certificate tests above then reach certificate validation, and docs/testing.md
     should be updated."""
-    with Session() as s:
+    host = BADSSL_VALID_CERT.split("/")[2]
+    with Session(impersonate=profile) as s:
         with pytest.raises(Exception) as ei:
             s.get(BADSSL_VALID_CERT, timeout=TIMEOUT)
-    assert _ems_refusal(ei.value) is not None, f"not the EMS refusal: {ei.value!r}"
+    assert _ems_refusal(ei.value) is not None, (
+        f"profile {profile} (ClientHello ~{_hello_size(profile, host)} bytes): "
+        f"not the EMS refusal: {ei.value!r}")
+
+
+@pytest.mark.parametrize("url", (*BADSSL_BAD_CERT, BADSSL_VALID_CERT))
+def test_badssl_reachable_with_stdlib_ssl(url):
+    """Control for the badssl tests: the same hosts through Python's ssl module
+    (OpenSSL's ClientHello, certificate verification ON, certifi roots). OpenSSL
+    accepts TLS 1.2 without EMS, so the handshake reaches the certificate: the
+    bad-certificate hosts must fail with SSLCertVerificationError and the front page
+    must complete. This passing while fasthttpc profiles are reset means the reset
+    is specific to their ClientHello; this being reset too means badssl.com itself
+    was dropping connections."""
+    import certifi
+
+    host = url.split("/")[2]
+    ctx = ssl.create_default_context(cafile=certifi.where())
+    with socket.create_connection((host, 443), timeout=TIMEOUT) as raw:
+        if url == BADSSL_VALID_CERT:
+            with ctx.wrap_socket(raw, server_hostname=host) as tls:
+                assert tls.version() in ("TLSv1.2", "TLSv1.3"), tls.version()
+            return
+        with pytest.raises(ssl.SSLCertVerificationError):
+            ctx.wrap_socket(raw, server_hostname=host)
 
 
 def test_h3_rejects_chain_from_untrusted_ca(tmp_path):

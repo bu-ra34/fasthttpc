@@ -1,7 +1,7 @@
 name: Live tests
 
 # Real-internet HTTP/3 tests (tests/live, marker `live`) against public servers:
-# cloudflare-quic.com, quic.nginx.org, www.google.com, badssl.com. GitHub-hosted
+# cloudflare-quic.com, quic.nginx.org, www.google.com, github.com, badssl.com. GitHub-hosted
 # runners allow outbound UDP/443 and do not intercept TLS. Manual + weekly only:
 # never on push/PR, so a flaky third-party server cannot block CI.
 on:

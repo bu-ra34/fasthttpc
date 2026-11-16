@@ -38,7 +38,7 @@ FASTHTTPC_LIVE=1 python -m pytest -m live tests/live -v
 
 Requirements: internet access, outbound **UDP/443** (QUIC), and a network that
 does **not** intercept TLS. The tests use `cloudflare-quic.com`, `quic.nginx.org`,
-`www.cloudflare.com`, `www.google.com` and `badssl.com`.
+`www.cloudflare.com`, `www.google.com`, `github.com` and `badssl.com`.
 
 | Test | What it checks |
 | --- | --- |
@@ -49,9 +49,10 @@ does **not** intercept TLS. The tests use `cloudflare-quic.com`, `quic.nginx.org
 | `test_auto_mode_with_untrusted_ca_never_fetches` | in auto mode with an unrelated CA the request fails with a certificate error instead of falling back to an unverified fetch |
 | `test_tcp_tls13_baseline_succeeds` | control: `www.cloudflare.com` and `www.google.com` are fetched over TCP with TLS 1.3 and the default trust store |
 | `test_tcp_rejects_chain_from_untrusted_ca` | the same two servers over TCP with `verify=` set to a freshly generated, unrelated CA: `CertificateValidationError` must be in the exception chain |
-| `test_tcp_rejects_hostname_mismatch` | the TCP connection is pinned (custom `resolver=`) to the IPv4 address of `quic.nginx.org`; under its own name it succeeds over TLS 1.3, under `fasthttpc-hostname-mismatch.invalid` it must fail with a certificate error whose cause is "no matching subjectAltName" |
-| `test_badssl_bad_cert_hosts_refused` | expired, wrong-host, self-signed and untrusted-root `badssl.com` hosts are refused: the error must be a certificate error or exactly the Extended Master Secret refusal (see below) |
-| `test_badssl_valid_cert_host_refused_for_missing_ems` | `badssl.com` itself (valid certificate) is refused by the Extended Master Secret check, which shows that refusal does not depend on the certificate |
+| `test_tcp_rejects_hostname_mismatch` | for `www.google.com` and `github.com` the TCP connection is pinned (custom `resolver=`) to the target's IPv4 address; under its own name it succeeds over TLS 1.3, under `fasthttpc-hostname-mismatch.invalid` it must fail with a certificate error whose cause is "no matching subjectAltName" or with exactly the `unrecognized_name` alert, and at least one target must give the certificate error (see below) |
+| `test_badssl_bad_cert_hosts_refused` | expired, wrong-host, self-signed and untrusted-root `badssl.com` hosts are refused, once per profile (`chrome_131`, `chrome_158`, `firefox_160`, `safari_27`, `default`): the error must be a certificate error or exactly the Extended Master Secret refusal (see below) |
+| `test_badssl_valid_cert_host_refused_for_missing_ems` | `badssl.com` itself (valid certificate) is refused by the Extended Master Secret check, per profile, which shows that refusal does not depend on the certificate |
+| `test_badssl_reachable_with_stdlib_ssl` | control: the same five `badssl.com` hosts through Python's `ssl` module (OpenSSL's ClientHello, verification on, certifi roots): bad-certificate hosts fail with `SSLCertVerificationError`, the front page completes |
 
 These tests never run on push or pull requests. They run in the separate
 **Live tests** GitHub Actions workflow (`.github/workflows/live.yml`), on
@@ -89,6 +90,15 @@ The tests account for that as follows:
   `handshake_failure`, exact message), nothing else. A connection reset or a
   timeout from `badssl.com` fails the test, under this name, instead of being
   skipped or counted as a rejection.
+- Every `badssl.com` check runs once per profile. The 0.7.0 default profile
+  `chrome_158` sends a larger ClientHello than `chrome_131` (about 1.9-2.0 KB
+  instead of 1.7-1.8 KB: `trust_anchors` 0xca34 with 28 IDs, ML-DSA and GREASE
+  signature algorithms, ALPS 17613). Both are well above 512 bytes, so neither
+  needs the padding extension, and both span two TCP segments. Against a local
+  OpenSSL TLS 1.2 server without EMS all five profiles get the EMS refusal. If a
+  CI run shows resets for some profiles and EMS refusals for others, the
+  ClientHello of the reset profiles is the suspect; if every profile and the
+  stdlib control are reset, `badssl.com` is dropping connections.
 - Certificate validation on the TCP path is tested against servers that
   negotiate TLS 1.3 (`test_tcp_rejects_chain_from_untrusted_ca`,
   `test_tcp_rejects_hostname_mismatch`), each with a control request that
@@ -96,6 +106,16 @@ The tests account for that as follows:
   not-yet-valid, wrong-host, self-signed and untrusted-root certificates are
   covered offline against local OpenSSL servers in
   `tests/test_interop_openssl.py`.
+- For the hostname check a server must answer an unknown SNI with a
+  certificate. `quic.nginx.org` (used before 0.7.0) aborts with the
+  `unrecognized_name` alert (112) instead, so validation was never reached.
+  `test_tcp_rejects_hostname_mismatch` now uses `www.google.com` (Google's front
+  ends serve their default `*.google.com` certificate for an unknown name) and
+  `github.com` (one certificate whatever the SNI). Per target it accepts the SAN
+  mismatch or exactly the `unrecognized_name` alert, because a server may
+  legitimately refuse the name. At least one target must give the SAN mismatch,
+  since the alert says nothing about hostname verification. A reset, timeout or
+  any other error fails the test.
 - Certificate-authority test sites (for example SSL.com's
   `expired-rsa-dv.ssl.com`) are not used: there is no documentation that they
   offer TLS 1.3 or TLS 1.2 with EMS, so they could fail for the same reason.
@@ -113,7 +133,14 @@ How to read failures:
 - `test_badssl_bad_cert_hosts_refused` failing with "neither by certificate
   validation nor by the EMS check" and a reset or timeout means `badssl.com` was
   unreachable or dropped the connection. Nothing was fetched, but the test cannot
-  tell why, so it fails.
+  tell why, so it fails. The message names the profile and its approximate
+  ClientHello size. Compare the profiles with each other and with
+  `test_badssl_reachable_with_stdlib_ssl`: resets only for some profiles point at
+  their ClientHello (a compatibility bug to investigate), resets everywhere point
+  at `badssl.com`.
+- `test_tcp_rejects_hostname_mismatch` failing with "no target served a
+  certificate for the unknown name" means every target now refuses the unknown
+  SNI with the alert: pick another target that serves a default certificate.
 - `test_badssl_valid_cert_host_refused_for_missing_ems` failing because the
   request succeeded means `badssl.com` now offers TLS 1.3 or EMS: the
   bad-certificate hosts then reach certificate validation and this section
