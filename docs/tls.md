@@ -65,9 +65,19 @@ over HTTP/3. With resumption off, every connection does a full handshake and
 
 x25519, secp256r1, secp384r1, and the hybrid post-quantum group
 **X25519MLKEM768** when the installed `cryptography` provides ML-KEM (version
-47 or newer). X25519MLKEM768 is offered by the `chrome_131` and `firefox_133`
-profiles, not by `safari_18` or `default`; see [profiles](profiles.md).
+47 or newer). X25519MLKEM768 is offered by the Chrome and Firefox profiles and by
+`safari_27`, not by `safari_18` or `default`; see [profiles](profiles.md).
 secp521r1, x448 and ffdhe are not implemented; no key_share is sent for them.
+
+## Signature schemes
+
+TLS 1.3 CertificateVerify is verified for ECDSA (P-256/384/521), RSA-PSS,
+Ed25519/Ed448 and, with `cryptography` 48 or newer, **ML-DSA-44/65/87**
+(0x0904–0x0906, pure ML-DSA with an empty context, per draft-ietf-tls-mldsa).
+`chrome_158` advertises ML-DSA as current Chrome does; ML-DSA certificate chains
+are verified like any other (strict; there are no ML-DSA roots in public trust
+stores, so in practice this only applies to private CAs given with `verify=`).
+A server that uses a scheme the profile did not offer is rejected.
 
 See also: [client certificates](features/client-certs.md),
 [legacy TLS](features/legacy-tls.md), [security model](security.md).

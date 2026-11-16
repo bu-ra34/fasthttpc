@@ -9,9 +9,28 @@ from .security.keyshare import (
 
 # ALPS (application_settings) eski kod noktası — Chrome 131 bunu kullanır
 # (17613'e geçiş Chrome 133'te). RFC taslağı: draft-vvv-tls-alps.
+# Profil ``alps_codepoint`` ile seçer (chrome_158: EXT_ALPS_NEW).
 EXT_ALPS = 17513
+EXT_ALPS_NEW = 17613     # BoringSSL TLSEXT_TYPE_application_settings
 EXT_ECH = 65037          # encrypted_client_hello (yalnızca GREASE gönderiyoruz)
+# Trust Anchor IDs (draft-ietf-tls-trust-anchor-ids): BoringSSL'in geçici kod
+# noktası TLSEXT_TYPE_trust_anchors = 0xca34 (51764). Kripto gerektirmez; yalnızca
+# sunucunun sertifika seçimine ipucudur — sertifika doğrulaması DEĞİŞMEZ.
+EXT_TRUST_ANCHORS = 0xCA34
 _SYS_RANDOM = _random_mod.SystemRandom()
+
+# Chrome trust anchor ID sırasını süreç başına sabitler (farklı süreçlerde farklı
+# sıra gözlendi); burada da süreç başına bir kez karıştırılır.
+_TAI_ORDER: dict[int, list[bytes]] = {}
+
+
+def _process_tai_order(ids: list[bytes]) -> list[bytes]:
+    key = id(ids)
+    if key not in _TAI_ORDER:
+        order = list(ids)
+        _SYS_RANDOM.shuffle(order)
+        _TAI_ORDER[key] = order
+    return _TAI_ORDER[key]
 
 
 def encrypted_extensions_types(hs_payload: bytes) -> list[int]:
@@ -29,7 +48,7 @@ def encrypted_extensions_types(hs_payload: bytes) -> list[int]:
     return types
 
 
-def build_client_encrypted_extensions(settings: bytes = b"") -> bytes:
+def build_client_encrypted_extensions(settings: bytes = b"", codepoint: int = EXT_ALPS) -> bytes:
     """İstemcinin EncryptedExtensions mesajı (hs_type=8) — yalnızca ALPS içerir.
 
     Sunucu EncryptedExtensions'ında application_settings döndürdüyse (ALPS
@@ -37,22 +56,29 @@ def build_client_encrypted_extensions(settings: bytes = b"") -> bytes:
     ZORUNDADIR (BoringSSL sunucuları bunu bekler). ``settings`` boş: Chrome
     h2 için istemci tarafı ayarı taşımaz.
     """
-    ext = struct.pack("!HH", EXT_ALPS, len(settings)) + settings
+    ext = struct.pack("!HH", codepoint, len(settings)) + settings
     body = struct.pack("!H", len(ext)) + ext
     return b"\x08" + struct.pack("!I", len(body))[1:] + body
 
 
-def alps_accepted(profile_alps: bool, ee_payload: bytes, alpn: str) -> bool:
-    """Sunucu ALPS'i kabul ettiyse (ve ALPN h2 ise) True."""
-    return bool(profile_alps and alpn == "h2" and EXT_ALPS in encrypted_extensions_types(ee_payload))
+def alps_accepted(profile_alps: bool, ee_payload: bytes, alpn: str,
+                  codepoint: int = EXT_ALPS) -> bool:
+    """Sunucu ALPS'i (ilan ettiğimiz kod noktasıyla) kabul ettiyse ve ALPN h2 ise True."""
+    return bool(profile_alps and alpn == "h2" and codepoint in encrypted_extensions_types(ee_payload))
 
 
 def _supported_cert_compression() -> list[int]:
-    """Açabildiğimiz sertifika sıkıştırma algoritmaları (zlib=1 her zaman, brotli=2 kuruluysa)."""
+    """Açabildiğimiz sertifika sıkıştırma algoritmaları (zlib=1 her zaman, brotli=2 /
+    zstd=3 ilgili paket kuruluysa)."""
     algs = [0x0001]
     try:
         import brotli  # noqa: F401
         algs.append(0x0002)
+    except ImportError:
+        pass
+    try:
+        import zstandard  # noqa: F401
+        algs.append(0x0003)
     except ImportError:
         pass
     return algs
@@ -81,6 +107,16 @@ def clear_ticket_cache() -> None:
 # ve handshake kırılır (bkz. keyshare.HAVE_MLKEM).
 _NEEDS_SUPPORT = frozenset({0x11EC, 0x6399})
 
+# ML-DSA imza şemaları (0x0904..0x0906) yalnızca CertificateVerify'ı gerçekten
+# doğrulayabiliyorsak (cryptography >= 48 ML-DSA) ilan edilir; aksi halde
+# profilden SESSİZCE düşer (parmak izi sapması docs/limits.md'de).
+_MLDSA_SCHEMES = frozenset({0x0904, 0x0905, 0x0906})
+try:
+    from cryptography.hazmat.primitives.asymmetric import mldsa as _mldsa  # noqa: F401
+    HAVE_MLDSA = True
+except ImportError:  # pragma: no cover - eski cryptography
+    HAVE_MLDSA = False
+
 
 class TLSImpersonator:
     def __init__(self, target_host, profile=None, legacy_tls=False):
@@ -94,6 +130,7 @@ class TLSImpersonator:
         self._grease_cipher = _random_grease()
         self._grease_group = _random_grease()
         self._grease_version = _random_grease()
+        self._grease_sigalg = _random_grease()      # BoringSSL ssl_grease_signature_algorithm
         self._used_grease_exts = set()
         # GREASE extension tipleri bağlantı başına bir kez seçilir ve HRR
         # sonrası 2. ClientHello'da AYNEN tekrarlanır (RFC 8446 §4.1.2: CH2,
@@ -264,7 +301,9 @@ class TLSImpersonator:
         return self._ext(0x0005, payload)
 
     def _pack_signature_algorithms(self) -> bytes:
-        algs = list(self.profile.get("signature_algorithms", [0x0403, 0x0804]))
+        algs = [self._grease_sigalg if a == "GREASE" else a
+                for a in self.profile.get("signature_algorithms", [0x0403, 0x0804])
+                if HAVE_MLDSA or a not in _MLDSA_SCHEMES]
         if self.legacy_tls:
             from .security.tls12_legacy import LEGACY_SIGALGS
             algs += [a for a in LEGACY_SIGALGS if a not in algs]
@@ -336,7 +375,16 @@ class TLSImpersonator:
         """application_settings (ALPS): desteklenen protokol listesi (Chrome: ["h2"])."""
         protos = self.profile.get("alps_protocols", ["h2"])
         raw = b"".join(struct.pack("!B", len(p)) + p.encode() for p in protos)
-        return self._ext(EXT_ALPS, struct.pack("!H", len(raw)) + raw)
+        return self._ext(self.alps_codepoint, struct.pack("!H", len(raw)) + raw)
+
+    def _pack_trust_anchors(self) -> bytes:
+        """trust_anchors (0xca34): u16 uzunluklu, her biri u8 uzunluklu TrustAnchorID
+        listesi (BoringSSL ext_trust_anchors_add_clienthello). Sunucunun yanıtı
+        (EncryptedExtensions/CertificateEntry içinde) yok sayılır; Chrome'un
+        TAI yeniden deneme akışı UYGULANMAZ (bkz. docs/limits.md)."""
+        ids = _process_tai_order(self.profile.get("trust_anchors", []))
+        raw = b"".join(struct.pack("!B", len(i)) + i for i in ids)
+        return self._ext(EXT_TRUST_ANCHORS, struct.pack("!H", len(raw)) + raw)
 
     def _pack_ech_grease(self) -> bytes:
         """ECH GREASE (RFC 9849 §6.2 / draft-ietf-tls-esni): GERÇEK ECH DEĞİL.
@@ -393,6 +441,7 @@ class TLSImpersonator:
         "record_size_limit":         "_pack_record_size_limit",
         "alps":                      "_pack_alps",
         "ech_grease":                "_pack_ech_grease",
+        "trust_anchors":             "_pack_trust_anchors",
         "encrypt_then_mac":          "_pack_encrypt_then_mac",
     }
 
@@ -403,6 +452,11 @@ class TLSImpersonator:
     @property
     def alps_advertised(self) -> bool:
         return "alps" in self.profile.get("extensions_order", [])
+
+    @property
+    def alps_codepoint(self) -> int:
+        """ClientHello'da (ve istemci EncryptedExtensions'ında) kullanılan ALPS kod noktası."""
+        return int(self.profile.get("alps_codepoint", EXT_ALPS))
 
     def _effective_order(self) -> list[str]:
         """Profil sırası; ``shuffle_extensions`` ise (Chrome) baştaki/sondaki

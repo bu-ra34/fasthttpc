@@ -992,7 +992,8 @@ class TLSAdapter:
                 if hs_type == _HS_ENCRYPTED_EXTENSIONS:
                     state["alpn"] = _parse_alpn_from_encrypted_extensions(hs_payload)
                     send_client_ee = alps_accepted(
-                        impersonator.alps_advertised, hs_payload, state["alpn"])
+                        impersonator.alps_advertised, hs_payload, state["alpn"],
+                        impersonator.alps_codepoint)
                     rsl = _parse_record_size_limit(hs_payload)
                     if rsl:
                         if rsl < 64:  # RFC 8449 §4
@@ -1067,7 +1068,7 @@ class TLSAdapter:
         if send_client_ee:
             # Sunucu ALPS'i kabul etti: istemci EE'yi Finished'tan önce yollar
             # (transcript'e girer; Finished MAC'i onu da kapsar).
-            client_ee = build_client_encrypted_extensions()
+            client_ee = build_client_encrypted_extensions(codepoint=impersonator.alps_codepoint)
             esock.send_record(client_ee, content_type=0x16, use_app_keys=False)
             state["handshake_messages"] += client_ee
         if cert_req is not None:
