@@ -177,6 +177,20 @@ düzeltmeleri, HTTP/2 indirmelerinde ~1,6–1,8x hızlanma ve gerçek internette
   `test_tcp_rejects_hostname_mismatch` (`quic.nginx.org` adresine yanlış adla
   bağlanınca "no matching subjectAltName"); her ikisinin de başarılı bir
   kontrol isteği var (`test_tcp_tls13_baseline_succeeds`).
+- Canlı testler: `quic.nginx.org` tanımadığı SNI'a sertifika göndermek yerine
+  `unrecognized_name` (112) alert'iyle el sıkışmayı kestiği için hostname testi
+  sertifika doğrulamasına hiç ulaşmıyordu. `test_tcp_rejects_hostname_mismatch`
+  artık `www.google.com` ve `github.com` adreslerine sabitlenip `.invalid` adla
+  bağlanıyor. Hedef başına yalnızca "no matching subjectAltName" ya da tam olarak
+  `unrecognized_name` alert'i kabul ediliyor, en az bir hedefin SAN uyuşmazlığı
+  vermesi şart.
+- Canlı testler: `badssl.com` denetimleri artık `chrome_131`, `chrome_158`,
+  `firefox_160`, `safari_27` ve `default` profilleriyle ayrı ayrı çalışıyor.
+  Sıfırlanan bağlantının mesajında profil adı ve yaklaşık ClientHello boyutu
+  var. Yeni `test_badssl_reachable_with_stdlib_ssl` kontrolü aynı sunuculara
+  Python `ssl` (OpenSSL ClientHello'su, doğrulama açık) ile bağlanıyor. Böylece
+  sıfırlamanın belirli bir ClientHello'dan mı yoksa `badssl.com`'un kendisinden
+  mi kaynaklandığı CI çıktısında görülüyor.
 
 ### Dokümantasyon
 - README, README.tr, kurulum, zaman aşımı, akış, sınırlar ve API sayfaları
