@@ -229,15 +229,15 @@ def test_retry_plugin_sync_ve_async():
 def test_rate_limit_plugin_sync_ve_async():
     with Session(transport=MockTransport(ok_handler)) as s:
         s.use(RateLimitPlugin(rps=20))
-        t0 = time.monotonic()
+        t0 = time.perf_counter()
         for _ in range(4):
             s.get("https://x.example/")
-        assert time.monotonic() - t0 >= 0.14          # 3 aralık * 50 ms
+        assert time.perf_counter() - t0 >= 0.14          # 3 aralık * 50 ms
 
     async def main():
         async with AsyncSession(transport=MockTransport(ok_handler)) as a:
             a.use(RateLimitPlugin(rps=20))
-            t0 = time.monotonic()
+            t0 = time.perf_counter()
             await asyncio.gather(*[a.get("https://x.example/") for _ in range(4)])
-            return time.monotonic() - t0
+            return time.perf_counter() - t0
     assert run(main()) >= 0.14
