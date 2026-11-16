@@ -57,11 +57,29 @@ class Headers(MutableMapping[str, str]):
             # dict dışındaki Mapping'ler de (MappingProxyType, httpx/requests başlık
             # nesneleri...) kabul edilir; eskiden yalnızca dict'e bakıldığı için bunlar
             # SESSİZCE yok sayılıyordu (ör. ``Session(headers=Headers(...))``).
-            for k, v in headers.items():
-                self[k] = v
+            self._extend_set(headers.items())
         elif isinstance(headers, list):
-            for k, v in headers:
+            self._extend_set(headers)
+
+    def _extend_set(self, items: typing.Iterable[typing.Any]) -> None:
+        """Art arda ``self[k] = v`` ile AYNI sonuç, ama doğrusal: her ``__setitem__``
+        listenin tamamını yeniden kuruyordu (n başlık -> O(n^2))."""
+        lst = self._list
+        index = {item[1]: i for i, item in enumerate(lst)}
+        if len(index) != len(lst):          # yinelenen ad varsa (olmamalı) genel yol
+            for k, v in items:
                 self[k] = v
+            return
+        for k, v in items:
+            raw_key = k.encode(_HDR_ENCODING, errors="ignore")
+            lookup = raw_key.lower()
+            entry = (raw_key, lookup, str(v).encode(_HDR_ENCODING, errors="replace"))
+            i = index.get(lookup)
+            if i is None:
+                index[lookup] = len(lst)
+                lst.append(entry)
+            else:
+                lst[i] = entry               # ilk konumunda yerinde güncelle (sıra korunur)
 
     def __getitem__(self, key: str) -> str:
         """Key'i bul, varsa tüm değerleri virgülle birleştirip dön."""
@@ -84,17 +102,18 @@ class Headers(MutableMapping[str, str]):
 
         # Var olan girdinin yerinde güncellenmesi sırayı korur; sondan
         # eklemek header sırasını bozar (bu da bir parmak izi sinyalidir).
-        new_list = []
-        replaced = False
-        for item in self._list:
-            if item[1] != lookup:
-                new_list.append(item)
-            elif not replaced:
-                new_list.append((raw_key, lookup, val_bytes))
-                replaced = True
-        if not replaced:
-            new_list.append((raw_key, lookup, val_bytes))
-        self._list = new_list
+        entry = (raw_key, lookup, val_bytes)
+        lst = self._list
+        for i, item in enumerate(lst):
+            if item[1] == lookup:
+                break
+        else:
+            # Yeni ad: Python döngüsüyle yeniden kurmadan (C düzeyinde) sona ekle. Yeni
+            # liste nesnesi: süren bir iterasyon eski listeyi görmeye devam eder.
+            self._list = lst + [entry]
+            return
+        # İlk eşleşme yerinde güncellenir, aynı adlı sonraki girdiler silinir.
+        self._list = lst[:i] + [entry] + [it for it in lst[i + 1:] if it[1] != lookup]
 
     def add(self, key: str, value: str) -> None:
         """Var olan değerleri silmeden yeni bir header satırı ekler.

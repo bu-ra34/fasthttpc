@@ -33,3 +33,21 @@ class RecordQueue:
             if isinstance(ev, HandshakeComplete):
                 continue
         return None
+
+    def pop_data(self) -> Optional[bytes]:
+        """Sıradaki olay uygulama verisiyse onu döner; değilse None (olay kuyrukta kalır).
+
+        Araya giren NewSessionTicket/KeyUpdate/HandshakeComplete atlanır
+        (``pop(skip_post_handshake=True)`` ile aynı); alert/kapanış TÜKETİLMEZ ki
+        okuyucu önce tampondaki veriyi teslim etsin, sonra kapanışı görsün."""
+        q = self._q
+        while q:
+            ev = q[0]
+            if isinstance(ev, ApplicationData):
+                q.popleft()
+                return ev.data
+            if isinstance(ev, (NewSessionTicket, KeyUpdateReceived, HandshakeComplete)):
+                q.popleft()
+                continue
+            return None
+        return None

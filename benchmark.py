@@ -18,6 +18,10 @@ Ağsız (yerel) bölümler:
 Ağ bölümleri (--network): soğuk handshake, sıcak bağlantı, büyük indirme,
 paralel istekler. requests / httpx / curl_cffi kuruluysa onlarla karşılaştırılır,
 kurulu değilse atlanır.
+
+Uçtan uca YEREL (ağsız) senaryolar — TLS 1.3 + HTTP/1.1 / HTTP/2 büyük indirme,
+akış, küçük istekler, handshake, async — için: benchmarks/local_bench.py
+(bkz. docs/performance.md).
 """
 from __future__ import annotations
 
