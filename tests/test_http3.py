@@ -474,3 +474,32 @@ def test_sync_udp_icmp_reddi_http3error_olur(exc):
             c._run(lambda: False, time.monotonic() + 5, "el sıkışma")
     finally:
         a.close(); b.close()
+
+
+# ------------------------------------------------ trio: aioquic yalnızca asyncio ile çalışır
+def test_trio_force_acik_hata_verir(pki, h3):
+    """trio altında http3='force' -> RuntimeError('no running event loop') DEĞİL, Http3ConnectError."""
+    trio = pytest.importorskip("trio")
+    pytest.importorskip("anyio")
+    from fasthttpc.http3.core import Http3ConnectError
+
+    async def go():
+        async with AsyncSession(http3="force", verify=pki["ca"]) as s:
+            with pytest.raises(Http3ConnectError, match="trio"):
+                await s.get(url(h3))
+    trio.run(go)
+
+
+def test_trio_auto_altsvc_h1e_duser(pki, dual):
+    """trio altında http3=True: Alt-Svc h3 ilan edilse de istekler TCP'de (h1/h2) başarılı."""
+    trio = pytest.importorskip("trio")
+    pytest.importorskip("anyio")
+
+    async def go():
+        async with AsyncSession(http3=True, verify=pki["ca"], impersonate=None) as s:
+            for _ in range(3):
+                r = await s.get(url(dual))
+                assert r.status_code == 200 and r.http_version == "HTTP/1.1"
+                assert r.headers["x-proto"] == "h1"
+    trio.run(go)
+    assert dual.tcp_hits == 3
