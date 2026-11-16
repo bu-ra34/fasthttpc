@@ -294,6 +294,21 @@ def _q(v: str) -> str:
 
 # --- .netrc / çözümleme -----------------------------------------------------
 
+# Ayrıştırılmış .netrc önbelleği: istek başına dosyayı yeniden okuyup ayrıştırmak
+# yerine (yol, mtime, boyut, inode) değişmedikçe aynı nesne. Dosya değişirse yeniden okunur.
+_NETRC_CACHE: "dict[str, tuple[tuple[int, int, int], _netrc.netrc]]" = {}
+
+
+def _parsed_netrc(path: str, st: os.stat_result) -> "_netrc.netrc":
+    sig = (st.st_mtime_ns, st.st_size, st.st_ino)
+    hit = _NETRC_CACHE.get(path)
+    if hit is not None and hit[0] == sig:
+        return hit[1]
+    parsed = _netrc.netrc(path)
+    _NETRC_CACHE[path] = (sig, parsed)
+    return parsed
+
+
 def netrc_credentials(host: str) -> "Optional[tuple[str, str]]":
     """``NETRC`` ortam değişkeni, ``~/.netrc`` ya da ``~/_netrc``'den ``(login, parola)``.
 
@@ -303,10 +318,12 @@ def netrc_credentials(host: str) -> "Optional[tuple[str, str]]":
         os.path.join("~", f) for f in (".netrc", "_netrc")]
     for cand in candidates:
         path = os.path.expanduser(cand)
-        if not os.path.exists(path):
+        try:
+            st = os.stat(path)
+        except OSError:
             continue
         try:
-            auth = _netrc.netrc(path).authenticators(host)
+            auth = _parsed_netrc(path, st).authenticators(host)
         except (_netrc.NetrcParseError, OSError):
             return None
         if auth:
