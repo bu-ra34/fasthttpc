@@ -15,7 +15,7 @@ available as an **experimental** extra.
     [security model](security.md) and [known limits](limits.md).
 
 ```bash
-pip install fasthttpc
+pip install fasthttpc            # includes the brotli and zstd decoders
 pip install "fasthttpc[trio]"    # optional: AsyncSession under trio
 pip install "fasthttpc[http3]"   # optional: experimental HTTP/3
 ```

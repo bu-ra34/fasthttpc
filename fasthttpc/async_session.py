@@ -30,7 +30,8 @@ from .metrics         import RequestMetrics
 from .cache           import ResponseCache
 from .cookies         import CookieJar
 from .multipart       import encode_multipart
-from .protocol.http1_parser import HTTP1Parser, MAX_RESPONSE_HEADER_BYTES, parse_chunk_size
+from .protocol.http1_parser import MAX_RESPONSE_HEADER_BYTES, parse_chunk_size
+from .streaming import decode_body
 from .models.request  import Request
 from .config          import Limits, Timeout, resolve_verify
 from .retry           import Retry
@@ -814,6 +815,29 @@ class AsyncSession:
         self._h2[key] = conn
         return conn
 
+    async def _timed_exchange(self, method: str, u: URL, proxy: Optional[ProxyConfig],
+                              req_headers: "dict[str, str]", raw_body: bytes,
+                              metrics: Optional[RequestMetrics], stream: bool = False) -> _ExchangeResult:
+        """:meth:`_exchange` + ``Timeout.total`` (istek başına toplam süre sınırı).
+
+        ``read`` her okuma için ayrı işler; damla damla veri yollayan sunucuyu
+        yalnızca ``total`` keser. Sınır bağlantı kurulumunu (ya da havuzdan almayı)
+        ve yanıtı kapsar; ``stream=True`` iken yanıt başlıklarına kadar (akış
+        gövdesi, senkron taraftaki gibi, her okumada ``read`` ile sınırlıdır)."""
+        total = self._tmo().total
+        if total is None:
+            return await self._exchange(method, u, proxy, req_headers, raw_body, metrics, stream=stream)
+        t0 = time.perf_counter()
+        try:
+            r: _ExchangeResult = await B.wait_for(
+                self._exchange(method, u, proxy, req_headers, raw_body, metrics, stream=stream), total)
+            return r
+        except asyncio.TimeoutError:
+            if time.perf_counter() - t0 < total:
+                raise                    # içteki read/write zaman aşımı: mesajı korunur
+            raise asyncio.TimeoutError(
+                f"İstek toplam süre sınırını (Timeout.total={total} sn) aştı.") from None
+
     async def _exchange(self, method: str, u: URL, proxy: Optional[ProxyConfig],
                         req_headers: "dict[str, str]", raw_body: bytes,
                         metrics: Optional[RequestMetrics], stream: bool = False) -> _ExchangeResult:
@@ -831,7 +855,7 @@ class AsyncSession:
                 if self._h3.state.force:
                     raise ConnectionError("http3='force' bir HTTP proxy ile kullanılamaz (UDP).")
             else:
-                t = self.timeout
+                t = self._tmo()      # istek düzeyi timeout= dahil
                 r3 = await self._h3.exchange(
                     u.host, u.port, method, u.raw_path.decode("latin-1"),
                     [(k.lower(), str(v)) for k, v in req_headers.items()
@@ -905,10 +929,14 @@ class AsyncSession:
         if metrics:
             metrics.bytes_sent = len(raw_body) + sum(len(k) + len(v) for k, v in h2_headers)
         send_time = time.perf_counter()
+        # Bu İSTEĞİN süreleri: bağlantı yeniden kullanılıyorsa onu açan isteğin
+        # süreleri (ör. timeout=None -> sınırsız) burada geçerli DEĞİLDİR.
+        tmo = self._tmo()
         try:
             if stream:
                 h = await conn.request_stream(method, authority, u.raw_path.decode("latin-1"),
-                                              h2_headers, raw_body)
+                                              h2_headers, raw_body,
+                                              read_timeout=tmo.read, write_timeout=tmo.write)
                 if metrics:
                     metrics.first_byte_time = h.first_byte_time or time.perf_counter()
                 headers = Headers()
@@ -916,7 +944,8 @@ class AsyncSession:
                     headers.add(k, v)
                 return h.status, headers, _AsyncH2Stream(h), send_time, "HTTP/2"
             r = await conn.request(method, authority, u.raw_path.decode("latin-1"),
-                                   h2_headers, raw_body)
+                                   h2_headers, raw_body,
+                                   read_timeout=tmo.read, write_timeout=tmo.write)
         except H2StreamRefused:
             raise
         except (Http2StreamError, Http2ConnectionError) as e:
@@ -1205,7 +1234,7 @@ class AsyncSession:
             metrics.request_start = time.perf_counter()
 
         try:
-            status_code, resp_headers, body_raw, send_time, http_version = await self._exchange(
+            status_code, resp_headers, body_raw, send_time, http_version = await self._timed_exchange(
                 method, u, proxy_cfg, req_headers, raw_body, metrics, stream=stream)
 
             is_stream = not isinstance(body_raw, (bytes, bytearray))
@@ -1216,7 +1245,7 @@ class AsyncSession:
 
             if isinstance(body_raw, (bytes, bytearray)):
                 ce  = resp_headers.get("content-encoding", "").lower()
-                body_final = HTTP1Parser._decompress(bytes(body_raw), ce)
+                body_final = decode_body(bytes(body_raw), ce)
             else:
                 body_final = b""
 

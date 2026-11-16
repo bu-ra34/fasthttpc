@@ -3,14 +3,22 @@
 ## Install
 
 ```bash
-pip install fasthttpc
-pip install "fasthttpc[brotli,zstd]"   # optional content decoders
+pip install fasthttpc                  # includes the brotli and zstd decoders
 pip install "fasthttpc[trio]"          # optional: AsyncSession under trio
 pip install "fasthttpc[http3]"         # optional: experimental HTTP/3 (aioquic)
 pip install "fasthttpc[all]"           # all of the above
 ```
 
-Requires Python 3.10+. Runtime dependencies: `cryptography` and `certifi`.
+Requires Python 3.10+. Runtime dependencies: `cryptography`, `certifi`,
+`brotli` and `zstandard` (all ship wheels for CPython 3.10 - 3.13 on Linux,
+macOS and Windows). The browser profiles advertise `br` (and `zstd` for
+Chrome/Firefox) in `Accept-Encoding`, so the decoders are installed by default;
+on PyPy `brotlicffi` is used and zstd needs `pip install "fasthttpc[zstd]"`.
+The `fasthttpc[brotli]` and `fasthttpc[zstd]` extras remain as compatibility
+aliases. If a decoder is missing, a response compressed with that encoding
+raises `fasthttpc.MissingDecoderError` (a `DecodeError`/`ValueError`) naming the
+package to install; compressed bytes are never returned silently
+(`stream=True` + `iter_raw()` still gives the raw body).
 Post-quantum key exchange (X25519MLKEM768) is only offered when the installed
 `cryptography` is version 47 or newer.
 

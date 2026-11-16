@@ -14,6 +14,8 @@
 
 ::: fasthttpc.Response
 ::: fasthttpc.HTTPStatusError
+::: fasthttpc.DecodeError
+::: fasthttpc.MissingDecoderError
 ::: fasthttpc.Request
 ::: fasthttpc.Headers
 ::: fasthttpc.URL

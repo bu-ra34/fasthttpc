@@ -8,7 +8,7 @@ from typing import Any, Optional
 
 from .._backend import current_backend
 from ..models.headers import Headers
-from ..protocol.http1_parser import HTTP1Parser
+from ..streaming import decode_body
 from ..security.cert_validator import CertificateValidationError
 from .altsvc import AltSvcCache
 from .core import Http3ConnectError, Http3Error
@@ -37,7 +37,7 @@ def convert_response(raw_headers, body: bytes):
                 status = int(v)
             continue
         headers.add(ks, v.decode("latin-1"))
-    body = HTTP1Parser._decompress(bytes(body), headers.get("content-encoding", "").lower())
+    body = decode_body(bytes(body), headers.get("content-encoding", "").lower())
     return status, headers, body
 
 
