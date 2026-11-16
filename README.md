@@ -190,7 +190,8 @@ privately via GitHub security advisories.
   and ffdhe key exchange are not implemented.
 - TLS 1.2: by default only ECDHE + AES-GCM / ChaCha20-Poly1305; CBC and static
   RSA only with `legacy_tls=True`. DHE, PSK and TLS 1.0/1.1 are always rejected
-  with an explicit error.
+  with an explicit error. TLS 1.2 servers without Extended Master Secret (for
+  example `badssl.com`) are refused unless `legacy_tls=True`.
 - HPACK Huffman *encoding* is not implemented (decoding is); this causes a tiny HTTP/2 fingerprint deviation.
 - HTTP/2 server push is disabled (`ENABLE_PUSH=0`). PRIORITY frames are not
   sent; the priority field of the HEADERS frame follows the profile.

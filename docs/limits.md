@@ -19,6 +19,12 @@
 - TLS 1.2: ECDHE + AEAD only by default. CBC and static RSA need
   `legacy_tls=True` ([legacy TLS](features/legacy-tls.md)); DHE, PSK and
   TLS 1.1 or lower are always rejected.
+- TLS 1.2 servers without Extended Master Secret (RFC 7627) or
+  `renegotiation_info` are refused at ServerHello unless `legacy_tls=True`
+  (example: `badssl.com`). The error is
+  `handshake_failure: Sunucu Extended Master Secret (RFC 7627) kabul etmedi`;
+  it comes before the certificate check, so such a server never reports a
+  certificate error.
 - No post-handshake client authentication (TLS 1.3 `post_handshake_auth`).
 
 ## HTTP
