@@ -38,19 +38,50 @@ FASTHTTPC_LIVE=1 python -m pytest -m live tests/live -v
 
 Requirements: internet access, outbound **UDP/443** (QUIC), and a network that
 does **not** intercept TLS. The tests use `cloudflare-quic.com`, `quic.nginx.org`,
-`www.google.com` and `badssl.com`.
+`www.cloudflare.com`, `www.google.com` and `badssl.com`.
 
 | Test | What it checks |
 | --- | --- |
 | `test_alt_svc_discovery_then_h3` | `http3=True`: first request over TCP learns `Alt-Svc: h3`, the next one is `HTTP/3` |
 | `test_h3_force_*` | `http3="force"` GETs (sync and async) against Cloudflare, nginx and Google; Cloudflare's `/cdn-cgi/trace` body must report `http=http/3`; repeated requests reuse one QUIC connection |
 | `test_fallback_to_h2_when_h3_unreachable` | Alt-Svc pointing at a dead UDP port: the request silently uses HTTP/2 and h3 is disabled for that origin |
-| `test_bad_certificates_rejected` | expired, wrong-host, self-signed and untrusted-root certificates are rejected |
 | `test_h3_rejects_chain_from_untrusted_ca` | the QUIC handshake rejects a real server whose root is not trusted (`verify=` set to an unrelated CA) |
 | `test_auto_mode_with_untrusted_ca_never_fetches` | in auto mode with an unrelated CA the request fails with a certificate error instead of falling back to an unverified fetch |
+| `test_tcp_tls13_baseline_succeeds` | control: `www.cloudflare.com` and `www.google.com` are fetched over TCP with TLS 1.3 and the default trust store |
+| `test_tcp_rejects_chain_from_untrusted_ca` | the same two servers over TCP with `verify=` set to a freshly generated, unrelated CA: `CertificateValidationError` must be in the exception chain |
+| `test_tcp_rejects_hostname_mismatch` | the TCP connection is pinned (custom `resolver=`) to the IPv4 address of `quic.nginx.org`; under its own name it succeeds over TLS 1.3, under `fasthttpc-hostname-mismatch.invalid` it must fail with a certificate error whose cause is "no matching subjectAltName" |
+| `test_badssl_bad_cert_hosts_refused` | expired, wrong-host, self-signed and untrusted-root `badssl.com` hosts are refused: the error must be a certificate error or exactly the Extended Master Secret refusal (see below) |
+| `test_badssl_valid_cert_host_refused_for_missing_ems` | `badssl.com` itself (valid certificate) is refused by the Extended Master Secret check, which shows that refusal does not depend on the certificate |
 
 These tests are not run in CI. So far HTTP/3 has only been verified against
 the local aioquic server of the offline suite.
+
+### badssl.com and Extended Master Secret
+
+`badssl.com` only offers TLS 1.2, without the Extended Master Secret extension
+(RFC 7627). fasthttpc refuses such servers by design (unless `legacy_tls=True`),
+and it does so when it reads the ServerHello, **before** the certificate is
+examined. So the `badssl.com` bad-certificate hosts never reach certificate
+validation: they fail with `TLS12Error("handshake_failure: Sunucu Extended
+Master Secret (RFC 7627) kabul etmedi ...")`.
+
+The tests account for that as follows:
+
+- `test_badssl_bad_cert_hosts_refused` only claims "refused, nothing fetched".
+  It accepts a certificate error or that specific EMS refusal (alert
+  `handshake_failure`, exact message), nothing else. A connection reset or a
+  timeout from `badssl.com` fails the test, under this name, instead of being
+  skipped or counted as a rejection.
+- Certificate validation on the TCP path is tested against servers that
+  negotiate TLS 1.3 (`test_tcp_rejects_chain_from_untrusted_ca`,
+  `test_tcp_rejects_hostname_mismatch`), each with a control request that
+  succeeds, so a failure there really is the certificate. Expired,
+  not-yet-valid, wrong-host, self-signed and untrusted-root certificates are
+  covered offline against local OpenSSL servers in
+  `tests/test_interop_openssl.py`.
+- Certificate-authority test sites (for example SSL.com's
+  `expired-rsa-dv.ssl.com`) are not used: there is no documentation that they
+  offer TLS 1.3 or TLS 1.2 with EMS, so they could fail for the same reason.
 
 How to read failures:
 
@@ -58,9 +89,18 @@ How to read failures:
   handshake timeout in the `test_h3_force_*` tests means UDP/443 is blocked on
   your network; the discovery tests then fail with "fell back to HTTP/2".
   `test_fallback_to_h2_when_h3_unreachable` does not need UDP and should still pass.
-- `test_bad_certificates_rejected` failing with "DID NOT RAISE" means something on
-  the path re-signs TLS (a corporate or sandbox egress proxy). The client is then
-  not talking to the real server, so the test is right to fail.
+- The certificate tests failing with "DID NOT RAISE" means something on the path
+  re-signs TLS (a corporate or sandbox egress proxy). The client is then not
+  talking to the real server, so the tests are right to fail. The baseline tests
+  fail with a certificate error in that case.
+- `test_badssl_bad_cert_hosts_refused` failing with "neither by certificate
+  validation nor by the EMS check" and a reset or timeout means `badssl.com` was
+  unreachable or dropped the connection. Nothing was fetched, but the test cannot
+  tell why, so it fails.
+- `test_badssl_valid_cert_host_refused_for_missing_ems` failing because the
+  request succeeded means `badssl.com` now offers TLS 1.3 or EMS: the
+  bad-certificate hosts then reach certificate validation and this section
+  should be updated.
 
 Certificate verification is never disabled by these tests: `verify=False` is not
 supported by fasthttpc.
