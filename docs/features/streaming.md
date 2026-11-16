@@ -1,7 +1,63 @@
 # Streaming responses
 
-!!! info "Status: in development"
-    This page is a skeleton and is being filled in as the feature lands.
-    Names below follow the current plan and may change before release.
+By default the whole body is read before the response is returned. With
+`stream=True` (or the `stream()` context manager) the response comes back as
+soon as the headers arrive and the body is read on demand. This works on
+`Session` and `AsyncSession`, over HTTP/1.1 and HTTP/2.
 
-TODO: iterating bodies (`iter_bytes`, `iter_lines`), sync and async, HTTP/1.1 and HTTP/2, closing and connection reuse.
+## Sync
+
+```python
+from fasthttpc import Session
+
+with Session() as s:
+    with s.stream("GET", "https://example.com/big.bin") as r:
+        for chunk in r.iter_bytes(chunk_size=65536):
+            ...
+
+    r = s.get("https://example.com/events", stream=True)
+    try:
+        for line in r.iter_lines(decode_unicode=True):
+            print(line)
+    finally:
+        r.close()
+```
+
+| Method | Yields |
+|---|---|
+| `iter_bytes(chunk_size=None)` | decoded bytes (`Content-Encoding` removed) |
+| `iter_text(chunk_size=None)` | `str` (multi-byte characters are never split) |
+| `iter_lines(decode_unicode=False, delimiter=None)` | each line as soon as it is complete (useful for SSE) |
+| `iter_raw(chunk_size=None)` | raw bytes, still compressed |
+| `iter_content(chunk_size=1, decode_unicode=False)` | requests-compatible alias |
+| `r.raw` | file-like reader of the raw body |
+| `r.read()` | the rest of the body |
+
+## Async
+
+```python
+async with AsyncSession() as s:
+    async with s.stream("GET", "https://example.com/big.bin") as r:
+        async for chunk in r.aiter_bytes():
+            ...
+```
+
+`aiter_bytes`, `aiter_text`, `aiter_lines` (yields `str` by default, like
+httpx), `aiter_raw`, `aread()` and `aclose()` mirror the sync methods.
+
+## Connections
+
+- Once the body has been read to the end, the connection goes back to the pool.
+- Closing a response early (`close()`, `aclose()` or leaving the `with` block)
+  closes the HTTP/1.1 connection, or cancels the HTTP/2 stream with
+  RST_STREAM(CANCEL) while the connection stays usable.
+- On HTTP/2 flow-control credit (WINDOW_UPDATE) is only returned for data you
+  have consumed, so a slow reader slows the server down.
+- Bodies of redirect and 401 intermediate responses are discarded, and a
+  response that is retried is closed.
+- A body consumed with `iter_*` is not kept: `r.content` afterwards raises.
+
+## Limits
+
+- HTTP/3 responses are always read completely, even with `stream=True`.
+- `MockTransport` responses are already in memory.

@@ -40,11 +40,16 @@ async def main():
 asyncio.run(main())
 ```
 
-`AsyncSession` accepts the same `impersonate`, `proxy`/`proxies`, `verify`,
-`Timeout` and `Limits` options. Its fingerprint (JA3/JA4, HTTP/2 settings)
-matches the synchronous client's.
+`AsyncSession` accepts the same options as `Session` (`impersonate`,
+`proxy`/`proxies`, `verify`, `cert`, `auth`, `Timeout`, `Limits`, `http3`,
+`legacy_tls` ...). Its fingerprint (JA3/JA4, HTTP/2 settings) matches the
+synchronous client's. With `impersonate=None` it uses Python's `ssl` module
+and HTTP/1.1 only. It also runs under trio, see [trio](features/trio.md).
 
-### Plugins (async)
+Both clients support `stream=True` ([streaming](features/streaming.md)) and
+[auth and hooks](features/auth-hooks.md).
+
+### Plugins
 
 ```python
 from fasthttpc import AsyncSession, RetryPlugin, RateLimitPlugin
@@ -54,6 +59,9 @@ async with AsyncSession() as s:
     s.use(RateLimitPlugin(rps=5.0))
 ```
 
+`Session.use()` takes the same plugins; there the plugin hooks must be plain
+functions.
+
 ## WebSocket
 
 ```python
@@ -62,6 +70,12 @@ async with AsyncSession() as s:
     ...
     await ws.close()
 ```
+
+`AsyncSession` supports `ws://` (plain TCP) and `wss://`; `wss://` uses the
+profile's ClientHello with ALPN `http/1.1`, directly or through a proxy.
+`Session.websocket()` supports `ws://` and `wss://` as well: `wss://` uses the
+profile's ClientHello with ALPN `http/1.1` only, and reads use the session's
+read timeout. `AsyncSession` is the more complete option (proxies, concurrency).
 
 ## DNS-over-HTTPS
 
@@ -74,5 +88,7 @@ with Session(resolver=DoHResolver(provider="cloudflare")) as s:
 
 ## Cookies and caching
 
-Cookies follow RFC 6265 (domain, path, `Secure`). Pass `cache=True` (or a
+Cookies follow RFC 6265 (domain, path, `Secure`). `Domain=` is ignored for IP
+hosts and single-label suffixes such as `com`, but there is no Public Suffix
+List, so multi-label suffixes (`co.uk`) are still accepted. Pass `cache=True` (or a
 `ResponseCache`) to enable a response cache with conditional requests.

@@ -1213,6 +1213,13 @@ class Http2Connection:
         self._dbg(f"gelen frame: {frame!r}")
         stream_id = st.stream_id
 
+        if frame.type == FrameType.PUSH_PROMISE:
+            # ENABLE_PUSH=0 ilan ettik: PUSH_PROMISE bağlantı hatasıdır
+            # (RFC 9113 §6.6, §8.4). Başlık bloğu decode edilmeden yutulsaydı
+            # HPACK dinamik tablosu sunucuyla senkronunu yitirirdi.
+            self._send_goaway(1)
+            raise Http2ConnectionError("PROTOCOL_ERROR: ENABLE_PUSH=0 iken PUSH_PROMISE alındı")
+
         if frame.stream_id != 0 and frame.stream_id != stream_id:
             self._dbg(f"  -> beklenmeyen stream_id, yutuluyor (bizim stream={stream_id})")
             self._foreign_frame(frame)
@@ -1283,7 +1290,7 @@ class Http2Connection:
                 # Tüketici bu veriyi isteyince (frame ancak o zaman okunur) pencere açılır.
                 self._send_window_updates(stream_id, raw_len)
             return data
-        # PRIORITY, PUSH_PROMISE vb. bu minimal modelde yok sayılır
+        # PRIORITY ve bilinmeyen frame türleri yok sayılır (RFC 9113 §4.1)
         return b""
 
 
@@ -1402,7 +1409,11 @@ class _PlainSocketAdapter:
     def recv_record(self, skip_post_handshake: bool = False) -> tuple[bytes, int]:
         try:
             chunk = self.raw_socket.recv(16384)
-        except (OSError, socket.timeout):
+        except socket.timeout:
+            # Okuma zaman aşımı "bağlantı kapandı" DEĞİLDİR: wss:// yolundaki
+            # (EncryptedSocket) davranışla aynı şekilde çağırana yükseltilir.
+            raise
+        except OSError:
             return b"", 23
         return chunk, 23                                        
 
@@ -1556,28 +1567,45 @@ class WebSocketConnection:
             hashlib.sha1((key + cls.GUID).encode()).digest()
         ).decode()
 
+        # session.timeout bir Timeout nesnesidir; settimeout() float/None ister.
+        # Bağlantı/TLS el sıkışması pool'un connect zaman aşımıyla yapılır,
+        # sonrasındaki okumalar (Upgrade yanıtı + frame'ler) read zaman aşımıyla.
+        tmo = session._tmo() if hasattr(session, "_tmo") else session.timeout
+        read_timeout = getattr(tmo, "read_timeout", tmo)
+
         conn = session.pool.acquire(u)
         try:
             if use_tls:
                 if not conn.tls_established:
                     from ..security.tls_adapter import TLSAdapter
+                    # Profilin ALPN'i "h2, http/1.1"; sunucu h2 seçerse HTTP/1.1
+                    # Upgrade yapılamaz — async yol gibi yalnızca http/1.1 öneriyoruz.
                     conn.socket = TLSAdapter.negotiate(conn.socket, u.host, session.impersonate,
+                                                      alpn=["http/1.1"],
                                                       **_tls_kw(session, u.port))
-                    tmo = session.timeout
-                    conn.socket.raw_socket.settimeout(getattr(tmo, "read_timeout", tmo))
                     conn.tls_established = True
+                alpn = (getattr(conn.socket, "state", None) or {}).get("alpn", "")
+                if alpn not in ("", "http/1.1") or getattr(conn, "h2_conn", None) is not None:
+                    raise ConnectionError(
+                        f"WebSocket için sunucu ALPN {alpn!r} seçti; yalnızca 'http/1.1' "
+                        "önerilmişti (WebSocket Upgrade HTTP/2 üzerinden yapılamaz)."
+                    )
+                conn.socket.raw_socket.settimeout(read_timeout)
                 wire = conn.socket
             else:
                 # 'ws://' — düz TCP, TLS katmanı yok. conn.socket burada ham
                 # socket.socket nesnesidir; EncryptedSocket'ın send_record/
                 # recv_record arayüzüyle uyumlu ince bir sarmalayıcı kullanıyoruz
                 # ki WebSocketFrame gönderim/alım kodu değişmeden çalışsın.
-                conn.socket.settimeout(session.timeout)
+                conn.socket.settimeout(read_timeout)
                 wire = _PlainSocketAdapter(conn.socket)
 
+            default_port = 443 if use_tls else 80
+            host = f"[{u.host}]" if ":" in u.host else u.host
+            hostport = host if u.port == default_port else f"{host}:{u.port}"
             req = (
                 f"GET {u.raw_path.decode()} HTTP/1.1\r\n"
-                f"Host: {u.host}\r\n"
+                f"Host: {hostport}\r\n"
                 f"Upgrade: websocket\r\n"
                 f"Connection: Upgrade\r\n"
                 f"Sec-WebSocket-Key: {key}\r\n"
