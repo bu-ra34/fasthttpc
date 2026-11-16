@@ -2,84 +2,20 @@
 
 ## [Unreleased]
 
-### Testler / CI
-- Canlı HTTP/3 testleri (`tests/live`, `FASTHTTPC_LIVE=1`) için ayrı bir GitHub
-  Actions iş akışı eklendi (`.github/workflows/live.yml`, "Live tests"): yalnızca
-  elle (Actions → Live tests → Run workflow) ve haftada bir çalışır, push/PR'da
-  çalışmaz. Ubuntu'da Python 3.10 + aioquic 1.3 (GOAWAY ara katmanı) ve Python
-  3.13 + güncel aioquic, macOS ve Windows'ta Python 3.12. Test başına 120 sn
-  sınırı var, yeniden deneme yok. `FASTHTTPC_LIVE=1` iken aioquic eksikse modül
-  artık sessizce atlanmıyor, hata veriyor; doğrulama mesajları durum kodu,
-  protokol ve `Alt-Svc` bilgisini gösteriyor. Ayrıntılar `docs/testing.md`'de.
-### Performans
-- **HTTP/2 alım akış kontrolü:** her 16 KiB'lik DATA frame'i için iki ayrı TLS
-  record'unda iki WINDOW_UPDATE gönderiliyordu. İlan edilen pencere 65535'ten
-  büyükse (tarayıcı profilleri) kredi artık tarayıcılar gibi toplu geri
-  veriliyor: eşik `min(pencere/2, 32 KiB)`. Stream bitince bağlantı kredisi
-  eksiksiz geri verilir, geri basınç korunur. Bağlantı ve stream güncellemesi
-  tek record'da gider. `default` profilinde (65535) davranış eskisiyle aynı.
-  İlan edilen SETTINGS ve önsöz değerleri, yani parmak izi değişmedi.
-- **Record katmanı:** nonce tamsayı XOR'u ile kuruluyor. `ct||tag`
-  bölünmeden `cryptography`'ye veriliyor (`seal`/`open`). Record tampondan
-  tek kopyayla alınıyor, padding `rstrip` ile atılıyor ve senkron yolda
-  `recv` 64 KiB okuyor. AEAD doğrulaması, record boyut sınırları ve sequence
-  denetimleri aynı. TLS 1.3 sans-IO çekirdeği ve TLS 1.2 de aynı yoldan geçiyor.
-- **HTTP/2 frame yolu:** frame yükü tek kopyayla alınıyor, gövde tek
-  `b"".join` ile birleştiriliyor ve kapalı debug f-string'leri artık her
-  frame'de değerlendirilmiyor. Async okuyucu yalnızca yazım yaptıysa drain
-  bekliyor. `AsyncTLSStream.read()` çözülmüş record'ların hepsini tek
-  çağrıda dönüyor.
-- **Küçük istekler:** `Headers(list)` kurulumu O(n²) yerine doğrusal.
-  `URL.params` ilk erişimde ayrıştırılıyor. `.netrc` her istekte yeniden
-  ayrıştırılmıyor; dosya değişirse yeniden okunuyor.
-- Yerel ölçümde (64 MiB, istemci CPU'su) HTTP/2 indirme ~255'ten ~440–475
-  MB/s'ye, async HTTP/2 indirme ~230'dan ~330–365 MB/s'ye, HTTP/1.1 indirme
-  ~%10–25 yükseldi. Ayrıntılar ve uyarılar `docs/performance.md`'de.
+## [0.7.0] — 2026-11-16
 
-### Araçlar
-- `benchmarks/local_bench.py`: ağsız uçtan uca benchmark. Sunucular ayrı
-  süreçte çalışıyor. HTTP/1.1, HTTP/2, akış, küçük istek, handshake ve async
-  senaryolarını ölçüyor, `--profile` ile cProfile çıktısı veriyor ve
-  `FASTHTTPC_BENCH_SRC` ile eski sürümle karşılaştırıyor.
-- `tests/test_perf_regresyon.py`: zamanlama eşiği olmadan sistem çağrısı,
-  record ve frame sayılarını ölçen regresyon testleri.
-### Düzeltmeler
-- **Yeniden kullanılan bağlantıda zaman aşımı:** soket/bağlantı zaman aşımı
-  yalnızca bağlantı kurulurken ayarlandığından, aynı sunucuya giden sonraki
-  istekler (keep-alive HTTP/1.1 ya da açık HTTP/2 bağlantısı) bağlantıyı açan
-  ilk isteğin süresini kullanıyordu: istek düzeyi `timeout=` ve oturumun süresi
-  yok sayılıyor, ilk istek `timeout=None` ise async HTTP/2'de istek sonsuza dek
-  takılabiliyordu. Senkron HTTP/2'de `Timeout.total` hiç uygulanmıyordu;
-  `AsyncSession` `total`'ı hiç uygulamıyordu. Artık her istek kendi etkin
-  `read`/`write`/`total` sürelerini her okuma/yazmada uygular (senkron ve async,
-  HTTP/1.1 ve HTTP/2, akışlı ve akışsız). `total` bağlantı alma/kurmayı da
-  kapsar; `stream=True` iken yanıt başlıklarına kadar geçerlidir.
-- **Senkron akış + istek düzeyi timeout:** HTTP/1.1 `stream=True` yolu soketi
-  oturumun `read` süresine döndürüyordu (`self.timeout`); akış gövdesi artık
-  isteğin `read` süresiyle okunur. HTTP/3 denemesi de istek düzeyi `timeout=`'u
-  kullanır.
-- **Sıkıştırılmış gövde sessizce bozuk dönüyordu:** `br`/`zstd` açıcısı kurulu
-  değilse gövde uyarısız, sıkıştırılmış haliyle dönüyor ve `.json()`
-  `UnicodeDecodeError` veriyordu. Artık kurulacak paketi ve `pip install`
-  komutunu söyleyen `fasthttpc.MissingDecoderError` (`DecodeError` ->
-  `ValueError` alt sınıfı; ikisi de dışa aktarıldı) yükselir; senkron/async,
-  akışlı (`iter_bytes`/`iter_text`/`aiter_*`) ve akışsız yollar aynı davranır
-  (`iter_raw()` ham gövdeyi vermeye devam eder). Gövdesiz yanıtlar hata vermez.
-- **zstd:** akışsız yol tek seferlik `ZstdDecompressor().decompress()` kullandığı
-  için çerçevesinde içerik boyutu olmayan (akış sıkıştırıcısıyla üretilmiş)
-  gövdeleri açamıyor, ham döndürüyordu. Akışsız gövde artık akışlı yolla aynı
-  açıcıdan geçer (virgüllü zincirler dahil).
+Güncel tarayıcı profilleri (Chrome 158, Firefox 160, Safari 27), düz HTTP ve
+proxy ortam değişkenleri, açık bağlantıda zaman aşımı ve brotli/zstd
+düzeltmeleri, HTTP/2 indirmelerinde ~1,6–1,8x hızlanma ve gerçek internette
+çalışan HTTP/3 testleri.
 
-### Bağımlılıklar
-- `brotli` (PyPy'de `brotlicffi`) ve `zstandard` artık normal bağımlılık
-  (CPython 3.10 - 3.13 için Linux/macOS/Windows wheel'leri var); tarayıcı
-  profillerinin `Accept-Encoding`'i değişmedi. `fasthttpc[brotli]` ve
-  `fasthttpc[zstd]` ekleri uyumluluk için duruyor (PyPy'de zstd için gerekli).
-
-### Dokümantasyon
-- README, README.tr, kurulum, zaman aşımı, akış, sınırlar ve API sayfaları
-  güncellendi.
 ### Davranış değişikliği
+- **Varsayılan profil `chrome_158`:** `Session()`/`AsyncSession()` ve `chrome`,
+  `firefox`, `safari` takma adları artık `chrome_158`, `firefox_160`,
+  `safari_27`'yi gösterir. Eski parmak izi için adı açıkça verin
+  (`impersonate="chrome_131"`).
+- **brotli ve zstandard artık zorunlu bağımlılık;** bir çözücü yine de yoksa
+  sıkıştırılmış gövde sessizce döndürülmez, `MissingDecoderError` verilir.
 - **`http://` artık düz HTTP:** `http://` adresleri requests/httpx gibi TLS'siz,
   düz TCP üzerinden HTTP/1.1 ile istenir (h2c ve HTTP/3 yok); 0.6.2'ye kadar TLS
   ile (port 80'e) isteniyordu ve yalnızca düz HTTP konuşan sunuculara
@@ -114,24 +50,6 @@
   devam eder.
 - `fasthttpc.transport.proxy`: `environ_proxies`, `proxy_bypass`,
   `select_proxy`; `fasthttpc.config.environ_ca_bundle`.
-
-### Güvenlik
-- `https://` → `http://` yönlendirmesi requests gibi izlenir ama o adımda
-  hiçbir kimlik bilgisi gitmez: `Authorization`, `Proxy-Authorization`,
-  `Cookie` başlıkları, `auth=`, URL'deki `kullanici:parola@` ve (requests'ten
-  farklı olarak) `.netrc` kimliği. `Secure` çerezler `http://` üzerinden
-  gönderilmez.
-- Düz HTTP yanıtı `Secure` çerez koyamaz, aynı adlı `Secure` çerezin üzerine
-  yazamaz ve onu silemez (RFC 6265bis §5.7).
-- Düz HTTP yanıtındaki `Alt-Svc` kaydedilmez; HTTP/3 yalnızca `https://` için
-  kullanılır (`http3="force"` olsa da `http://` düz HTTP/1.1 ile gider).
-- HSTS uygulanmaz (belgelendi).
-
-### Dokümantasyon
-- README, README.tr, `proxy.md`, `limits.md`, `security.md`,
-  `security-audit.md`, `migration-requests.md`, `migration-httpx.md` ve
-  auth/hook sayfası yeni davranışa göre güncellendi.
-### Eklendi
 - **Güncel tarayıcı profilleri (2026-11-16 kararlı sürümleri):** `chrome_158`,
   `firefox_160`, `safari_27` (Safari 27.2). Değerler tarayıcı kaynak kodundan
   (Chromium 158 + BoringSSL, Firefox 160 + NSS 3.132), curl-impersonate
@@ -158,14 +76,93 @@
 - JA4 hesabı imza algoritması listesindeki GREASE değerlerini artık yok sayıyor
   (FoxIO JA4 tanımı).
 
-### Dokümantasyon
-- Kullanıcı bildirimi doğrulandı: "extension 51764" Trust Anchor IDs'dir (PQ
-  kripto değil); ML-DSA gerçekten Chrome 158'in imza listesinde; Firefox 160'ta
-  ise ML-DSA kodda var ama `security.tls.enable_mldsa=false` olduğu için
-  ClientHello'da YOK. Safari 18 h2 dizesi gerçek Safari 18.0 ile aynıydı; farklılık
-  güncel Safari 26/27'ye göreydi. Ayrı Edge profili eklenmedi (TLS farkı
-  doğrulanamadı). Bilinen sapmalar `docs/limits.md`'de tablo olarak.
-### Testler
+### Düzeltmeler
+- **Yeniden kullanılan bağlantıda zaman aşımı:** soket/bağlantı zaman aşımı
+  yalnızca bağlantı kurulurken ayarlandığından, aynı sunucuya giden sonraki
+  istekler (keep-alive HTTP/1.1 ya da açık HTTP/2 bağlantısı) bağlantıyı açan
+  ilk isteğin süresini kullanıyordu: istek düzeyi `timeout=` ve oturumun süresi
+  yok sayılıyor, ilk istek `timeout=None` ise async HTTP/2'de istek sonsuza dek
+  takılabiliyordu. Senkron HTTP/2'de `Timeout.total` hiç uygulanmıyordu;
+  `AsyncSession` `total`'ı hiç uygulamıyordu. Artık her istek kendi etkin
+  `read`/`write`/`total` sürelerini her okuma/yazmada uygular (senkron ve async,
+  HTTP/1.1 ve HTTP/2, akışlı ve akışsız). `total` bağlantı alma/kurmayı da
+  kapsar; `stream=True` iken yanıt başlıklarına kadar geçerlidir.
+- **Senkron akış + istek düzeyi timeout:** HTTP/1.1 `stream=True` yolu soketi
+  oturumun `read` süresine döndürüyordu (`self.timeout`); akış gövdesi artık
+  isteğin `read` süresiyle okunur. HTTP/3 denemesi de istek düzeyi `timeout=`'u
+  kullanır.
+- **Sıkıştırılmış gövde sessizce bozuk dönüyordu:** `br`/`zstd` açıcısı kurulu
+  değilse gövde uyarısız, sıkıştırılmış haliyle dönüyor ve `.json()`
+  `UnicodeDecodeError` veriyordu. Artık kurulacak paketi ve `pip install`
+  komutunu söyleyen `fasthttpc.MissingDecoderError` (`DecodeError` ->
+  `ValueError` alt sınıfı; ikisi de dışa aktarıldı) yükselir; senkron/async,
+  akışlı (`iter_bytes`/`iter_text`/`aiter_*`) ve akışsız yollar aynı davranır
+  (`iter_raw()` ham gövdeyi vermeye devam eder). Gövdesiz yanıtlar hata vermez.
+- **zstd:** akışsız yol tek seferlik `ZstdDecompressor().decompress()` kullandığı
+  için çerçevesinde içerik boyutu olmayan (akış sıkıştırıcısıyla üretilmiş)
+  gövdeleri açamıyor, ham döndürüyordu. Akışsız gövde artık akışlı yolla aynı
+  açıcıdan geçer (virgüllü zincirler dahil).
+
+### Güvenlik
+- `https://` → `http://` yönlendirmesi requests gibi izlenir ama o adımda
+  hiçbir kimlik bilgisi gitmez: `Authorization`, `Proxy-Authorization`,
+  `Cookie` başlıkları, `auth=`, URL'deki `kullanici:parola@` ve (requests'ten
+  farklı olarak) `.netrc` kimliği. `Secure` çerezler `http://` üzerinden
+  gönderilmez.
+- Düz HTTP yanıtı `Secure` çerez koyamaz, aynı adlı `Secure` çerezin üzerine
+  yazamaz ve onu silemez (RFC 6265bis §5.7).
+- Düz HTTP yanıtındaki `Alt-Svc` kaydedilmez; HTTP/3 yalnızca `https://` için
+  kullanılır (`http3="force"` olsa da `http://` düz HTTP/1.1 ile gider).
+- HSTS uygulanmaz (belgelendi).
+
+### Performans
+- **HTTP/2 alım akış kontrolü:** her 16 KiB'lik DATA frame'i için iki ayrı TLS
+  record'unda iki WINDOW_UPDATE gönderiliyordu. İlan edilen pencere 65535'ten
+  büyükse (tarayıcı profilleri) kredi artık tarayıcılar gibi toplu geri
+  veriliyor: eşik `min(pencere/2, 32 KiB)`. Stream bitince bağlantı kredisi
+  eksiksiz geri verilir, geri basınç korunur. Bağlantı ve stream güncellemesi
+  tek record'da gider. `default` profilinde (65535) davranış eskisiyle aynı.
+  İlan edilen SETTINGS ve önsöz değerleri, yani parmak izi değişmedi.
+- **Record katmanı:** nonce tamsayı XOR'u ile kuruluyor. `ct||tag`
+  bölünmeden `cryptography`'ye veriliyor (`seal`/`open`). Record tampondan
+  tek kopyayla alınıyor, padding `rstrip` ile atılıyor ve senkron yolda
+  `recv` 64 KiB okuyor. AEAD doğrulaması, record boyut sınırları ve sequence
+  denetimleri aynı. TLS 1.3 sans-IO çekirdeği ve TLS 1.2 de aynı yoldan geçiyor.
+- **HTTP/2 frame yolu:** frame yükü tek kopyayla alınıyor, gövde tek
+  `b"".join` ile birleştiriliyor ve kapalı debug f-string'leri artık her
+  frame'de değerlendirilmiyor. Async okuyucu yalnızca yazım yaptıysa drain
+  bekliyor. `AsyncTLSStream.read()` çözülmüş record'ların hepsini tek
+  çağrıda dönüyor.
+- **Küçük istekler:** `Headers(list)` kurulumu O(n²) yerine doğrusal.
+  `URL.params` ilk erişimde ayrıştırılıyor. `.netrc` her istekte yeniden
+  ayrıştırılmıyor; dosya değişirse yeniden okunuyor.
+- Yerel ölçümde (64 MiB, istemci CPU'su) HTTP/2 indirme ~255'ten ~440–475
+  MB/s'ye, async HTTP/2 indirme ~230'dan ~330–365 MB/s'ye, HTTP/1.1 indirme
+  ~%10–25 yükseldi. Ayrıntılar ve uyarılar `docs/performance.md`'de.
+
+### Bağımlılıklar
+- `brotli` (PyPy'de `brotlicffi`) ve `zstandard` artık normal bağımlılık
+  (CPython 3.10 - 3.13 için Linux/macOS/Windows wheel'leri var); tarayıcı
+  profillerinin `Accept-Encoding`'i değişmedi. `fasthttpc[brotli]` ve
+  `fasthttpc[zstd]` ekleri uyumluluk için duruyor (PyPy'de zstd için gerekli).
+
+### Araçlar
+- `benchmarks/local_bench.py`: ağsız uçtan uca benchmark. Sunucular ayrı
+  süreçte çalışıyor. HTTP/1.1, HTTP/2, akış, küçük istek, handshake ve async
+  senaryolarını ölçüyor, `--profile` ile cProfile çıktısı veriyor ve
+  `FASTHTTPC_BENCH_SRC` ile eski sürümle karşılaştırıyor.
+- `tests/test_perf_regresyon.py`: zamanlama eşiği olmadan sistem çağrısı,
+  record ve frame sayılarını ölçen regresyon testleri.
+
+### Testler / CI
+- Canlı HTTP/3 testleri (`tests/live`, `FASTHTTPC_LIVE=1`) için ayrı bir GitHub
+  Actions iş akışı eklendi (`.github/workflows/live.yml`, "Live tests"): yalnızca
+  elle (Actions → Live tests → Run workflow) ve haftada bir çalışır, push/PR'da
+  çalışmaz. Ubuntu'da Python 3.10 + aioquic 1.3 (GOAWAY ara katmanı) ve Python
+  3.13 + güncel aioquic, macOS ve Windows'ta Python 3.12. Test başına 120 sn
+  sınırı var, yeniden deneme yok. `FASTHTTPC_LIVE=1` iken aioquic eksikse modül
+  artık sessizce atlanmıyor, hata veriyor; doğrulama mesajları durum kodu,
+  protokol ve `Alt-Svc` bilgisini gösteriyor. Ayrıntılar `docs/testing.md`'de.
 - Canlı testler (`FASTHTTPC_LIVE=1`): `badssl.com` yalnızca Extended Master
   Secret'sız TLS 1.2 sunduğu için fasthttpc onu sertifikaya bakmadan ServerHello'da
   reddediyor; eski `test_bad_certificates_rejected` bu yüzden sertifika
@@ -182,6 +179,17 @@
   kontrol isteği var (`test_tcp_tls13_baseline_succeeds`).
 
 ### Dokümantasyon
+- README, README.tr, kurulum, zaman aşımı, akış, sınırlar ve API sayfaları
+  güncellendi.
+- README, README.tr, `proxy.md`, `limits.md`, `security.md`,
+  `security-audit.md`, `migration-requests.md`, `migration-httpx.md` ve
+  auth/hook sayfası yeni davranışa göre güncellendi.
+- Kullanıcı bildirimi doğrulandı: "extension 51764" Trust Anchor IDs'dir (PQ
+  kripto değil); ML-DSA gerçekten Chrome 158'in imza listesinde; Firefox 160'ta
+  ise ML-DSA kodda var ama `security.tls.enable_mldsa=false` olduğu için
+  ClientHello'da YOK. Safari 18 h2 dizesi gerçek Safari 18.0 ile aynıydı; farklılık
+  güncel Safari 26/27'ye göreydi. Ayrı Edge profili eklenmedi (TLS farkı
+  doğrulanamadı). Bilinen sapmalar `docs/limits.md`'de tablo olarak.
 - `docs/testing.md`: `badssl.com`'un EMS'siz TLS 1.2 sunduğu ve testlerin bunu
   nasıl ele aldığı. `docs/limits.md` ve README: EMS'siz TLS 1.2 sunucuları
   (`legacy_tls=True` olmadan) reddedilir.
