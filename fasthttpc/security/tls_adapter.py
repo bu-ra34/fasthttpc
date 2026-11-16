@@ -816,7 +816,8 @@ class TLSAdapter:
     @staticmethod
     def negotiate(raw_socket: socket.socket, host: str, profile_name: str, *,
                   ca_path: str | None = None, port: int | None = None,
-                  legacy_tls: bool = False, client_cert=None) -> EncryptedSocket:
+                  legacy_tls: bool = False, client_cert=None,
+                  alpn: list[str] | None = None) -> EncryptedSocket:
         """ca_path: None -> certifi + sistem CA'ları; aksi halde YALNIZCA o PEM dosyası.
 
         legacy_tls: eski sunucu uyumluluk modu (varsayılan False = davranış değişmez);
@@ -825,8 +826,13 @@ class TLSAdapter:
         client_cert: security.client_cert.ClientCert (mTLS). CertificateRequest gelirse
         Certificate + CertificateVerify gönderilir (uygun şema yoksa boş Certificate).
         Kimliği PSK bilet önbelleği anahtarına girer.
+
+        alpn: profilin ALPN listesini geçersiz kılar (ör. WebSocket için
+        ``["http/1.1"]``; h2 üzerinden HTTP/1.1 Upgrade yapılamaz). None = profilinki.
         """
         impersonator = TLSImpersonator(host, profile=profile_name, legacy_tls=legacy_tls)
+        if alpn is not None:
+            impersonator.profile = dict(impersonator.profile, alpn=list(alpn))
 
         # PSK resumption (faz4) — VARSAYILAN KAPALI; bkz. session_tickets.enable_resumption.
         ticket_key = None

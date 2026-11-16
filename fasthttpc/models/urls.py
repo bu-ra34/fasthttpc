@@ -44,7 +44,7 @@ class URL:
         self.password = unquote(parsed.password) if parsed.password else ""
 
         try:
-            self.port = parsed.port or (443 if self.scheme == "https" else 80)
+            self.port = parsed.port or (443 if self.scheme in ("https", "wss") else 80)
         except ValueError as e:
             raise ValueError(f"URL'de geçersiz port: {url!r}") from e
 
@@ -95,7 +95,7 @@ class URL:
         return (self.scheme, self.host, self.port)
 
     def __str__(self) -> str:
-        default = 443 if self.scheme == "https" else 80
+        default = 443 if self.scheme in ("https", "wss") else 80
         netloc = self.host if self.port == default else f"{self.host}:{self.port}"
         q = f"?{self.raw_query}" if self.raw_query else ""
         return f"{self.scheme}://{netloc}{self.path}{q}"
