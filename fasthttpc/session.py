@@ -27,8 +27,9 @@ from .transport.plain           import PlainSocket
 from .transport.proxy           import ProxyConfig, absolute_form, authority, forward_proxy_headers
 from .security.tls_adapter      import TLSAdapter
 from .security.alerts          import describe_alert
-from .protocol.http1_parser     import MAX_RESPONSE_HEADER_BYTES, parse_chunk_size
-from .streaming  import decode_body
+from .protocol.http1_parser     import (MAX_RESPONSE_HEADER_BYTES, BodyFraming, parse_chunk_size,
+                                         response_framing)
+from .streaming  import IncrementalDecoder, decode_body
 from .protocol.http2_parser     import (Http2Connection, Http2StreamError, Http2ConnectionError,
                                          Http2RefusedError)
 from .metrics    import RequestMetrics
@@ -647,19 +648,15 @@ class Session:
 
     @staticmethod
     def _body_framing(method: str, status_code: int, headers: Headers) -> str:
-        """Yanıt gövdesinin çerçevelenme biçimi (RFC 9112 §6.3).
+        """Yanıt gövdesinin çerçevelenme biçimi (RFC 9112 §6.3; bkz.
+        :func:`~fasthttpc.protocol.http1_parser.response_framing`).
 
         ``"none"`` (HEAD, 1xx, 204, 304: gövde YOK, bağlantıdan veri beklenmez),
         ``"chunked"``, ``"length"`` ya da ``"eof"`` (bağlantı kapanana kadar).
+        Çelişkili/geçersiz ``Content-Length`` ya da bilinmeyen aktarım kodlaması:
+        :class:`ConnectionError`.
         """
-        if method.upper() == "HEAD" or status_code in (204, 304) or 100 <= status_code < 200:
-            return "none"
-        if "chunked" in headers.get("transfer-encoding", "").lower():
-            return "chunked"
-        cl = headers.get("content-length", "").strip()
-        if cl.isdigit():
-            return "length"
-        return "eof"
+        return response_framing(method, status_code, headers).kind
 
     def _collect_body(
         self,
@@ -667,15 +664,36 @@ class Session:
         first_body_chunk: bytes,
         headers: Headers,
         metrics: RequestMetrics | None = None,
-        framing: str | None = None,
+        framing: "BodyFraming | None" = None,
     ) -> bytes:
         """Gövdeyi tamamen toplar (bkz. :meth:`_iter_body`)."""
         return b"".join(self._iter_body(conn, first_body_chunk, headers, framing))
 
     def _iter_body(self, conn: "HTTPConnection", first_body_chunk: bytes, headers: Headers,
-                   framing: str | None = None) -> _BodyGen:
+                   framing: "BodyFraming | None" = None) -> _BodyGen:
         """
         Headers parse edildikten sonra body'yi PARÇA PARÇA üretir (boş parça yok).
+
+        Çerçeveleme :func:`response_framing` sonucudur. ``chunked`` dışındaki aktarım
+        kodlamaları (``Transfer-Encoding: gzip, chunked``) burada, Content-Encoding ile
+        aynı ``Limits.max_decompressed_size`` sınırıyla açılır.
+        """
+        if framing is None:
+            framing = response_framing("GET", 200, headers)
+        raw = self._iter_framed(conn, first_body_chunk, framing)
+        if not framing.codings:
+            yield from raw
+            return
+        dec = IncrementalDecoder(", ".join(framing.codings), self.limits.max_decompressed_size,
+                                 strict=True)
+        for c in raw:
+            yield from dec.decode_iter(c)
+        yield from dec.flush_iter()
+
+    def _iter_framed(self, conn: "HTTPConnection", first_body_chunk: bytes,
+                     framing: BodyFraming) -> _BodyGen:
+        """
+        Çerçevelenmiş (aktarım kodlaması açılmamış) gövde parçaları.
 
         Chunked: proper chunk state-machine (TLS record boundary sorununu çözer)
         Content-Length: tam miktar okunana kadar devam et; eksik gelirse
@@ -684,16 +702,14 @@ class Session:
         close_notify'sız TCP kapanışı normal sayılır (çoğu HTTP/1.0 sunucusu
         TLS'i düzgün kapatmaz; tarayıcılar/curl da böyle davranır).
         """
-        if framing is None:
-            framing = self._body_framing("GET", 200, headers)
-        if framing == "none":
+        if framing.kind == "none":
             return
-        if framing == "chunked":
+        if framing.kind == "chunked":
             yield from self._iter_chunked(conn, first_body_chunk)
             return
 
-        if framing == "length":
-            content_length = int(headers.get("content-length", "").strip())
+        if framing.kind == "length":
+            content_length = framing.length
             remaining = content_length
             chunk = first_body_chunk
             while True:
@@ -1009,17 +1025,19 @@ class Session:
 
                                                                            
                                                                     
-                framing  = self._body_framing(req.method, status_code, resp_headers)
-                conn_hdr = resp_headers.get("connection", "").lower()
                 http10   = lines[0].upper().startswith(b"HTTP/1.0")
-                if stream and framing != "none" and not (
-                        framing == "length"
-                        and int(resp_headers.get("content-length", "0").strip()) == 0):
+                # RFC 9112 §6.3; çelişkili/geçersiz çerçeveleme -> ConnectionError (bağlantı kapanır)
+                framing  = response_framing(req.method, status_code, resp_headers, http10)
+                conn_hdr = resp_headers.get("connection", "").lower()
+                # TE+CL ya da kapanışla biten gövde: bağlantı bir daha kullanılmaz.
+                no_reuse = framing.close or framing.kind == "eof"
+                if stream and framing.kind != "none" and not (
+                        framing.kind == "length" and framing.length == 0):
                     # Akış: gövdeyi OKUMADAN dön. Toplam süre sınırı (deadline)
                     # akış gövdesine uygulanmaz; her okuma İSTEĞİN read süresiyle
                     # sınırlıdır (eskiden oturumunkiyle: istek düzeyi timeout= yok sayılırdı).
                     self._end_deadline(conn)
-                    reusable = not ("close" in conn_hdr or framing == "eof"
+                    reusable = not ("close" in conn_hdr or no_reuse
                                     or (http10 and "keep-alive" not in conn_hdr))
                     gen = self._iter_body(conn, first_body_chunk, resp_headers, framing)
                     resp = Response(status_code=status_code, headers=resp_headers,
@@ -1072,7 +1090,7 @@ class Session:
                 if self._cache and method.upper() == "GET":
                     self._cache.store(str(url), method, resp)
 
-                if ("close" in conn_hdr or framing == "eof"
+                if ("close" in conn_hdr or no_reuse
                         or (http10 and "keep-alive" not in conn_hdr)):
                     # Yeniden kullanılamaz: kapat VE havuza iade et. release()
                     # kapalı bağlantıyı havuza koymaz ama semaphore slotunu

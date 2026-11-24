@@ -6,7 +6,7 @@ Yenilikler:
   - Chunked decoder iyileştirildi
 """
 from __future__ import annotations
-import zlib
+from typing import NamedTuple
 from ..models.headers import Headers
 from ..models.response import Response
 from ..buffer import ZeroCopyReader
@@ -62,11 +62,96 @@ def parse_chunk_size(line: "bytes | bytearray") -> int:
     return int(size, 16)
 
 
+#: Yanıtta çözebildiğimiz aktarım kodlamaları (RFC 9112 §7; ``chunked`` ayrıca ele
+#: alınır). ``compress``/``x-compress`` (LZW) ve kayıtlı olmayan adlar hata verir.
+_TRANSFER_CODINGS = frozenset({"gzip", "x-gzip", "deflate"})
+_DIGITS = frozenset("0123456789")
+
+
+class BodyFraming(NamedTuple):
+    """HTTP/1.1 yanıt gövdesinin çerçevelenmesi (bkz. :func:`response_framing`)."""
+
+    #: ``"none"`` (gövde yok), ``"chunked"``, ``"length"`` ya da ``"eof"`` (kapanışa kadar).
+    kind: str
+    #: ``kind == "length"`` iken gövde uzunluğu.
+    length: int = 0
+    #: ``chunked`` dışında, gövdeye uygulanmış (açılacak) aktarım kodlamaları, uygulanma sırasıyla.
+    codings: "tuple[str, ...]" = ()
+    #: Yanıttan sonra bağlantı YENİDEN KULLANILMAZ (çelişkili/bozuk çerçeveleme riski).
+    close: bool = False
+
+
+def _framing_error(msg: str) -> ConnectionError:
+    return ConnectionError(f"Yanıt çerçevelemesi geçersiz: {msg}")
+
+
+def response_framing(method: str, status: int, headers: Headers,
+                     http10: bool = False) -> BodyFraming:
+    """Yanıt gövdesinin uzunluğu, RFC 9112 §6.1-6.3'e harfiyen uyarak.
+
+    * HEAD, 1xx, 204, 304 -> gövde yok (diğer başlıklara bakılmaz).
+    * ``Transfer-Encoding`` varsa ``Content-Length``'i GEÇERSİZ KILAR (§6.3 madde 3).
+      İkisi birlikte gelmişse yanıt işlenir ama bağlantı yeniden kullanılmaz: bu ikili
+      request smuggling / response splitting işareti olabilir; bağlantıda kalan baytlar
+      bir sonraki yanıt sanılmamalı. Son kodlama ``chunked`` ise chunked okunur; değilse
+      gövde bağlantı kapanana kadar okunur (§6.3 madde 4). ``chunked``'dan SONRA başka
+      kodlama ya da bilinmeyen kodlama -> hata.
+    * HTTP/1.0 yanıtında ``Transfer-Encoding``: çerçeveleme bozuk sayılır (§6.1);
+      ``Content-Length`` dahil güvenilmez, gövde kapanışa kadar okunur, bağlantı kapatılır.
+    * ``Content-Length`` (TE yoksa): virgüllü liste ve tekrarlanan satırlar, hepsi aynı
+      geçerli değerse kabul edilir (``5, 5``); farklı değerler ya da geçersiz değer
+      kurtarılamaz çerçeveleme hatasıdır (§6.3 madde 5) -> :class:`ConnectionError`.
+    * Hiçbiri yoksa gövde kapanışa kadar okunur (§6.3 madde 8).
+    """
+    if method.upper() == "HEAD" or status in (204, 304) or 100 <= status < 200:
+        return BodyFraming("none")
+    te_values = headers.get_list("transfer-encoding")
+    cl_values = headers.get_list("content-length")
+    if te_values:
+        if http10:
+            return BodyFraming("eof", close=True)
+        codings = [c.split(";", 1)[0].strip().lower()
+                   for v in te_values for c in v.split(",")]
+        codings = [c for c in codings if c and c != "identity"]   # identity: eski no-op
+        for c in codings:
+            if c != "chunked" and c not in _TRANSFER_CODINGS:
+                raise _framing_error(f"desteklenmeyen Transfer-Encoding {c!r}.")
+        chunked = "chunked" in codings
+        if chunked:
+            first = codings.index("chunked")
+            # Yinelenen "chunked" (aynı başlığın iki satırı) tek sayılır; chunked'dan
+            # sonra uygulanmış başka bir kodlama çerçevelemeyi anlamsız kılar (curl de reddeder).
+            if any(c != "chunked" for c in codings[first:]):
+                raise _framing_error("'chunked' son aktarım kodlaması değil.")
+        others = tuple(c for c in codings if c != "chunked")
+        return BodyFraming("chunked" if chunked else "eof", codings=others,
+                           close=bool(cl_values) or not chunked)
+    if not cl_values:
+        return BodyFraming("eof")
+    lengths = set()
+    for v in cl_values:
+        for item in v.split(","):
+            item = item.strip()
+            if not item:
+                continue
+            if not set(item) <= _DIGITS or len(item) > 19:
+                raise _framing_error(f"geçersiz Content-Length {v!r}.")
+            lengths.add(int(item))
+    if len(lengths) != 1:
+        raise _framing_error(
+            f"birbiriyle çelişen ya da boş Content-Length değerleri {cl_values!r}.")
+    return BodyFraming("length", length=lengths.pop())
+
+
 class HTTP1Parser:
     """Ham HTTP/1.1 bayt akışını Response nesnesine dönüştüren protokol ayrıştırıcısı."""
 
     @staticmethod
-    def parse(raw: bytes) -> Response:
+    def parse(raw: bytes, max_decompressed_size: "int | None" = DEFAULT_MAX_DECOMPRESSED_SIZE,
+              method: str = "GET") -> Response:
+        """Tam bir yanıtı (bellekteki ham baytlar) ayrıştırır. Çerçeveleme
+        :func:`response_framing` ile (RFC 9112 §6.3); geçersiz çerçevelemede
+        :class:`ConnectionError`."""
         reader = ZeroCopyReader(raw)
 
                                
@@ -101,21 +186,22 @@ class HTTP1Parser:
             headers._list.append((k.strip(), k.strip().lower(), v.strip()))
 
                               
-        te = headers.get("transfer-encoding", "")
-        if "chunked" in te.lower():
+        framing = response_framing(method, status_code, headers,
+                                   http10=lines[0].upper().startswith(b"HTTP/1.0"))
+        if framing.kind == "none":
+            body_raw = b""
+        elif framing.kind == "chunked":
             body_raw = HTTP1Parser._decode_chunked(body_raw)
-        else:
-            cl = headers.get("content-length", "")
-            if cl:
-                try:
-                    body_raw = body_raw[:int(cl)]
-                except ValueError:
-                    pass
+        elif framing.kind == "length":
+            body_raw = body_raw[:framing.length]
+        if framing.codings:          # aktarım kodlaması (gzip/deflate): aynı sınırla açılır
+            body_raw = decode_body(body_raw, ", ".join(framing.codings), max_decompressed_size,
+                                   strict=True)
 
-                                                                     
         body_raw = HTTP1Parser._decompress(
             body_raw,
-            headers.get("content-encoding", "").lower()
+            headers.get("content-encoding", "").lower(),
+            max_decompressed_size,
         )
 
         return Response(status_code=status_code, headers=headers, body=body_raw)
