@@ -93,7 +93,7 @@ with Session(transport=transport) as s:
 | Proxies | HTTP CONNECT (+Basic), SOCKS5 (RFC 1929), rotation; `HTTP_PROXY`/`HTTPS_PROXY`/`ALL_PROXY`/`NO_PROXY` with `trust_env=True`; TLS always terminates inside the tunnel |
 | Timeouts / limits / retries | `Timeout` (including a `total` budget), applied per request also on reused keep-alive / HTTP/2 connections; `Limits`, urllib3-style `Retry` with `Retry-After` |
 | Content decoding | gzip, deflate, brotli, zstd (chained encodings too), identical for streaming and non-streaming, sync and async |
-| Cookies, cache, redirects | RFC 6265 cookie jar, response cache, redirect history |
+| Cookies, cache, redirects | RFC 6265 cookie jar (with Public Suffix List checks), response cache, redirect history |
 | DNS | Optional DNS-over-HTTPS resolver; Happy Eyeballs (RFC 8305) for hosts with several addresses |
 | Old servers | `legacy_tls=True` (off by default): TLS 1.2 CBC and static-RSA suites. TLS 1.0/1.1 are never supported |
 | Testing | `MockTransport` (sync and async handlers) |
@@ -215,7 +215,7 @@ privately via GitHub security advisories.
   [limits](https://bu-ra34.github.io/fasthttpc/limits/).
 - Pure-Python crypto framing is slower than OpenSSL for large bulk transfers.
 - Open findings of the internal review (for example no limit on the
-  decompressed body size, no Public Suffix List for cookies) are listed in the
+  decompressed body size) are listed in the
   [security review](https://bu-ra34.github.io/fasthttpc/security-audit/).
 
 The full list is in the [documentation](https://bu-ra34.github.io/fasthttpc/limits/)
@@ -237,8 +237,13 @@ pytest            # offline tests; live tests are skipped unless FASTHTTPC_LIVE=
 ruff check .
 mypy
 mkdocs serve      # needs: pip install -e ".[docs]"
+python scripts/update_psl.py   # refresh the bundled Public Suffix List (network)
 ```
 
 ## License
 
 MIT. See [LICENSE](LICENSE).
+
+The bundled Public Suffix List snapshot (`fasthttpc/public_suffix_list.dat.gz`,
+used for cookie domains) comes from <https://publicsuffix.org/> and is under the
+Mozilla Public License 2.0. See [LICENSE-PSL](LICENSE-PSL).

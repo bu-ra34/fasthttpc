@@ -1,0 +1,21 @@
+fasthttpc/public_suffix_list.dat.gz
+===================================
+
+This file is a snapshot of the Public Suffix List
+(https://publicsuffix.org/list/public_suffix_list.dat), maintained by the
+Public Suffix List project and contributors. The upstream VERSION and COMMIT
+of the snapshot, and a link to that exact upstream source file, are recorded
+at the top of the decompressed file.
+
+It is a modified form of that file, produced by scripts/update_psl.py:
+comments were dropped, internationalized labels were converted to A-labels
+(punycode), and the result was gzip-compressed. The rules themselves are not
+changed. The license notice of the original file is kept at the top of the
+decompressed file:
+
+    This Source Code Form is subject to the terms of the Mozilla Public
+    License, v. 2.0. If a copy of the MPL was not distributed with this
+    file, You can obtain one at https://mozilla.org/MPL/2.0/.
+
+The Mozilla Public License 2.0 applies to this file only. The rest of
+fasthttpc is licensed under the MIT license (see LICENSE).

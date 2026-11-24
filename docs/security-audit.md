@@ -26,7 +26,7 @@ No Critical or High findings were identified.
 | FHC-05 | Low | Unbounded HTTP/1.1 response header accumulation | Fixed |
 | FHC-06 | Low | Loose parsing of the TLS 1.3 `Certificate` message | Fixed |
 | FHC-07 | Low | No limit on decompressed response size | Open |
-| FHC-08 | Low | No Public Suffix List for multi-label suffixes | Open |
+| FHC-08 | Low | No Public Suffix List for multi-label suffixes | Fixed |
 | FHC-09 | Low | Conflicting `Transfer-Encoding` / `Content-Length` responses are not treated as errors | Open |
 | FHC-10 | Info | TLS 1.3 cipher suite and ALPN not checked against what was offered | Open |
 | FHC-11 | Info | Sync TLS 1.3 record layer accepts compatibility CCS after the handshake | Open |
@@ -94,8 +94,8 @@ control characters. Violations raise `ValueError` and nothing is sent.
 
 ### FHC-03 — Cookie `Domain=` scoped to a TLD or IP suffix (Medium, Fixed)
 
-**Location:** `fasthttpc/cookies.py:63` (`_domain_attr_allowed`), used by
-`parse_set_cookie` at line 131.
+**Location:** `fasthttpc/cookies.py:65` (`_domain_attr_allowed`), used through
+`_domain_attr_verdict` (line 78) by `parse_set_cookie` at line 167.
 
 **Description.** The `Domain` attribute was accepted whenever the request host
 ended with it. A response from `attacker.com` with `Set-Cookie: sid=x; Domain=com`
@@ -112,8 +112,12 @@ other site under the same TLD.
 **Fix.** On an IP host the `Domain` attribute is ignored (host-only cookie).
 Single-label values (`com`, `.com`, `local`) are not accepted as a cookie
 domain; the cookie stays host-only. Normal registrable domains
-(`Domain=example.com` from `a.example.com`) work as before. Multi-label public
-suffixes are still open, see FHC-08.
+(`Domain=example.com` from `a.example.com`) work as before. *Update (FHC-08,
+after 0.7.0):* multi-label public suffixes are now rejected as well, and a
+cookie whose `Domain` is any public suffix (including a single label such as
+`com`) is now ignored entirely instead of being kept host-only, unless the
+attribute equals the request host (RFC 6265 section 5.3 step 5). IP hosts still
+get a host-only cookie.
 
 ### FHC-04 — Lenient chunked-encoding parsing (Low, Fixed)
 
@@ -174,14 +178,39 @@ A small gzip/brotli/zstd body can expand to gigabytes when the body is buffered
 **Recommendation:** add a `max_decompressed_size` (or reuse a response-size limit)
 and use incremental decompressors with `max_length` in the buffered path too.
 
-### FHC-08 — No Public Suffix List (Low, Open)
+### FHC-08 — No Public Suffix List (Low, Fixed)
 
-**Location:** `fasthttpc/cookies.py:63`.
+**Location:** `fasthttpc/cookies.py:78` (`_domain_attr_verdict`), used by
+`parse_set_cookie` at line 167; the list lookup is `fasthttpc/_psl.py`.
 
-After FHC-03, `Domain=co.uk` or `Domain=github.io` is still accepted from
-`a.co.uk` / `x.github.io`. **Recommendation:** check the attribute against the
-Public Suffix List (an optional dependency, or a vendored snapshot), as
-browsers do.
+**Description.** After FHC-03, only single-label `Domain` values were refused.
+`Domain=co.uk` from `example.co.uk`, or `Domain=github.io` from `x.github.io`,
+was still accepted and created a cookie for the whole suffix. The same held for
+the PRIVATE section of the Public Suffix List (`herokuapp.com` and similar
+hosting domains) and for IDN suffixes (`Domain=рф`).
+
+**Exploit scenario.** As in FHC-03, one level down: a long-lived `Session`
+visits `attacker.github.io` (anyone can publish there) and later
+`victim.github.io`; or `evil.co.uk` and later a bank under `.co.uk`. The
+attacker's cookie is sent to the other site (session fixation / cookie
+tossing). A cookie set on an intermediate redirect response is enough.
+
+**Fix.** The `Domain` attribute is checked against a snapshot of the Public
+Suffix List that ships inside the package (`fasthttpc/public_suffix_list.dat.gz`,
+ICANN and PRIVATE sections, version `2026-11-23_15-54-01_UTC`, upstream commit
+`faf981a2`; MPL-2.0, see `LICENSE-PSL`). Nothing is downloaded at runtime. The
+lookup follows the official algorithm: normal rules, wildcards (`*.ck`),
+exceptions (`!www.ck`) and the default rule `*`. Names are compared
+case-insensitively, without a trailing dot, and with IDN labels converted to
+A-labels by the same function on the list and on the host side. Following
+RFC 6265 section 5.3 step 5, a cookie whose `Domain` is a public suffix is
+ignored entirely, unless the attribute equals the request host, in which case
+the cookie is host-only. The last `Domain` attribute counts (step 4). `Session`
+and `AsyncSession` share the `CookieJar`, and cookies set on redirect hops go
+through the same check. The list is parsed on first use, once per process
+(about 8 ms). The regression tests are in `tests/test_security_audit.py`
+(section F8); the lookup is also tested against the official PSL test vectors
+in `tests/test_psl.py`. `scripts/update_psl.py` refreshes the snapshot.
 
 ### FHC-09 — Conflicting message framing not treated as an error (Low, Open)
 

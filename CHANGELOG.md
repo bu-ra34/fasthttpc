@@ -2,6 +2,65 @@
 
 ## [Unreleased]
 
+### Güvenlik
+- **Çerez `Domain=` için Public Suffix List (FHC-08):** öznitelik artık pakete
+  gömülü bir Public Suffix List anlık görüntüsüyle (ICANN ve PRIVATE bölümleri,
+  tarayıcılar gibi) denetleniyor. Eskiden `evil.co.uk`'nin `Domain=co.uk`,
+  `foo.github.io`'nun `Domain=github.io` (ya da `herokuapp.com`, `рф` ...)
+  çerezi o sonekin altındaki bütün sitelere gidiyordu; artık RFC 6265 §5.3
+  adım 5 gereği tümden yok sayılıyor. Öznitelik istek host'una eşitse (ör.
+  doğrudan `github.io`'ya yapılan istek) çerez host-only kalır. Joker (`*.ck`),
+  istisna (`!www.ck`) ve varsayılan `*` kuralı resmi algoritmaya göre
+  uygulanıyor; IDN adlar liste ve host tarafında aynı fonksiyonla A-label'a
+  (punycode) çevrilip büyük/küçük harf ve sondaki nokta gözetilmeden
+  karşılaştırılıyor. `Session`, `AsyncSession` ve yönlendirme ara yanıtlarında
+  konan çerezler aynı denetimden geçiyor.
+
+### Davranış değişikliği
+- Genel sonek olan `Domain=` taşıyan çerez (tek etiketli `com`, `local` dahil)
+  artık host-only olarak saklanmıyor, hiç saklanmıyor (FHC-03'te host-only
+  kalıyordu; tarayıcılar da reddeder). IP host'larda `Domain=` yine yok
+  sayılıyor, çerez host-only kalıyor.
+- Birden çok `Domain=` özniteliği varsa sonuncusu geçerli (RFC 6265 §5.3 adım 4).
+- Host-only çerezin alan adı kanonik biçimde saklanıyor (küçük harf, sondaki
+  nokta yok, IDN için A-label); `CookieJar.header_for()` Unicode host da kabul
+  ediyor.
+
+### Paketleme
+- Liste `fasthttpc/public_suffix_list.dat.gz` olarak wheel ve sdist'te: sürüm
+  `2026-11-23_15-54-01_UTC`, upstream commit
+  `faf981a207f390881e6c3bcc7b9a1d57b8db066f`, 10.472 kural. Yorumlar atılmış,
+  IDN'ler A-label'a çevrilmiş ve gzip'lenmiş haliyle ~44 KB; wheel ~48 KB
+  büyüdü. Yeni bağımlılık yok, çalışma anında ağa çıkılmıyor.
+- Liste `import fasthttpc` sırasında değil, `Domain=` içeren ilk `Set-Cookie`'de
+  süreç başına bir kez (thread-safe) yükleniyor: ~8 ms, ~1 MB bellek; sonraki
+  aramalar küme sorgusu (~1 µs). `import fasthttpc` süresi değişmedi.
+- Liste dosyası Mozilla Public License 2.0 altında: `LICENSE-PSL` eklendi,
+  paketin lisans ifadesi `MIT AND MPL-2.0` oldu (MPL yalnızca bu dosya için;
+  kodun geri kalanı MIT).
+
+### Araçlar
+- `scripts/update_psl.py`: listeyi publicsuffix.org'dan indirir (ya da
+  `--input` ile yerel dosyayı okur) ve paketlenmiş dosyayı yeniden üretir.
+  Biçimi denetler (joker yalnızca en soldaki etiket, iki bölüm de var, MPL
+  bildirimi, VERSION/COMMIT satırları) ve aynı listeden bayt bayt aynı dosyayı
+  üretir. Testler ağa çıkmaz.
+
+### Testler
+- `tests/test_psl.py`: resmi PSL test vektörleri (upstream `tests/test_psl.txt`,
+  dosyaya kopyalandı), joker/istisna, IDN, tembel ve thread-safe yükleme, paketlenmiş
+  dosyanın içeriği ve güncelleme betiği (uydurma, küçük bir listeyle).
+- `tests/test_security_audit.py` (F8): `co.uk`, `github.io`, `herokuapp.com`,
+  joker/istisna ve IDN (`рф`, `公司.cn`) senaryoları; host'un kendisi genel
+  sonekse host-only çerez; `Session` ve `AsyncSession` ile yönlendirme ara
+  yanıtında konan çerezin kardeş sitelere gitmediği. FHC-03 testleri yeni
+  davranışa göre: `Domain=com` çerezi artık tümden yok sayılıyor.
+
+### Dokümantasyon
+- `docs/security-audit.md`: FHC-08 kapatıldı, FHC-03'e not eklendi.
+  `docs/usage.md` çerez bölümü, README ve README.tr (lisans, sınırlar,
+  geliştirme) güncellendi.
+
 ## [0.7.0] — 2026-11-16
 
 Güncel tarayıcı profilleri (Chrome 158, Firefox 160, Safari 27), düz HTTP ve
