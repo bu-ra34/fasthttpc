@@ -503,3 +503,36 @@ def test_trio_auto_altsvc_h1e_duser(pki, dual):
                 assert r.headers["x-proto"] == "h1"
     trio.run(go)
     assert dual.tcp_hits == 3
+
+
+# --- FHC-07: açılmış gövde sınırı HTTP/3'te de (docs/security-audit.md) -----------------
+_LIMIT = 100 * 1024
+
+
+@pytest.mark.parametrize("enc", ["gzip", "br"])
+def test_h3_sikistirma_bombasi_sinirlanir_sync(pki, h3, enc):
+    from fasthttpc import DecompressedSizeError, Limits
+    lim = Limits(max_decompressed_size=_LIMIT)
+    with Session(http3="force", verify=pki["ca"], limits=lim) as s:
+        with pytest.raises(DecompressedSizeError) as ei:
+            s.get(url(h3, f"/bomb?enc={enc}&n={1024 * 1024}"))
+        assert (ei.value.limit, ei.value.encoding) == (_LIMIT, enc)
+        r = s.get(url(h3, f"/bomb?enc={enc}&n={_LIMIT}"))       # tam sınırda: geçer
+        assert r.http_version == "HTTP/3" and r.content == bytes(_LIMIT)
+    with Session(http3="force", verify=pki["ca"], limits=Limits(max_decompressed_size=None)) as s:
+        assert s.get(url(h3, f"/bomb?enc={enc}&n={1024 * 1024}")).content == bytes(1024 * 1024)
+
+
+@pytest.mark.parametrize("enc", ["gzip", "br"])
+def test_h3_sikistirma_bombasi_sinirlanir_async(pki, h3, enc):
+    from fasthttpc import DecompressedSizeError, Limits
+
+    async def go():
+        lim = Limits(max_decompressed_size=_LIMIT)
+        async with AsyncSession(http3="force", verify=pki["ca"], limits=lim) as s:
+            with pytest.raises(DecompressedSizeError):
+                await s.get(url(h3, f"/bomb?enc={enc}&n={1024 * 1024}"))
+            r = await s.get(url(h3, f"/bomb?enc={enc}&n={_LIMIT}"))
+            # gövde bir kez açılır (eskiden async h3 yolu iki kez açmaya çalışıyordu)
+            assert r.http_version == "HTTP/3" and r.content == bytes(_LIMIT)
+    asyncio.run(go())
