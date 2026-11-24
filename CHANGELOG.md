@@ -2,6 +2,55 @@
 
 ## [Unreleased]
 
+### Güvenlik
+- **Açılmış gövde sınırı (FHC-07, sıkıştırma bombası):** yeni
+  `Limits(max_decompressed_size=...)`, varsayılan 256 MiB, `None` sınırı kapatır.
+  Content-Encoding (gzip, deflate, br, zstd ve `gzip, br` gibi zincirler) ve
+  HTTP/1.1 aktarım kodlamaları artık artımlı açılır; her adımın çıktısı sınırlıdır
+  (zlib `max_length`, brotli `output_buffer_limit`, zstd küçük girdi dilimleri),
+  bellek sınır denetiminden önce büyümez. Sınır aşılınca yeni
+  `fasthttpc.DecompressedSizeError` (`DecodeError` alt sınıfı) verilir; gövde asla
+  sessizce kısaltılmaz. HTTP/1.1, HTTP/2 ve HTTP/3, `Session` ve `AsyncSession`,
+  akışlı ve akışsız yolların hepsinde geçerli; `stream=True` iken her parça en
+  çok ~64 KiB'tır ve sınır toplam açılmış bayta uygulanır. Bir yanıtta en çok 5
+  içerik kodlaması açılır (urllib3 gibi).
+- **Yanıt çerçevelemesi RFC 9112 §6.1-6.3'e uygun (FHC-09):** `Transfer-Encoding`
+  ile `Content-Length` birlikte gelirse TE kazanır ve bağlantı bir daha
+  kullanılmaz (havuza dönmez). Birbirinden farklı ya da geçersiz `Content-Length`
+  değerleri, bilinmeyen aktarım kodlaması (`compress` ...) ve `chunked`'dan sonra
+  gelen kodlama artık `ConnectionError`; aynı değerin tekrarı (`5, 5`) kabul
+  edilir. Son kodlaması `chunked` olmayan TE'de gövde bağlantı kapanana kadar
+  okunur; `gzip`/`deflate` aktarım kodlamaları açılır. HTTP/1.0 yanıtında TE
+  varsa çerçeveleme bozuk sayılır: gövde kapanışa kadar okunur, bağlantı
+  kapatılır.
+
+### Davranış değişikliği
+- Geçersiz `Content-Length` (ör. `abc`) eskiden "kapanışa kadar oku"ya
+  düşüyordu; artık kurtarılamaz çerçeveleme hatasıdır (`ConnectionError`).
+- Art arda birden çok zstd çerçevesi içeren gövde artık tamamen açılır
+  (RFC 8878; eskiden yalnızca ilk çerçeve dönüyordu). Açılırken çıktı ürettikten
+  sonra bozulan gövde (ör. gzip CRC hatası) artık ham (sıkıştırılmış) döndürülmez,
+  `DecodeError` verir; hiç açılamayan gövde (başlıkta yanlış kodlama) eskisi gibi
+  ham geçer.
+
+### Düzeltmeler
+- Async HTTP/3 yolu yanıt gövdesini iki kez açmaya çalışıyordu (gzip'li her
+  yanıtta yersiz bir uyarı); gövde artık yalnızca oturumda, bir kez açılır.
+- `http2_parser.StreamingDecompressor` artık ortak açıcıyı kullanır: çok
+  parçalı zstd akışı her parçada yeni açıcıyla başladığı için bozuluyordu.
+
+### Bağımlılıklar
+- `brotli` / `brotlicffi` en az 1.2 (`output_buffer_limit` için). Daha eski bir
+  sürüm kuruluysa girdi küçük dilimlerle verilir; sınır yine geçerlidir.
+
+### Dokümantasyon
+- HTTP/3 belgeleri güncellendi: canlı HTTP/3 testleri 0.7.0'dan beri ayrı "Live
+  tests" iş akışında haftalık ve elle tetiklenerek Ubuntu/macOS/Windows
+  makinelerinde Cloudflare, nginx ve Google'a karşı çalışıyor ("yalnızca yerel
+  aioquic sunucusuyla test edildi" ifadeleri kaldırıldı). HTTP/3 deneysel kalıyor.
+- `docs/security-audit.md`: FHC-07 ve FHC-09 "Fixed"; yeni ayar
+  `docs/timeouts-limits-retries.md`'de.
+
 ## [0.7.0] — 2026-11-16
 
 Güncel tarayıcı profilleri (Chrome 158, Firefox 160, Safari 27), düz HTTP ve

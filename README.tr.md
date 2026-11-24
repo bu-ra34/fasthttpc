@@ -249,6 +249,7 @@ eskisi gibi çalışır; `from fasthttpc.timeout import Timeout` aynı sınıft�
 | `max_connections` | 10 | `Session`'da origin başına, `AsyncSession`'da toplam eşzamanlı bağlantı (`AsyncSession`'ın `max_connections` varsayılanı 100) |
 | `max_keepalive_connections` | `None` (= `max_connections`) | Havuzda boşta tutulan bağlantı |
 | `keepalive_expiry` | 30.0 | Boştaki bağlantının ömrü (sn); `None` → sınırsız, `0` → keep-alive kapalı |
+| `max_decompressed_size` | 256 MiB | Content-Encoding (gzip/deflate/br/zstd) ya da aktarım kodlaması açıldıktan sonra gövde için üst sınır (bayt); aşılınca `DecompressedSizeError` (sıkıştırma bombası koruması, akışta da toplam üzerinden; gövde asla sessizce kısaltılmaz). `None` → sınırsız |
 
 ### Yeniden deneme (`retries`)
 

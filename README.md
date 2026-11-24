@@ -91,7 +91,7 @@ with Session(transport=transport) as s:
 | Streaming | `stream=True` / `s.stream(...)`; `iter_bytes`, `iter_text`, `iter_lines`, `iter_raw` and the async `aiter_*` versions, over HTTP/1.1 and HTTP/2 |
 | Auth and hooks | Basic, Digest (RFC 7616), Bearer, `.netrc`, custom auth (requests or httpx style); requests-style `hooks=`, httpx-style `event_hooks=`; plugins on `Session` and `AsyncSession` |
 | Proxies | HTTP CONNECT (+Basic), SOCKS5 (RFC 1929), rotation; `HTTP_PROXY`/`HTTPS_PROXY`/`ALL_PROXY`/`NO_PROXY` with `trust_env=True`; TLS always terminates inside the tunnel |
-| Timeouts / limits / retries | `Timeout` (including a `total` budget), applied per request also on reused keep-alive / HTTP/2 connections; `Limits`, urllib3-style `Retry` with `Retry-After` |
+| Timeouts / limits / retries | `Timeout` (including a `total` budget), applied per request also on reused keep-alive / HTTP/2 connections; `Limits` (including a decompressed body size limit against compression bombs, 256 MiB by default), urllib3-style `Retry` with `Retry-After` |
 | Content decoding | gzip, deflate, brotli, zstd (chained encodings too), identical for streaming and non-streaming, sync and async |
 | Cookies, cache, redirects | RFC 6265 cookie jar, response cache, redirect history |
 | DNS | Optional DNS-over-HTTPS resolver; Happy Eyeballs (RFC 8305) for hosts with several addresses |
