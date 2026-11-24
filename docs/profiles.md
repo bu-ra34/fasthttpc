@@ -2,8 +2,10 @@
 
 `impersonate=` selects a browser profile that controls the **TLS ClientHello**
 (cipher suites, extensions and their order, groups, ALPN), the **HTTP/2
-fingerprint** (SETTINGS, window updates, HEADERS priority, pseudo-header order)
-and default **headers and header order**. The default is `"chrome_158"` for
+fingerprint** (SETTINGS, window updates, HEADERS priority, pseudo-header order,
+and the browser's HPACK encoding: Huffman, dynamic table, cookie splitting; see
+[HTTP/2](http2.md#hpack-header-compression)) and default **headers and header
+order**. The default is `"chrome_158"` for
 both `Session` and `AsyncSession`.
 
 | Profile | Browser (stable as of 2026-11-16) | Aliases |
@@ -139,9 +141,9 @@ profiles use aioquic defaults). See [HTTP/3](features/http3.md).
 !!! info "Honest caveats"
     Profiles are snapshots of specific browser versions and age as browsers
     change. Known deviations of the current profiles are listed in
-    [Limits](limits.md#browser-fingerprint-deviations). Not implemented: HPACK
-    Huffman *encoding* (small HTTP/2 deviation), secp521r1/ffdhe key exchange,
-    Chrome's trust-anchor retry flow. Post-quantum X25519MLKEM768 and ML-DSA
+    [Limits](limits.md#browser-fingerprint-deviations). Not implemented:
+    secp521r1/ffdhe key exchange, Chrome's trust-anchor retry flow. Safari's
+    HPACK encoder is only partly verified (closed source). Post-quantum X25519MLKEM768 and ML-DSA
     depend on the `cryptography` version. `legacy_tls=True` appends old suites
     and changes the ClientHello. Session resumption is off by default; when
     turned on, resumed connections add a `pre_shared_key` extension. Anti-bot

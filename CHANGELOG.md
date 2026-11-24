@@ -2,6 +2,55 @@
 
 ## [Unreleased]
 
+### Davranış değişikliği
+- **HTTP/2 HEADERS baytları artık tarayıcınınki gibi:** HPACK kodlayıcı
+  Huffman kodlama (RFC 7541 Appendix B) ve bağlantı başına dinamik tablo
+  kullanıyor; her başlığı Huffman'sız ve indekslemesiz literal olarak gönderme
+  dönemi bitti. Tipik bir Chrome isteğinin başlık bloğu yeni bağlantıda 715
+  yerine 507 bayt, aynı bağlantıda tekrarlandığında 40 bayt. Akamai HTTP/2
+  dizeleri ve SETTINGS/WINDOW_UPDATE/PRIORITY değişmedi.
+- Chrome ve Firefox profillerinde `Cookie` başlığı HTTP/2'de tarayıcı gibi
+  parçalara bölünerek gönderilir (RFC 9113 §8.2.3); sunucu yine tek başlık görür.
+
+### Eklenenler
+- **Profil başına HPACK politikası** (`PROFILES[ad]["h2"]["hpack"]`,
+  `http2_parser.HpackPolicy`): Huffman kararı, hangi başlığın dinamik tabloya
+  gireceği, ad referansı, never-indexed alanlar, cookie parçalama ve tablo
+  boyutu güncellemesi. Chrome: Chromium/QUICHE `hpack_encoder.cc` (Huffman
+  yalnızca kısaysa, pseudo'lardan yalnızca `:authority` indekslenir); gerçek
+  Chrome 151 bayt yakalamalarıyla birebir. Firefox: `Http2Compression.cpp`
+  (her dize Huffman, `:path` her zaman literal, `authorization` ve 20 bayttan
+  kısa cookie parçaları never-indexed, son ad eşleşmesi). Safari: kapalı kaynak;
+  bir Safari 26.6.1 yakalamasının 277 baytlık HEADERS yüküyle doğrulanan kısım
+  dışında Chrome davranışı varsayıldı (`docs/limits.md`).
+- Sunucunun `SETTINGS_HEADER_TABLE_SIZE`'ı kodlayıcıya uygulanır (senkron ve
+  async): sonraki başlık bloğunun başına dinamik tablo boyutu güncellemesi
+  (arada daha küçük değer görüldüyse önce o) yazılır; Chrome yalnızca değer
+  değişince, Firefox her ayarda yazar. 16 MiB üstü ilanlar 16 MiB'ye sınırlanır.
+- `hpack_huffman_encode`, `hpack_huffman_size`, `HPACK_HUFFMAN_CODES` (kod
+  tablosu decode trie'sinden türetilir; RFC tablosuyla testte karşılaştırılır).
+
+### Testler / CI
+- RFC 7541 Appendix B tablosu (257 sembol), C.4 ve C.6 örnekleri (tahliye
+  dahil) bayt bayt; tipik Chrome ve Firefox istekleri ile aynı bağlantıdaki
+  ikinci isteğin tam baytları; rastgele istek + tablo boyutu değişikliklerinde
+  kodlayıcı tablosunun bizim ve `hpack` paketinin çözücüsüyle senkronu.
+- Bağımsız sunucuyla birlikte-çalışma (OpenSSL TLS + `h2`): senkron ve async,
+  üç profil, bağlantı ortasında tablo küçültme/büyütme, eşzamanlı stream'ler;
+  ham HEADERS blokları sunucu tarafında denetlenir.
+
+### Performans
+- Huffman kodlama tablo güdümlü (bit bit Python döngüsü yok); kısa dizelerin
+  kodlanmış hâli süreç genelinde önbellekte. Tipik Chrome başlık listesi (18
+  alan): aynı bağlantıda tekrar eden istek ~13,4 → ~12,3 µs (blok 715 → 40
+  bayt); yeni bağlantının ilk isteği ~13,7 → ~27 µs (blok 715 → 507 bayt;
+  süreçteki ilk bağlantıda, dize önbelleği soğukken ~90 µs).
+
+### Dokümantasyon
+- `docs/http2.md`: tarayıcı başına HPACK davranışı tablosu ve kaynakları.
+  `docs/limits.md`: "HPACK Huffman kodlama yok" sınırı kaldırıldı; Safari HPACK
+  varsayımları ve 16 MiB tablo sınırı sapma tablosuna eklendi.
+
 ## [0.7.0] — 2026-11-16
 
 Güncel tarayıcı profilleri (Chrome 158, Firefox 160, Safari 27), düz HTTP ve
