@@ -27,6 +27,7 @@ except ImportError:
     _ZSTD = False
 
 from .._log import get_logger
+from ..transport.iotimeout import IOTimeouts, TOTAL_TIMEOUT_MESSAGE, send_all, write_timeout_error
 logger = get_logger("http2")
 
 # Bozuk sıkıştırılmış veride beklenen hata tipleri (gerisi yukarı yükselir).
@@ -948,9 +949,13 @@ class Http2Connection:
         self._lock = threading.Lock()
         self._foreign_hblock = bytearray()
         # İstek başına zaman aşımı (Session._arm_timeouts her istekte ayarlar):
-        # okuma süresi ve Timeout.total'ın bitiş anı (perf_counter; None = yok).
+        # okuma/yazma süresi ve Timeout.total'ın bitiş anı (perf_counter; None = yok).
+        # write_timeout gövde gönderirken akış kontrolü (WINDOW_UPDATE) beklemesini de
+        # sınırlar; frame gönderimlerinin kendisi soket sarmalayıcısının ``io``'suyla sınırlıdır.
         self.read_timeout: Optional[float] = None
+        self.write_timeout: Optional[float] = None
         self.deadline: Optional[float] = None
+        self._send_wait = False      # True: gövde gönderilirken pencere bekleniyor (write süresi)
         self.debug = debug or __import__("os").environ.get("FASTHTTPC_H2_DEBUG") == "1"
         # Alım tarafı akış kontrolü: tüketilmiş ama henüz WINDOW_UPDATE ile geri
         # verilmemiş bayt (bağlantı düzeyi) ve eşikler (bkz. h2_wu_thresholds).
@@ -989,14 +994,25 @@ class Http2Connection:
     def _recv_record(self) -> tuple[bytes, int]:
         """``sock.recv_record``; istek başına toplam süre sınırı (``deadline``,
         ``time.perf_counter`` cinsinden; Session ayarlar) varsa soketin zaman
-        aşımı her okumadan önce kalan süreye kısaltılır."""
+        aşımı her okumadan önce kalan süreye kısaltılır. Gövde gönderilirken
+        akış kontrolü beklemesinde (``_send_wait``) temel süre ``write_timeout``'tur."""
         dl = self.deadline
+        if self._send_wait:
+            base = self.write_timeout
+        elif dl is None:
+            rec0: tuple[bytes, int] = self.sock.recv_record(skip_post_handshake=True)
+            return rec0
+        else:
+            base = self.read_timeout
         if dl is not None:
             left = dl - time.perf_counter()
             if left <= 0:
-                raise TimeoutError("İstek toplam süre sınırını (Timeout.total) aştı.")
-            rt = self.read_timeout
-            self.sock.raw_socket.settimeout(left if rt is None else min(rt, left))
+                raise TimeoutError(TOTAL_TIMEOUT_MESSAGE)
+            base = left if base is None else min(base, left)
+        if base is not None or dl is not None:
+            raw = self.sock.raw_socket
+            if raw.gettimeout() != base:
+                raw.settimeout(base)
         rec: tuple[bytes, int] = self.sock.recv_record(skip_post_handshake=True)
         return rec
 
@@ -1124,23 +1140,46 @@ class Http2Connection:
         bundan büyük bir gövdeyi tek seferde göndermek sunucudan
         FLOW_CONTROL_ERROR / GOAWAY almakla sonuçlanır.
         """
-        while min(self._conn_window_send, self._stream_windows.get(stream_id, 0)) < needed:
-            frame = self._read_frame()
-            if frame.type == FrameType.WINDOW_UPDATE:
-                self._handle_window_update(frame)
-            elif frame.type == FrameType.SETTINGS:
-                self._handle_settings(frame)
-            elif frame.type == FrameType.PING and not (frame.flags & 0x1):
-                pong = HTTP2Frame(len(frame.payload), FrameType.PING, 0x1, 0, frame.payload)
-                self.sock.send_record(pong.serialize())
-            elif frame.type == FrameType.GOAWAY:
-                self._on_goaway(frame, stream_id)
-            elif frame.type == FrameType.RST_STREAM:
-                raise Http2StreamError(f"Stream {frame.stream_id} gövde gönderilirken sıfırlandı.")
-            else:
-                # Yanıt bizden önce gelmeye başlamış olabilir; sonra işlenmek
-                # üzere sakla (yarı-kapalı stream'de bu tamamen geçerlidir).
-                self._pending_frames.append(frame)
+        if min(self._conn_window_send, self._stream_windows.get(stream_id, 0)) >= needed:
+            return
+        # Bekleme bir GÖNDERİM aşamasıdır: süre ``write_timeout`` (+ kalan total). Okuma
+        # süresi (soketin önceki zaman aşımı) bekleme bitince geri yüklenir.
+        timed = self.write_timeout is not None or self.deadline is not None
+        prev = self.sock.raw_socket.gettimeout() if timed else None
+        self._send_wait = True
+        try:
+            while min(self._conn_window_send, self._stream_windows.get(stream_id, 0)) < needed:
+                frame = self._read_frame()
+                if frame.type == FrameType.WINDOW_UPDATE:
+                    self._handle_window_update(frame)
+                elif frame.type == FrameType.SETTINGS:
+                    self._handle_settings(frame)
+                elif frame.type == FrameType.PING and not (frame.flags & 0x1):
+                    pong = HTTP2Frame(len(frame.payload), FrameType.PING, 0x1, 0, frame.payload)
+                    self.sock.send_record(pong.serialize())
+                elif frame.type == FrameType.GOAWAY:
+                    self._on_goaway(frame, stream_id)
+                elif frame.type == FrameType.RST_STREAM:
+                    raise Http2StreamError(f"Stream {frame.stream_id} gövde gönderilirken sıfırlandı.")
+                else:
+                    # Yanıt bizden önce gelmeye başlamış olabilir; sonra işlenmek
+                    # üzere sakla (yarı-kapalı stream'de bu tamamen geçerlidir).
+                    self._pending_frames.append(frame)
+        except TimeoutError:
+            # Okuma da araya giren frame gönderimleri (PONG, SETTINGS ACK) de write ile sınırlı.
+            if self.deadline is not None and time.perf_counter() >= self.deadline:
+                raise TimeoutError(TOTAL_TIMEOUT_MESSAGE) from None
+            raise write_timeout_error(
+                self.write_timeout, "HTTP/2 akış kontrolü penceresi (WINDOW_UPDATE) gelmediğinden gövde"
+            ) from None
+        finally:
+            self._send_wait = False
+            if timed:
+                try:
+                    if self.sock.raw_socket.gettimeout() != prev:
+                        self.sock.raw_socket.settimeout(prev)
+                except OSError:
+                    pass
 
     def _send_data(self, stream_id: int, body: bytes) -> None:
         if not body:
@@ -1488,9 +1527,10 @@ class _PlainSocketAdapter:
     """
     def __init__(self, raw_socket):
         self.raw_socket = raw_socket
+        self.io: Optional[IOTimeouts] = None     # bkz. transport.iotimeout
 
     def send_record(self, data: bytes, content_type: int = 0x17, use_app_keys: bool = True) -> None:
-        self.raw_socket.sendall(data)
+        send_all(self.raw_socket, data, self.io)
 
     def recv_record(self, skip_post_handshake: bool = False) -> tuple[bytes, int]:
         try:
@@ -1658,6 +1698,7 @@ class WebSocketConnection:
         # sonrasındaki okumalar (Upgrade yanıtı + frame'ler) read zaman aşımıyla.
         tmo = session._tmo() if hasattr(session, "_tmo") else session.timeout
         read_timeout = getattr(tmo, "read_timeout", tmo)
+        write_timeout = getattr(tmo, "write_timeout", read_timeout)
 
         conn = session.pool.acquire(u)
         try:
@@ -1685,6 +1726,8 @@ class WebSocketConnection:
                 # ki WebSocketFrame gönderim/alım kodu değişmeden çalışsın.
                 conn.socket.settimeout(read_timeout)
                 wire = _PlainSocketAdapter(conn.socket)
+            # Gönderimler (Upgrade isteği, frame'ler) Timeout.write ile sınırlı.
+            wire.io = IOTimeouts(read_timeout, write_timeout)
 
             default_port = 443 if use_tls else 80
             host = f"[{u.host}]" if ":" in u.host else u.host

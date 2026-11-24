@@ -21,8 +21,11 @@
 | `files={"f": open(...)}` | works, but the file name is not taken from the file object; use `files={"f": ("name", file_or_bytes, "mime")}` |
 
 Differences to know: `verify`, `cert` and `proxies` are session-level, not per
-request; `Session` is not thread-safe; `Session()` impersonates Chrome by default
-(`impersonate="chrome_158"`).
+request; `Session()` impersonates Chrome by default
+(`impersonate="chrome_158"`). One `Session` can be shared by many threads, as is
+common with requests ([guarantees](usage.md#using-one-session-from-many-threads)).
+After `close()` the session stays closed: further requests raise `RuntimeError`
+(requests reopens its pools).
 
 Proxies and redirects: an explicit `proxies=` dict replaces the environment
 completely (requests fills missing schemes from `HTTP_PROXY`/`HTTPS_PROXY`;

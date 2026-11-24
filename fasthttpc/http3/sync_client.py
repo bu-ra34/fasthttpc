@@ -23,6 +23,10 @@ class SyncH3Connection:
         self._lock = threading.RLock()
         self._sock: "Optional[socket.socket]" = None
         self.core: "Optional[H3Core]" = None
+        # SyncHttp3 kilidi altında: bu bağlantıyı şu an kullanan iş parçacığı sayısı ve
+        # sözlükten çıkarıldı mı (son kullanıcı bitince kapatılır).
+        self.users = 0
+        self.retired = False
 
     # -- IO ---------------------------------------------------------------------
     def _flush(self) -> None:

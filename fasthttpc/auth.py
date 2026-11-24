@@ -194,6 +194,10 @@ class DigestAuth(Auth):
     401 challenge'ı alınınca isteği TEK kez yeniden dener; ``stale=true`` yeni
     nonce ile yine tek yeniden deneme yapar. Nonce başına ``nc`` sayacı artar ve
     sonraki isteklerde (aynı origin) challenge beklenmeden önceden gönderilir.
+
+    İş parçacığı güvenli: aynı nesne paylaşılan bir ``Session``'da eşzamanlı isteklerde
+    kullanılabilir; ``nc`` sayacı ve challenge durumu kilit altında güncellenir (her
+    isteğin ``nc`` değeri eşsizdir).
     """
 
     def __init__(self, username, password="") -> None:
@@ -264,7 +268,8 @@ class DigestAuth(Auth):
 
     def auth_flow(self, request) -> AuthFlow:
         origin = request.url.origin
-        ch = self._state.get(origin)
+        with self._lock:
+            ch = self._state.get(origin)
         preemptive = ch is not None
         if preemptive:
             request.headers["Authorization"] = self._header(request, ch)
@@ -276,7 +281,15 @@ class DigestAuth(Auth):
             return
         if preemptive and not new.stale:
             return                              # kimlik bilgisi reddedildi; tekrar denemek boşuna
-        self._state[origin] = new
+        with self._lock:
+            cur = self._state.get(origin)
+            if (cur is not None and not new.stale and cur.nonce == new.nonce
+                    and cur.realm == new.realm and cur.algorithm == new.algorithm):
+                # Eşzamanlı istekler aynı challenge'ı aldı: sayacı sıfırlamak yerine mevcut
+                # durumu kullan (aynı nonce ile tekrarlanan nc sunucuda replay sayılır).
+                new = cur
+            else:
+                self._state[origin] = new
         request.headers["Authorization"] = self._header(request, new)
         yield request
 

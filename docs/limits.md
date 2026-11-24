@@ -45,9 +45,10 @@
 
 ## Client
 
-- `Session` is not thread-safe.
-- `Timeout.write` is not enforced separately on the sync side (sends use the
-  request's `read` socket timeout, capped by the remaining `total`).
+- `Session` is thread-safe (see [using one `Session` from many threads](usage.md#using-one-session-from-many-threads)),
+  but on the sync side an HTTP/2 connection carries one request at a time: threads
+  use separate connections, up to `Limits.max_connections` per origin. A closed
+  `Session` cannot be reopened.
 - `Timeout.total` does not bound reading a streamed (`stream=True`) body after
   the headers have arrived; each read there is bounded by `read`.
 - On PyPy, zstd decoding needs `pip install "fasthttpc[zstd]"` (zstandard has no

@@ -8,6 +8,7 @@ from __future__ import annotations
 import socket
 from typing import Optional
 
+from ..transport.iotimeout import IOTimeouts, send_all
 from ..transport.lingering import shutdown_and_drain
 from .connection import TLSClientConnection
 from ._records import RecordQueue
@@ -18,6 +19,8 @@ class SyncTLSSocket:
         self.raw_socket = raw_socket
         self.conn = conn
         self._records = RecordQueue()
+        # İsteğin süreleri (Session her istekte ayarlar; bkz. transport.iotimeout).
+        self.io: Optional[IOTimeouts] = None
 
     # --------------------------------------------------------------- kurulum
     @classmethod
@@ -57,7 +60,7 @@ class SyncTLSSocket:
         # use_app_keys yalnızca imza uyumluluğu için: handshake sonrası çekirdek
         # her zaman güncel application anahtarını kullanır.
         self.conn.send_record(data, content_type)
-        self.raw_socket.sendall(self.conn.data_to_send())
+        send_all(self.raw_socket, self.conn.data_to_send(), self.io)
 
     def recv_record(self, skip_post_handshake: bool = False) -> tuple[bytes, int]:
         while True:
@@ -77,7 +80,7 @@ class SyncTLSSocket:
                 try:
                     out = self.conn.data_to_send()
                     if out:
-                        self.raw_socket.sendall(out)
+                        send_all(self.raw_socket, out, self.io)
                         # RST yerine FIN: okunmamış veriyle close() alert'i eş tarafta siler.
                         shutdown_and_drain(self.raw_socket)
                 except OSError:
@@ -85,7 +88,7 @@ class SyncTLSSocket:
                 raise
             out = self.conn.data_to_send()      # ör. KeyUpdate yanıtı
             if out:
-                self.raw_socket.sendall(out)
+                send_all(self.raw_socket, out, self.io)
 
     # ----------------------------------------------------------- yardımcılar
     def settimeout(self, t) -> None:

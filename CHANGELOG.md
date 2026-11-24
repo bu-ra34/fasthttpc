@@ -2,6 +2,70 @@
 
 ## [Unreleased]
 
+### Davranış değişikliği
+- **`Session` iş parçacığı güvenli:** tek oturum birden çok iş parçacığından aynı
+  anda kullanılabilir (havuz, çerez kavanozu, önbellek ve TLS durumu paylaşılır).
+  Bir bağlantı (HTTP/1.1 ya da HTTP/2) aynı anda yalnızca bir isteğe kiralanır;
+  senkron HTTP/2 bağlantısı tek stream taşır. Boş bağlantı yoksa iş parçacığı
+  origin başına `max_connections`'a kadar yeni bağlantı açar, sınırdaysa
+  `Timeout.pool` kadar bekleyip `TimeoutError` alır (kilitlenme yok). İstek düzeyi
+  ayarlar (`timeout=`, `auth=`, `cookies=` ...) başka iş parçacığına sızmaz:
+  süreler isteğin kiraladığı bağlantıya yazılır. Belgelerdeki "thread-safe
+  değildir" uyarıları kaldırıldı.
+- **`Session.close()` kalıcı ve belirlenimli:** herhangi bir iş parçacığından,
+  birden çok kez çağrılabilir. Bağlantısını almış süren istekler kesilmez ve
+  beklenmez; bittiklerinde bağlantıları havuza dönmeden kapatılır. Boştaki
+  bağlantılar hemen kapanır. Bağlantı almamış her istek (sonradan başlayanlar,
+  slot bekleyenler, süren çağrının yönlendirme/yeniden deneme/auth adımı)
+  `RuntimeError` verir; eskiden kapatılan oturum sessizce yeni bağlantı açıyordu.
+  `cert=` yol olarak verildiyse özel anahtar, kirada bağlantı kalmayınca bırakılır.
+- **`Timeout.write` senkron tarafta uygulanıyor:** her gönderim (HTTP/1.1 istek
+  başı ve gövdesi, HTTP/2 frame'leri ve gövde DATA'sı, TLS kayıtları, proxy
+  CONNECT/SOCKS5 gönderimleri) `write` içinde işletim sistemine teslim edilmeli,
+  kalan `total` ile kısaltılır; gövde gönderirken HTTP/2 WINDOW_UPDATE beklemesi de
+  `write` ile sınırlı. Gönderimden sonra soket isteğin `read` süresine döner.
+  Aşılınca mesajında `Timeout.write` geçen `TimeoutError`. Eskiden gönderimler
+  `read` süresini kullanıyordu.
+
+### Eklenenler
+- `Session.pool_stats()` girdilerinde `in_use` (kirada bağlantı sayısı).
+- `fasthttpc.transport.iotimeout`: `IOTimeouts` ve `send_all` (istek başına
+  okuma/yazma/toplam süre).
+
+### Düzeltmeler
+- Havuz: `release()` idempotent; aynı bağlantının ikinci iadesi semaphore'u bir
+  daha artırıp `max_connections` sınırını sessizce aşabiliyordu. Bağlantı
+  kurulamazsa slot `KeyboardInterrupt`'ta da iade edilir; `acquire(block=False)`
+  `ValueError` vermiyor.
+- Önbellek: `304` yanıtında paylaşılan önbellek nesnesinin `request`/`metrics`
+  alanı her istekte eziliyordu; artık her isteğe ayrı kopya döner.
+- `DigestAuth`: aynı challenge'ı eşzamanlı alan istekler sayacı sıfırlıyor, aynı
+  nonce ile aynı `nc` tekrar gönderiliyordu (sunucuda replay); durum artık kilit
+  altında ve mevcut challenge yeniden kullanılıyor.
+- Senkron HTTP/3: `close()` ve kullanılamaz bağlantının değiştirilmesi süren bir
+  isteği beklemiyor ya da kesmiyor; bağlantı son kullanıcı bitince kapanır.
+- Chrome trust anchor sırasının süreç başına tek kez belirlenmesi iş parçacıkları
+  arasında yarışabiliyordu.
+- Yeni HTTP/2 bağlantısının ön eki (preface + SETTINGS) isteğin zaman aşımı
+  uygulandıktan sonra gönderiliyor.
+
+### Testler
+- `tests/test_thread_safety.py`: 16 iş parçacığı × 20 istek (TLS HTTP/1.1, HTTP/2,
+  düz HTTP); her yanıt kendi eşsiz yolu/gövdesiyle doğrulanır, eşzamanlı çerezlerin
+  hepsi kavanozda, havuz sınırı istemci ve sunucu tarafında aşılmıyor, HTTP/2'de
+  bağlantı başına tek açık stream; istek düzeyi zaman aşımı sızmıyor; `close()`
+  süren isteklerle; `DigestAuth` `nc` eşsizliği.
+- `tests/test_write_timeout.py`: hiç okumayan yerel sunucuya büyük gövdeyle
+  `write` (HTTP/1.1 düz/TLS, HTTP/2 gönderim ve akış kontrolü beklemesi), `read`'in
+  bağımsızlığı, `total`'ın üst sınırı, gönderimden sonra okuma süresinin geri
+  gelmesi; `send_all` ve proxy el sıkışması birim testleri.
+- `tests/thread_servers.py`: iş parçacıklı HTTP/2 (`h2`) ve "okumayan" sunucu.
+
+### Dokümantasyon
+- `usage.md`: "Using one `Session` from many threads" (garantiler, kilit tasarımı,
+  `close()` anlamı); `timeouts-limits-retries.md`: senkron `write`; `limits.md`,
+  `migration-requests.md`, README'ler güncellendi.
+
 ## [0.7.0] — 2026-11-16
 
 Güncel tarayıcı profilleri (Chrome 158, Firefox 160, Safari 27), düz HTTP ve

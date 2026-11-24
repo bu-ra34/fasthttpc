@@ -32,6 +32,7 @@ from ..tls_crafter import (
     TLSImpersonator, alps_accepted, build_client_encrypted_extensions,
 )
 from .._log import get_logger
+from ..transport.iotimeout import send_all
 from .alerts import describe_alert
 from .keyshare import (
     is_hello_retry_request,
@@ -354,6 +355,9 @@ class EncryptedSocket:
         # anahtar değişince (handshake->app, KeyUpdate) otomatik olarak yeni nesne oluşur.
         self._cipher_cache: dict = {}
         self._post_hs_buffer = b""
+        # İsteğin süreleri (transport.iotimeout.IOTimeouts; Session her istekte ayarlar).
+        # None iken gönderim soketin o anki zaman aşımıyla yapılır (el sıkışma: connect).
+        self.io = None
 
     def _cipher(self, key: bytes):
         is_aes = self.state["cipher_name"].startswith("AES")
@@ -445,7 +449,7 @@ class EncryptedSocket:
         sealed = cipher.seal(nonce, inner, header)     # ct || tag
 
         self.state[seq_name] = seq + 1
-        self.raw_socket.sendall(header + sealed)
+        send_all(self.raw_socket, header + sealed, self.io)
 
     def close(self) -> None:
         try:

@@ -18,8 +18,72 @@ generic `request(method, url, ...)`. Redirects are followed by default
 (`allow_redirects=False` to disable; `max_redirects=` on the session) and the
 chain is in `r.history`.
 
-!!! note
-    `Session` is **not thread-safe**. Use one instance per thread.
+### Using one `Session` from many threads
+
+`Session` is thread-safe: one instance can be shared by any number of threads,
+for example from a `ThreadPoolExecutor`. Sharing it is the intended way to use
+it, because the threads then share its connection pool, cookie jar, cache and
+TLS state.
+
+```python
+from concurrent.futures import ThreadPoolExecutor
+from fasthttpc import Session
+
+with Session(max_connections=8) as s:
+    with ThreadPoolExecutor(max_workers=16) as ex:
+        pages = list(ex.map(lambda i: s.get(f"https://api.example.com/items/{i}").json(),
+                            range(100)))
+```
+
+What is guaranteed:
+
+- **Connections are exclusive.** A pooled connection, HTTP/1.1 or HTTP/2, is used
+  by one request (one thread) at a time. It goes back to the pool when the
+  response body has been read, or when a streamed response is closed. On the
+  sync side an HTTP/2 connection carries one stream at a time; concurrent
+  streams on one connection are an `AsyncSession` feature.
+- **Pool limits hold under contention.** At most `Limits.max_connections`
+  connections per origin are in use or being opened at the same time. A thread
+  takes an idle connection if one is free and otherwise opens a new one while
+  the origin is below the limit. At the limit it waits up to `Timeout.pool` for
+  a connection to be released, then raises `TimeoutError`. Locks are only held
+  for short bookkeeping, never during network I/O, and a thread holds at most
+  one pool slot per request. Waiting therefore cannot deadlock: the wait is
+  bounded by `Timeout.pool` even when another thread keeps a streamed response
+  open.
+- **Per-request settings stay per request.** `timeout=`, `auth=`, `cookies=`,
+  `params=`, `headers=` and `hooks=` passed to one call never affect a call in
+  another thread. The effective timeouts are attached to the connection the
+  request leases, so a streamed body that another thread reads keeps the
+  timeouts of the request that opened it.
+- **Shared state is synchronized.** The cookie jar, the response cache (a `304`
+  returns a fresh copy of the cached response for each request), `DigestAuth`
+  nonce counters (every `nc` is unique), `RateLimitPlugin`, the proxy rotator,
+  Alt-Svc/HTTP/3 state, the DoH cache and the TLS session-ticket cache are all
+  safe under concurrent use.
+- Session-level attributes (`s.headers`, `s.auth`, `s.params`, `s.hooks` …) can
+  be changed between requests. Changing them while other threads are sending
+  requests is not synchronized; configure the session before sharing it.
+  Your own hooks and plugins run in the calling thread and must be thread-safe
+  themselves.
+
+`close()` can be called from any thread, at any time, any number of times (only
+the first call does anything). It does not interrupt requests that are in
+progress in other threads, and it does not wait for them:
+
+- every exchange that already holds a connection finishes normally (its response,
+  or the rest of a streamed body, can still be read), and that connection is then
+  closed instead of going back to the pool;
+- idle connections are closed immediately;
+- every request that has not obtained a connection raises `RuntimeError`: requests
+  started after `close()`, threads waiting for a free pool slot, and the next step
+  of a call already in progress (redirect hop, retry, auth challenge);
+- with `cert=` given as a path or tuple, the private key is released when the last
+  connection still in use is returned, so a TLS handshake that is in progress
+  does not lose its key.
+
+A closed `Session` stays closed. Create a new one if you need to send more
+requests.
 
 ## Asynchronous: `AsyncSession`
 

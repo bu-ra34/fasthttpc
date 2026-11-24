@@ -60,6 +60,7 @@ pytest        # ağ gerektirmez (canlı testler FASTHTTPC_LIVE=1 olmadan atlanı
 | Auth ve hook'lar | Basic, Digest (RFC 7616), Bearer, `.netrc`, özel auth (requests veya httpx tarzı); requests tarzı `hooks=`, httpx tarzı `event_hooks=`; `Session` ve `AsyncSession`'da plugin'ler |
 | Proxy | HTTP CONNECT (+Basic), SOCKS5 (RFC 1929), rotasyon; `trust_env=True` ile `HTTP_PROXY`/`HTTPS_PROXY`/`ALL_PROXY`/`NO_PROXY`; TLS her zaman tünelin içinde kurulur |
 | Zaman aşımı / sınır / yeniden deneme | `Timeout` (`total` dahil), `Limits`, urllib3 tarzı `Retry` (`Retry-After` ile) |
+| İş parçacıkları | Tek `Session` birden çok iş parçacığından paylaşılabilir: bağlantılar özel kiralanır, `max_connections` eşzamanlılıkta da korunur, istek düzeyi ayarlar sızmaz, `close()` belirlenimlidir ([ayrıntı](https://bu-ra34.github.io/fasthttpc/usage/#using-one-session-from-many-threads)) |
 | Çerez, cache, yönlendirme | RFC 6265 cookie jar, response cache, yönlendirme geçmişi |
 | DNS | İsteğe bağlı DNS-over-HTTPS çözücü; çok adresli host'larda Happy Eyeballs (RFC 8305) |
 | Eski sunucular | `legacy_tls=True` (varsayılan kapalı): TLS 1.2 CBC ve statik RSA suite'leri. TLS 1.0/1.1 hiçbir zaman desteklenmez |
@@ -225,7 +226,7 @@ with Session(
 |---|---|
 | `connect` | TCP bağlantısı + TLS el sıkışması |
 | `read` | Sunucudan veri bekleme |
-| `write` | Veri gönderme (şimdilik senkron tarafta `read` ile aynı soket zaman aşımını paylaşır) |
+| `write` | Veri gönderme: senkron tarafta her gönderim (TLS kaydı, HTTP/2 frame'i, gövde parçası, proxy el sıkışması; gövde gönderirken HTTP/2 WINDOW_UPDATE beklemesi dahil) `write` içinde işletim sistemine teslim edilmeli; kalan `total` ile kısaltılır. Okumalar `read` ile sınırlı kalır |
 | `pool` | Havuzdan boş bağlantı bekleme (diğer alanlar gibi ilk argümanı alır; yine de `None` ise `Session` `connect` süresini kullanır, `AsyncSession` sınırsız bekler) |
 | `total` | Bağlantı alma/kurma + yanıt (gövde dahil) için istek başına toplam süre sınırı (varsayılan `None`, sınırsız); `read`'in aksine damla damla veri yollayan sunucuyu da keser. `stream=True` iken yanıt başlıklarına kadar geçerlidir; akış gövdesinin her okuması `read` ile sınırlıdır |
 
@@ -484,10 +485,10 @@ verir veya belgelenmiştir:
   `Http3ConnectError` verir), yanıt gövdesini tamamen okur (`stream=True` ile de), QUIC
   içindeki ClientHello aioquic'indir (tarayıcı parmak izi yok). Yalnızca yerel
   aioquic sunucusuyla test edildi.
-- `Session` thread-safe değildir; thread başına bir tane kullanın.
+- Senkron tarafta bir HTTP/2 bağlantısı aynı anda tek isteği taşır (`Session`
+  thread-safe'tir; eşzamanlı iş parçacıkları origin başına `max_connections`'a kadar
+  ayrı havuz bağlantıları kullanır).
 - **`verify=False` yok** (bilinçli; yukarıya bakın).
-- `Timeout.write` senkron tarafta ayrı uygulanmıyor (soket `read` zaman aşımını
-  kullanır); `AsyncSession` `write`'ı drain süresine uygular.
 - `Timeout.total`, başlıklar geldikten sonra akış (`stream=True`) gövdesinin
   okunmasını sınırlamaz (oradaki her okuma `read` ile sınırlıdır).
 - İç güvenlik incelemesinin açık bulguları (ör. açılmış gövde boyutuna sınır

@@ -91,7 +91,8 @@ with Session(transport=transport) as s:
 | Streaming | `stream=True` / `s.stream(...)`; `iter_bytes`, `iter_text`, `iter_lines`, `iter_raw` and the async `aiter_*` versions, over HTTP/1.1 and HTTP/2 |
 | Auth and hooks | Basic, Digest (RFC 7616), Bearer, `.netrc`, custom auth (requests or httpx style); requests-style `hooks=`, httpx-style `event_hooks=`; plugins on `Session` and `AsyncSession` |
 | Proxies | HTTP CONNECT (+Basic), SOCKS5 (RFC 1929), rotation; `HTTP_PROXY`/`HTTPS_PROXY`/`ALL_PROXY`/`NO_PROXY` with `trust_env=True`; TLS always terminates inside the tunnel |
-| Timeouts / limits / retries | `Timeout` (including a `total` budget), applied per request also on reused keep-alive / HTTP/2 connections; `Limits`, urllib3-style `Retry` with `Retry-After` |
+| Timeouts / limits / retries | `Timeout` (separate `read`/`write`, plus a `total` budget), applied per request also on reused keep-alive / HTTP/2 connections; `Limits`, urllib3-style `Retry` with `Retry-After` |
+| Threads | One `Session` can be shared by many threads: exclusive pooled connections, `max_connections` enforced under contention, per-request settings never leak, deterministic `close()` ([details](https://bu-ra34.github.io/fasthttpc/usage/#using-one-session-from-many-threads)) |
 | Content decoding | gzip, deflate, brotli, zstd (chained encodings too), identical for streaming and non-streaming, sync and async |
 | Cookies, cache, redirects | RFC 6265 cookie jar, response cache, redirect history |
 | DNS | Optional DNS-over-HTTPS resolver; Happy Eyeballs (RFC 8305) for hosts with several addresses |
@@ -205,8 +206,9 @@ privately via GitHub security advisories.
 - `https://` proxies (TLS to the proxy) are not supported; an explicit or
   environment proxy URL with such a scheme raises `ValueError`. Proxy and CA
   environment variables are read once, when the session is created.
-- `Session` is not thread-safe: use one per thread.
-- `Timeout.write` is not enforced separately on the sync side.
+- On the sync side an HTTP/2 connection carries one request at a time (`Session`
+  is thread-safe; concurrent threads use separate pooled connections, up to
+  `max_connections` per origin).
 - `Timeout.total` does not bound reading a streamed body after the headers
   arrived (each read there is bounded by `read`).
 - Only 3 browser families are modelled (no separate Edge profile); profiles are
