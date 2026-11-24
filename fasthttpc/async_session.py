@@ -1281,7 +1281,7 @@ class AsyncSession:
 
             if isinstance(body_raw, (bytes, bytearray)):
                 ce  = resp_headers.get("content-encoding", "").lower()
-                body_final = decode_body(bytes(body_raw), ce)
+                body_final = decode_body(bytes(body_raw), ce, self.limits.max_decompressed_size)
             else:
                 body_final = b""
 
@@ -1291,6 +1291,7 @@ class AsyncSession:
                 resp = Response(status_code=status_code, headers=resp_headers, body=body_final)
             else:
                 resp = Response(status_code=status_code, headers=resp_headers, astream=body_raw)
+                resp._max_decompressed_size = self.limits.max_decompressed_size
             resp.http_version = http_version
             resp.tls_info = (None if u.scheme == "http"
                              else self._tls_infos.get((u.host, u.port, proxy_cfg)))

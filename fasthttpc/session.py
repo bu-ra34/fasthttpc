@@ -510,6 +510,7 @@ class Session:
         if h2_stream is not None:
             resp = Response(status_code=status_code, headers=resp_headers,
                             stream=_H2BodyStream(self, conn, h2_stream, metrics))
+            resp._max_decompressed_size = self.limits.max_decompressed_size
             resp.request = req
             resp.http_version = "HTTP/2"
             if metrics:
@@ -518,7 +519,7 @@ class Session:
             return resp
 
         ce = resp_headers.get("content-encoding", "").lower()
-        body_raw = decode_body(body_raw, ce)
+        body_raw = decode_body(body_raw, ce, self.limits.max_decompressed_size)
 
         resp         = Response(status_code=status_code, headers=resp_headers, body=body_raw)
         resp.request = req
@@ -561,6 +562,8 @@ class Session:
         resp_headers: Headers
         body: bytes
         status_code, resp_headers, body = r
+        body = decode_body(body, resp_headers.get("content-encoding", "").lower(),
+                           self.limits.max_decompressed_size)
         resp = Response(status_code=status_code, headers=resp_headers, body=body)
         resp.request = req
         resp.http_version = "HTTP/3"
@@ -1022,6 +1025,7 @@ class Session:
                     resp = Response(status_code=status_code, headers=resp_headers,
                                     stream=_H1BodyStream(self, conn, gen, reusable, metrics,
                                                          len(headers_raw) + 4))
+                    resp._max_decompressed_size = self.limits.max_decompressed_size
                     resp.request = req
                     if metrics:
                         metrics.transfer_end = time.perf_counter()
@@ -1044,7 +1048,7 @@ class Session:
 
                                                                            
                 ce       = resp_headers.get("content-encoding", "").lower()
-                body_raw = decode_body(body_raw, ce)
+                body_raw = decode_body(body_raw, ce, self.limits.max_decompressed_size)
 
                 resp         = Response(status_code=status_code, headers=resp_headers, body=body_raw)
                 resp.request = req

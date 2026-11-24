@@ -11,7 +11,8 @@ from ..models.headers import Headers
 from ..models.response import Response
 from ..buffer import ZeroCopyReader
 from .._log import get_logger
-from ..streaming import _DECODER_PACKAGES, MissingDecoderError
+from ..streaming import (_DECODER_PACKAGES, DEFAULT_MAX_DECOMPRESSED_SIZE, DecodeError,
+                         DecompressedSizeError, MissingDecoderError, decode_body)
 
 logger = get_logger("http1")
 
@@ -37,13 +38,6 @@ except ImportError:
 def _missing(enc: str) -> MissingDecoderError:
     _mods, package, extra = _DECODER_PACKAGES[enc]
     return MissingDecoderError(enc, package, extra)
-
-# Bozuk sıkıştırılmış veride beklenen hata tipleri (gerisi yukarı yükselir).
-_DECOMPRESS_ERRORS: tuple = (zlib.error, ValueError, EOFError)
-if _BROTLI:
-    _DECOMPRESS_ERRORS += (getattr(_brotli, "error", ValueError),)
-if _ZSTD:
-    _DECOMPRESS_ERRORS += (_zstd.ZstdError,)
 
 
 _HEX_DIGITS = frozenset(b"0123456789abcdefABCDEF")
@@ -128,49 +122,31 @@ class HTTP1Parser:
 
                                                                               
 
+    _DECODER_NAMES = {"gzip": "Gzip", "deflate": "Deflate", "br": "Brotli", "zstd": "Zstd"}
+
     @staticmethod
-    def _decompress(data: bytes, encoding: str) -> bytes:
+    def _decompress(data: bytes, encoding: str,
+                    max_size: "int | None" = DEFAULT_MAX_DECOMPRESSED_SIZE) -> bytes:
+        """Tek kodlamayı (gzip > deflate > br > zstd önceliğiyle) açar; açılamazsa ham
+        gövde döner. Açma artımlıdır ve ``max_size`` aşılınca
+        :class:`~fasthttpc.streaming.DecompressedSizeError` yükselir (FHC-07)."""
         if not data or not encoding:
             return data
-
-        if "gzip" in encoding:
-            try:
-                return zlib.decompress(data, zlib.MAX_WBITS | 16)
-            except zlib.error:
-                return data
-
-        if "deflate" in encoding:
-            try:
-                return zlib.decompress(data)
-            except zlib.error:
-                try:
-                    return zlib.decompress(data, -zlib.MAX_WBITS)
-                except zlib.error:
-                    return data
-
-        if "br" in encoding:
-            if not _BROTLI:
-                raise _missing("br")      # ham (sıkıştırılmış) gövde sessizce dönmez
-            try:
-                return _brotli.decompress(data)
-            except _DECOMPRESS_ERRORS as e:
-                logger.warning("Brotli açılamadı, ham gövde döndürülüyor: %s", e)
-                return data
-
-        if "zstd" in encoding:
-            if not _ZSTD:
-                raise _missing("zstd")
-            try:
-                # decompressobj: çerçeve başlığında içerik boyutu olmayan (akış
-                # sıkıştırıcısıyla üretilmiş) gövdeler de açılır; tek seferlik
-                # ZstdDecompressor().decompress() onları reddediyordu.
-                out: bytes = _zstd.ZstdDecompressor().decompressobj().decompress(data)
-                return out
-            except _DECOMPRESS_ERRORS as e:
-                logger.warning("Zstd açılamadı, ham gövde döndürülüyor: %s", e)
-                return data
-
-        return data
+        enc = next((e for e in ("gzip", "deflate", "br", "zstd") if e in encoding), None)
+        if enc is None:
+            return data
+        if enc == "br" and not _BROTLI:
+            raise _missing("br")      # ham (sıkıştırılmış) gövde sessizce dönmez
+        if enc == "zstd" and not _ZSTD:
+            raise _missing("zstd")
+        try:
+            return decode_body(data, enc, max_size, strict=True)
+        except (DecompressedSizeError, MissingDecoderError):
+            raise
+        except DecodeError as e:
+            logger.warning("%s açılamadı, ham gövde döndürülüyor: %s",
+                           HTTP1Parser._DECODER_NAMES[enc], e)
+            return data
 
                                                                               
 
