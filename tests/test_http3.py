@@ -436,6 +436,13 @@ def test_options_validation():
     assert Http3Options.from_value("force").mode == "force"
     with pytest.raises(ValueError):
         Http3Options.from_value("yes")
+    # aioquic >= 1.9 1 ms altını/sonsuzu QuicConnection kurarken reddeder: her sürümde erken ValueError
+    assert Http3Options.from_value(Http3Options(idle_timeout=0.001)).idle_timeout == 0.001
+    for bad in (0, 0.0005, -1.0, float("inf"), float("nan")):
+        with pytest.raises(ValueError, match="idle_timeout"):
+            Http3Options.from_value(Http3Options(idle_timeout=bad))
+    with pytest.raises(ValueError, match="idle_timeout"):
+        Session(http3=Http3Options(mode="force", idle_timeout=0.0005))
 
 
 def test_core_imports_without_aioquic():
