@@ -1009,24 +1009,30 @@ class AsyncSession:
         return b"".join(parts), state.extra
 
     @staticmethod
-    async def _h1_iter_body(reader: Any, framing: BodyFraming, first: bytes,
-                            read_to: Optional[float], state: "_BodyState", stream: bool = False,
-                            max_size: Optional[int] = DEFAULT_MAX_DECOMPRESSED_SIZE,
-                            ) -> "AsyncGenerator[bytes, None]":
+    def _h1_iter_body(reader: Any, framing: BodyFraming, first: bytes,
+                      read_to: Optional[float], state: "_BodyState", stream: bool = False,
+                      max_size: Optional[int] = DEFAULT_MAX_DECOMPRESSED_SIZE,
+                      ) -> "AsyncGenerator[bytes, None]":
         """:meth:`_h1_iter_framed` + ``chunked`` dışındaki aktarım kodlamalarının
         (``Transfer-Encoding: gzip, chunked``) açılması (Content-Encoding ile aynı
         ``max_size`` sınırı)."""
         raw = AsyncSession._h1_iter_framed(reader, framing, first, read_to, state, stream)
         if not framing.codings:
+            return raw
+        return AsyncSession._h1_transfer_decode(raw, framing.codings, max_size)
+
+    @staticmethod
+    async def _h1_transfer_decode(raw: "AsyncGenerator[bytes, None]", codings: "tuple[str, ...]",
+                                  max_size: Optional[int]) -> "AsyncGenerator[bytes, None]":
+        dec = IncrementalDecoder(", ".join(codings), max_size, strict=True)
+        try:
             async for c in raw:
-                yield c
-            return
-        dec = IncrementalDecoder(", ".join(framing.codings), max_size, strict=True)
-        async for c in raw:
-            for out in dec.decode_iter(c):
+                for out in dec.decode_iter(c):
+                    yield out
+            for out in dec.flush_iter():
                 yield out
-        for out in dec.flush_iter():
-            yield out
+        finally:
+            await raw.aclose()
 
     @staticmethod
     async def _h1_iter_framed(reader: Any, framing: BodyFraming, first: bytes,

@@ -682,13 +682,18 @@ class Session:
             framing = response_framing("GET", 200, headers)
         raw = self._iter_framed(conn, first_body_chunk, framing)
         if not framing.codings:
-            yield from raw
-            return
-        dec = IncrementalDecoder(", ".join(framing.codings), self.limits.max_decompressed_size,
+            return raw
+        return self._transfer_decode(raw, framing.codings)
+
+    def _transfer_decode(self, raw: _BodyGen, codings: "tuple[str, ...]") -> _BodyGen:
+        dec = IncrementalDecoder(", ".join(codings), self.limits.max_decompressed_size,
                                  strict=True)
-        for c in raw:
-            yield from dec.decode_iter(c)
-        yield from dec.flush_iter()
+        try:
+            for c in raw:
+                yield from dec.decode_iter(c)
+            yield from dec.flush_iter()
+        finally:
+            raw.close()
 
     def _iter_framed(self, conn: "HTTPConnection", first_body_chunk: bytes,
                      framing: BodyFraming) -> _BodyGen:
