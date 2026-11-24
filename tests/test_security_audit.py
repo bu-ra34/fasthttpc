@@ -205,11 +205,49 @@ def test_cookie_domain_dot_tld_is_rejected():
     assert jar.header_for("www.attacker.com", "/", True) == ""
 
 
-def test_cookie_domain_on_ip_host_is_host_only():
+@pytest.mark.parametrize("host,domain,other", [
+    ("10.0.0.1", "0.0.1", "9.0.0.1"),
+    ("10.0.0.1", "10.0.0.2", "10.0.0.2"),
+    ("10.0.0.1", "example.com", "example.com"),
+    ("::1", "::1", "::2"),          # IPv6 öznitelik köşeli parantezsiz: tarayıcılar da reddeder
+    ("::1", "[::2]", "::2"),
+])
+def test_cookie_domain_on_ip_host_is_rejected(host, domain, other):
+    # FHC-03'te host-only kalıyordu; Chromium/Firefox gibi artık tümden yok sayılır
+    # (bkz. fasthttpc/cookies.py _domain_attr_verdict).
     jar = CookieJar()
-    jar.update_from_headers(["sid=x; Domain=0.0.1"], "10.0.0.1", "/")
-    assert jar.header_for("9.0.0.1", "/", True) == ""
-    assert jar.header_for("10.0.0.1", "/", True) == "sid=x"
+    jar.update_from_headers([f"sid=x; Domain={domain}"], host, "/")
+    assert len(jar) == 0
+    assert jar.header_for(other, "/", True) == ""
+    assert jar.header_for(host, "/", True) == ""
+
+
+@pytest.mark.parametrize("host,domain,other", [
+    ("10.0.0.1", "10.0.0.1", "9.0.0.1"),
+    ("10.0.0.1", ".10.0.0.1", "10.0.0.10"),
+    ("::1", "[::1]", "::2"),
+    ("[::1]", "[::1]", "[::2]"),
+])
+def test_cookie_domain_equal_to_ip_host_is_host_only(host, domain, other):
+    jar = CookieJar()
+    jar.update_from_headers([f"sid=x; Domain={domain}"], host, "/")
+    assert jar.header_for(host, "/", True) == "sid=x"
+    assert jar.header_for(other, "/", True) == ""
+
+
+@pytest.mark.parametrize("host,domain", [
+    ("evil.com", "bank.com"),
+    ("example.com", "a.example.com"),           # öznitelik host'un alt alanı
+    ("notexample.com", "example.com"),          # sonek ama etiket sınırında değil
+    ("a.example.com", "b.example.com"),
+])
+def test_cookie_domain_not_matching_host_is_rejected(host, domain):
+    """RFC 6265 §5.3 adım 6: host özniteliği domain-match etmiyorsa çerez yok sayılır."""
+    jar = CookieJar()
+    jar.update_from_headers([f"sid=evil; Domain={domain}"], host, "/")
+    assert len(jar) == 0
+    assert jar.header_for(domain, "/", True) == ""
+    assert jar.header_for(host, "/", True) == ""
 
 
 def test_cookie_registrable_domain_still_shared():

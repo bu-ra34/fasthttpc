@@ -19,8 +19,17 @@
 ### Davranış değişikliği
 - Genel sonek olan `Domain=` taşıyan çerez (tek etiketli `com`, `local` dahil)
   artık host-only olarak saklanmıyor, hiç saklanmıyor (FHC-03'te host-only
-  kalıyordu; tarayıcılar da reddeder). IP host'larda `Domain=` yine yok
-  sayılıyor, çerez host-only kalıyor.
+  kalıyordu; tarayıcılar da reddeder).
+- İstek host'unun domain-match etmediği `Domain=` (`evil.com`'dan
+  `Domain=bank.com`, `example.com`'dan `Domain=a.example.com`) taşıyan çerez de
+  artık host-only kalmıyor, tümden yok sayılıyor (RFC 6265 §5.3 adım 6;
+  Chromium ve Firefox da reddeder).
+- IP host'ta `Domain=` IP'nin kendisiyse (IPv6'da URL'deki gibi köşeli
+  parantezli: `[::1]`) çerez host-only; başka her değerde çerez yok sayılıyor
+  (eskiden host-only kalıyordu). Davranış Chromium
+  (`net/cookies/cookie_util.cc`, `GetCookieDomainWithString`) ve Firefox
+  (`netwerk/cookie/CookieValidation.cpp`, `CookieValidation::CheckDomain`)
+  kaynağından doğrulandı.
 - Birden çok `Domain=` özniteliği varsa sonuncusu geçerli (RFC 6265 §5.3 adım 4).
 - Host-only çerezin alan adı kanonik biçimde saklanıyor (küçük harf, sondaki
   nokta yok, IDN için A-label); `CookieJar.header_for()` Unicode host da kabul
@@ -54,7 +63,9 @@
   joker/istisna ve IDN (`рф`, `公司.cn`) senaryoları; host'un kendisi genel
   sonekse host-only çerez; `Session` ve `AsyncSession` ile yönlendirme ara
   yanıtında konan çerezin kardeş sitelere gitmediği. FHC-03 testleri yeni
-  davranışa göre: `Domain=com` çerezi artık tümden yok sayılıyor.
+  davranışa göre sıkılaştırıldı: `Domain=com`, IP host'ta IP'den farklı
+  `Domain=` ve host'un domain-match etmediği `Domain=` taşıyan çerez artık
+  tümden yok sayılıyor; IP'ye eşit `Domain=` host-only çerez veriyor.
 
 ### Dokümantasyon
 - `docs/security-audit.md`: FHC-08 kapatıldı, FHC-03'e not eklendi.

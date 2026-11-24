@@ -62,13 +62,20 @@ def _is_ip(host: str) -> bool:
         return False
 
 
-def _domain_attr_allowed(host: str, declared: str) -> bool:
-    """``Domain=`` özniteliği çerezi alan-geneli (host-only olmayan) yapabilir mi?
+def _ip_literal(host: str) -> str:
+    """IP host'un tarayıcıların ``Domain=`` ile karşılaştırdığı biçimi: IPv6
+    köşeli parantezli (URL host'u gibi ``[::1]``), IPv4 olduğu gibi."""
+    bare = host.strip("[]")
+    return f"[{bare}]" if ":" in bare else bare
 
-    RFC 6265 §5.3 adım 6: öznitelik istek host'unu domain-match etmeli; IP adresi
-    olan host'ta alan-geneli çerez olmaz (``Domain=0.1`` '10.0.0.1'den '9.0.0.1'e
-    sızardı). Genel sonek (``com``, ``co.uk``, ``github.io``) burada değil,
-    ``_domain_attr_verdict``'te (adım 5) elenir. ``host`` ve ``declared`` kanoniktir.
+
+def _domain_attr_allowed(host: str, declared: str) -> bool:
+    """İstek host'u ``Domain=`` değerini domain-match ediyor mu (RFC 6265 §5.1.3)?
+
+    Host ya değerin kendisi ya da onun alt alan adıdır: ``a.example.com`` <-
+    ``example.com`` evet, ``evil.com`` <- ``bank.com`` hayır. IP host'ta hiçbir
+    değer alan-geneli çerez vermez (``Domain=0.0.1`` '10.0.0.1'den '9.0.0.1'e
+    sızardı). ``host`` ve ``declared`` kanoniktir.
     """
     if not declared or _is_ip(host):
         return False
@@ -79,17 +86,30 @@ def _domain_attr_verdict(host: str, declared: str) -> Optional[bool]:
     """``Domain=`` özniteliğinin sonucu: ``True`` alan-geneli çerez, ``False``
     host-only çerez, ``None`` çerez tümden yok sayılır.
 
-    RFC 6265 §5.3 adım 5: öznitelik bir genel sonekse (Public Suffix List; tek
-    etiketli her değer de varsayılan ``*`` kuralıyla genel sonektir) ve istek
-    host'una eşitse çerez host-only olur, değilse yok sayılır — aksi halde
-    ``evil.co.uk``'nin ``Domain=co.uk`` çerezi tüm ``.co.uk`` sitelerine giderdi.
-    IP host'ta öznitelik yok sayılır (host-only; FHC-03).
+    * IP host: öznitelik IP'nin kendisiyse host-only, başka her değerde çerez yok
+      sayılır. Tarayıcılar böyle yapar (2026-11-24'te kaynaktan bakıldı):
+      Chromium ``net/cookies/cookie_util.cc`` ``GetCookieDomainWithString()``
+      ("IP address that don't have an empty or matching domain attribute are
+      invalid"; eşitse host cookie) ve Firefox
+      ``netwerk/cookie/CookieValidation.cpp`` ``CookieValidation::CheckDomain()``
+      (IP / eTLD host'ta ``aRequireHostMatch``: tam eşitlik, yoksa
+      ``eRejectedInvalidDomain``; mozilla-central 8390f786553b). Karşılaştırma
+      URL host biçimiyledir (IPv6 köşeli parantezli).
+    * RFC 6265 §5.3 adım 5: öznitelik bir genel sonekse (Public Suffix List; tek
+      etiketli her değer de varsayılan ``*`` kuralıyla genel sonektir) ve istek
+      host'una eşitse çerez host-only olur, değilse yok sayılır — aksi halde
+      ``evil.co.uk``'nin ``Domain=co.uk`` çerezi tüm ``.co.uk`` sitelerine giderdi.
+    * RFC 6265 §5.3 adım 6: host özniteliği domain-match etmiyorsa
+      (``evil.com``'dan ``Domain=bank.com``) çerez yok sayılır; Chromium ve
+      Firefox da reddeder.
     """
-    if not declared or _is_ip(host):
-        return False
+    if not declared:
+        return False            # boş öznitelik yok sayılır (§5.2.3): host-only
+    if _is_ip(host):
+        return False if declared == _ip_literal(host) else None
     if is_public_suffix(declared):
         return False if declared == host else None
-    return _domain_attr_allowed(host, declared)
+    return True if _domain_attr_allowed(host, declared) else None
 
 
 def _path_matches(request_path: str, cookie_path: str) -> bool:

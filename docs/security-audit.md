@@ -94,8 +94,8 @@ control characters. Violations raise `ValueError` and nothing is sent.
 
 ### FHC-03 — Cookie `Domain=` scoped to a TLD or IP suffix (Medium, Fixed)
 
-**Location:** `fasthttpc/cookies.py:65` (`_domain_attr_allowed`), used through
-`_domain_attr_verdict` (line 78) by `parse_set_cookie` at line 167.
+**Location:** `fasthttpc/cookies.py:72` (`_domain_attr_allowed`), used through
+`_domain_attr_verdict` (line 85) by `parse_set_cookie` at line 187.
 
 **Description.** The `Domain` attribute was accepted whenever the request host
 ended with it. A response from `attacker.com` with `Set-Cookie: sid=x; Domain=com`
@@ -112,12 +112,22 @@ other site under the same TLD.
 **Fix.** On an IP host the `Domain` attribute is ignored (host-only cookie).
 Single-label values (`com`, `.com`, `local`) are not accepted as a cookie
 domain; the cookie stays host-only. Normal registrable domains
-(`Domain=example.com` from `a.example.com`) work as before. *Update (FHC-08,
-after 0.7.0):* multi-label public suffixes are now rejected as well, and a
-cookie whose `Domain` is any public suffix (including a single label such as
-`com`) is now ignored entirely instead of being kept host-only, unless the
-attribute equals the request host (RFC 6265 section 5.3 step 5). IP hosts still
-get a host-only cookie.
+(`Domain=example.com` from `a.example.com`) work as before.
+
+*Update (with FHC-08, after 0.7.0):* an invalid `Domain` no longer falls back to
+a host-only cookie; the cookie is ignored entirely, as in browsers:
+
+* a public suffix, multi-label ones included (`com`, `co.uk`), unless it equals
+  the request host, which gives a host-only cookie (RFC 6265 section 5.3
+  step 5, see FHC-08);
+* a value the request host does not domain-match, such as `Domain=bank.com`
+  from `evil.com` (step 6);
+* on an IP host, any value other than the IP itself (IPv6 in brackets, as in
+  the URL). `Domain=0.0.1` from `10.0.0.1` used to give a host-only cookie and
+  is now ignored; `Domain=10.0.0.1` gives a host-only cookie. This follows
+  Chromium (`net/cookies/cookie_util.cc`, `GetCookieDomainWithString`) and
+  Firefox (`netwerk/cookie/CookieValidation.cpp`,
+  `CookieValidation::CheckDomain`), checked in their sources on 2026-11-24.
 
 ### FHC-04 — Lenient chunked-encoding parsing (Low, Fixed)
 
@@ -180,8 +190,8 @@ and use incremental decompressors with `max_length` in the buffered path too.
 
 ### FHC-08 — No Public Suffix List (Low, Fixed)
 
-**Location:** `fasthttpc/cookies.py:78` (`_domain_attr_verdict`), used by
-`parse_set_cookie` at line 167; the list lookup is `fasthttpc/_psl.py`.
+**Location:** `fasthttpc/cookies.py:85` (`_domain_attr_verdict`), used by
+`parse_set_cookie` at line 187; the list lookup is `fasthttpc/_psl.py`.
 
 **Description.** After FHC-03, only single-label `Domain` values were refused.
 `Domain=co.uk` from `example.co.uk`, or `Domain=github.io` from `x.github.io`,

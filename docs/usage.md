@@ -88,8 +88,11 @@ with Session(resolver=DoHResolver(provider="cloudflare")) as s:
 
 ## Cookies and caching
 
-Cookies follow RFC 6265 (domain, path, `Secure`). `Domain=` is ignored for IP
-hosts (the cookie stays host-only). Like browsers, fasthttpc checks `Domain=`
+Cookies follow RFC 6265 (domain, path, `Secure`). As in browsers, a cookie is
+ignored when its `Domain=` is not the request host or one of its parent domains
+(`evil.com` sending `Domain=bank.com`). On an IP host, `Domain=` must be the IP
+itself (IPv6 in brackets, `[::1]`), which gives a host-only cookie; any other
+value makes the cookie be ignored. Like browsers, fasthttpc also checks `Domain=`
 against the [Public Suffix List](https://publicsuffix.org/): a cookie whose
 `Domain` is a public suffix (`com`, `co.uk`, `github.io`, `herokuapp.com`,
 `рф`, ...) is ignored, so `evil.co.uk` cannot set a cookie that would be sent
