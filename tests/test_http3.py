@@ -312,16 +312,32 @@ def test_server_goaway_with_invalid_id_closes_connection(pki, h3, goaway_id):
         assert s.get(url(h3)).http_version == "HTTP/3"      # yeni bağlantı kuruldu
 
 
+def _wait_for(cond, timeout=5.0):
+    """Başka bir iş parçacığının sürdüğü bağlantıyı (kilidine dokunmadan) gözle."""
+    deadline = time.monotonic() + timeout
+    while not cond():
+        assert time.monotonic() < deadline, "koşul gerçekleşmedi (zaman aşımı)"
+        time.sleep(0.01)
+
+
 def test_server_goaway_id_must_not_increase(pki, h3):
+    """RFC 9114 §5.2: sonraki GOAWAY kimliği ARTIRAMAZ (8 -> 12: H3_ID_ERROR). İki GOAWAY de aynı
+    bağlantıda, istek hâlâ sürerken gelir: istemci ilk GOAWAY'den sonra yeni istek BAŞLATMAZ (aioquic
+    >= 1.9 buna zaten izin vermez; tüm desteklenen sürümlerde aynı senaryo)."""
+    from concurrent.futures import ThreadPoolExecutor
     from fasthttpc.http3.core import Http3Error
-    with Session(http3="force", verify=pki["ca"]) as s:
-        s.get(url(h3, "/goaway=8"))
-        conn = next(iter(s._h3._conns.values()))
-        _wait_core(conn, lambda: conn.core.goaway_id is not None)
+    path = "/goaway-hold=8"
+    with Session(http3="force", verify=pki["ca"]) as s, ThreadPoolExecutor(1) as ex:
+        fut = ex.submit(s.get, url(h3, path), timeout=10)  # akış 0: GOAWAY(8), yanıt bekletilir
+        conns = s._h3._conns
+        _wait_for(lambda: any(c.core is not None and c.core.goaway_id is not None
+                              for c in list(conns.values())))
+        conn = next(iter(conns.values()))
         assert conn.core.goaway_id == 8 and not conn.core.closed
-        conn.core.goaway_id = None              # yeniden kullanılabilir say: ikinci GOAWAY gelsin
+        assert not fut.done()                   # akış 0 < 8: istek reddedilmedi, sürüyor
+        h3.send_goaway(path, 12)                # aynı bağlantıda ikinci GOAWAY
         with pytest.raises(Http3Error, match="kod=0x108"):     # 8 -> 12: artış, H3_ID_ERROR
-            s.get(url(h3, "/goaway=12"))
+            fut.result(10)
         assert conn.core.closed and next(iter(s._h3._conns.values())) is conn
 
 
