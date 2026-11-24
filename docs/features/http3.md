@@ -1,9 +1,12 @@
 # HTTP/3
 
 !!! warning "Experimental, off by default"
-    HTTP/3 support is experimental. It has been tested against a local aioquic
-    server only; the [live tests](../testing.md#live-http3-tests) against public
-    servers are opt-in and do not run in CI.
+    HTTP/3 support is experimental. The offline test suite exercises it against a
+    local aioquic server. The [live tests](../testing.md#live-http3-tests) run it
+    against Cloudflare (`cloudflare-quic.com`), nginx (`quic.nginx.org`) and
+    Google (`www.google.com`) in the separate "Live tests" GitHub Actions
+    workflow, weekly and on demand, on GitHub-hosted Ubuntu, macOS and Windows
+    runners. That workflow is not part of push/PR CI.
 
 ```bash
 pip install "fasthttpc[http3]"     # installs aioquic>=1.3
