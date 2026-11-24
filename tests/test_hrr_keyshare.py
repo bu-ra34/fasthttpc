@@ -216,10 +216,14 @@ def test_hrr_for_already_offered_group_rejected(trust_leaf):
     srv.close()
 
 
-def test_hrr_for_unimplemented_group_clear_error(trust_leaf):
-    # firefox_133 secp521r1'i ilan eder ama implemente etmiyoruz
-    srv = FakeTLS13Server(hrr_group=0x0019)
-    with pytest.raises(ConnectionError, match="implemente edilmedi"):
+def test_hrr_for_unimplemented_group_clear_error(trust_leaf, monkeypatch):
+    # secp521r1/x448/ffdhe2048/3072 artık uygulanıyor (bkz. test_kex_groups.py). İlan edilen
+    # ama uygulanmayan bir grup (ffdhe4096) HRR ile istenirse yine açık hata verilmeli.
+    prof = dict(PROFILES["firefox_133"])
+    prof["supported_groups"] = list(prof["supported_groups"]) + [0x0102]
+    monkeypatch.setitem(PROFILES, "firefox_133", prof)
+    srv = FakeTLS13Server(hrr_group=0x0102)
+    with pytest.raises(ConnectionError, match="ffdhe4096.*implemente edilmedi"):
         _connect(srv, "firefox_133")
     srv.close()
 
