@@ -31,6 +31,12 @@ from aioquic.quic import events as qevents
 from aioquic.quic.configuration import QuicConfiguration
 from aioquic.quic.connection import QuicConnection
 
+try:    # aioquic >= 1.9: send_headers refuses to start a request after a GOAWAY (RFC 9114 section 5.2)
+    from aioquic.h3.exceptions import InvalidConnectionStateError
+except ImportError:     # pragma: no cover - aioquic < 1.9 never refuses; nothing raises this placeholder
+    class InvalidConnectionStateError(Exception):     # type: ignore[no-redef]
+        pass
+
 from ..security.cert_validator import CertificateValidationError
 from . import fingerprint as fp
 from .verify import validate_peer_chain
@@ -168,6 +174,8 @@ class H3Core:
         self.closed = False
         self.error: "Optional[BaseException]" = None
         self.goaway_id: "Optional[int]" = None
+        # aioquic yeni istek başlatmayı reddetti (GOAWAY alındı / bağlantı kapanıyor): yeniden kullanılmaz.
+        self.draining = False
         self.last_activity = clock()
         self.on_state_change: "Optional[Callable[[], None]]" = None
         self._addr: "Optional[tuple]" = None
@@ -179,7 +187,7 @@ class H3Core:
 
     @property
     def usable(self) -> bool:
-        return self.handshake_done and not self.closed and self.goaway_id is None
+        return self.handshake_done and not self.closed and self.goaway_id is None and not self.draining
 
     def receive(self, data: bytes, addr: tuple) -> None:
         self.last_activity = self.clock()
@@ -305,8 +313,15 @@ class H3Core:
         for k, v in headers:
             hdrs.append((k.lower().encode("latin-1"), v.encode("latin-1")))
         st = _Stream(sid)
+        try:
+            self.h3.send_headers(sid, hdrs, end_stream=not body)
+        except InvalidConnectionStateError as e:
+            # aioquic >= 1.9: GOAWAY alınmış (fasthttpc henüz işlememiş olabilir: yarış) ya da
+            # bağlantı kapanıyor. İstek akışına hiçbir şey yazılmadan reddedilir, istek HİÇ
+            # gönderilmedi: yeni bağlantıda yeniden denemek güvenli (aioquic'in istisnası sızmaz).
+            self.draining = True
+            raise Http3RequestRefused(f"aioquic isteği başlatmadı: {e}") from e
         self.streams[sid] = st
-        self.h3.send_headers(sid, hdrs, end_stream=not body)
         if body:
             self.h3.send_data(sid, body, end_stream=True)
         self.last_activity = self.clock()
