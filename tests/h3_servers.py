@@ -61,6 +61,7 @@ def make_leaf(tmp_path, ca_key, ca_cert, names=("localhost",), tag="leaf"):
 
 
 _REFUSED: "set[str]" = set()     # /refuse-once yolları: yalnız İLK istek GOAWAY ile reddedilir
+_HELD: "dict[str, _H3Server]" = {}  # /goaway-hold yolları: yanıtı bekletilen isteğin bağlantısı
 
 
 class _H3Server(QuicConnectionProtocol):
@@ -97,6 +98,13 @@ class _H3Server(QuicConnectionProtocol):
             # Zarif kapanış: bu isteği İŞLEMEDEN GOAWAY(sid) gönder (yanıt yok).
             _REFUSED.add(path)
             self._send_goaway(sid)
+            self.transmit()
+            return
+        if path.startswith("/goaway-hold="):
+            # GOAWAY(id) gönder, yanıtı VERME: istek, test H3TestServer.send_goaway ile aynı
+            # bağlantıda bir GOAWAY daha gönderene kadar sürer (istemci yeni istek başlatmadan).
+            _HELD[path] = self
+            self._send_goaway(int(path.split("=")[1]))
             self.transmit()
             return
         if path.startswith("/goaway"):
@@ -195,6 +203,19 @@ class H3TestServer:
         except BaseException as e:      # noqa: BLE001 - start() yeniden fırlatır
             self._exc = e
             self._ready.set()
+
+    def send_goaway(self, path, goaway_id):
+        """``/goaway-hold`` isteği ``path``'i bekleten bağlantıda bir GOAWAY(goaway_id) daha gönder
+        (test iş parçacığından; çerçeve sunucunun olay döngüsünde yazılır)."""
+        proto = _HELD.pop(path)
+        sent = threading.Event()
+
+        def go():
+            proto._send_goaway(goaway_id)
+            proto.transmit()
+            sent.set()
+        self._loop.call_soon_threadsafe(go)
+        assert sent.wait(5), "GOAWAY gönderilemedi (zaman aşımı)"
 
     def _start_tcp(self):
         outer = self

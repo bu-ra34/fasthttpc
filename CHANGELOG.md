@@ -72,6 +72,26 @@
   `docs/usage.md` çerez bölümü, README ve README.tr (lisans, sınırlar,
   geliştirme) güncellendi.
 
+### Düzeltmeler
+- **aioquic 1.9 uyumluluğu:** aioquic 1.9, GOAWAY alındıktan ya da bağlantı
+  kapanmaya başladıktan sonra yeni istek başlatmayı reddediyor (RFC 9114
+  §5.2, `InvalidConnectionStateError`). İstek hiç gönderilmediği için bu artık
+  `Http3RequestRefused` olur: bağlantı yeniden kullanılmaz, istek bir kez yeni
+  bağlantıda tekrarlanır (sync ve async). aioquic'in istisnası kullanıcıya
+  sızmaz. Desteklenen sürümler: aioquic 1.3–1.9.
+- **`Http3Options.idle_timeout` doğrulaması:** aioquic 1.9, 1 ms altı ya da
+  sonsuz değerle QuicConnection kurmayı reddettiği için hata ilk HTTP/3
+  isteğinde aioquic'in `ConnectionConfigurationError`'ı olarak çıkıyordu.
+  0,001 sn'nin altındaki, negatif, sonsuz ya da NaN değer artık her aioquic
+  sürümünde oturum kurulurken `ValueError` verir.
+
+### Testler / CI
+- Artan GOAWAY kimliği testi (8 → 12, H3_ID_ERROR) aioquic 1.9'da yeni istek
+  başlatılamadığı için düşüyordu. İkinci GOAWAY artık aynı bağlantıda, istek
+  sürerken gönderiliyor (yerel sunucuda `/goaway-hold` yolu); test aioquic 1.3,
+  1.8 ve 1.9.2'de aynı senaryoyu sınar.
+
+
 ## [0.7.0] — 2026-11-16
 
 Güncel tarayıcı profilleri (Chrome 158, Firefox 160, Safari 27), düz HTTP ve
