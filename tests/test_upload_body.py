@@ -20,7 +20,7 @@ import pytest
 
 from fasthttpc import AsyncSession, DigestAuth, MockTransport, Request, Response, Retry, Session
 from fasthttpc import Timeout
-from fasthttpc._body import UnrewindableBodyError
+from fasthttpc import UnrewindableBodyError
 from thread_servers import StallServer
 from upload_servers import Got, make_server
 

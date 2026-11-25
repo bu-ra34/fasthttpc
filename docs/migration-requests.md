@@ -18,7 +18,8 @@
 | `cert=("c.pem", "k.pem")` | `Session(cert=...)` (session-level only); see [client certificates](features/client-certs.md) |
 | `verify=False` | **not supported**; trust the CA/cert via `verify="path.pem"` |
 | `HTTPAdapter(max_retries=Retry(...))` | `Session(retries=Retry(...))` |
-| `files={"f": open(...)}` | works, but the file name is not taken from the file object; use `files={"f": ("name", file_or_bytes, "mime")}` |
+| `files={"f": open(...)}` | same; the file name is taken from the file object's `name` (field name if it has none); `(name, content, mime, headers)` tuples and a list of pairs also work |
+| `data=open(...)`, `data=generator` | same: streamed, `Content-Length` from the file size, chunked for generators; see [request bodies](usage.md#request-bodies-data-json-files) |
 
 Differences to know: `verify`, `cert` and `proxies` are session-level, not per
 request; `Session()` impersonates Chrome by default
@@ -26,6 +27,14 @@ request; `Session()` impersonates Chrome by default
 common with requests ([guarantees](usage.md#using-one-session-from-many-threads)).
 After `close()` the session stays closed: further requests raise `RuntimeError`
 (requests reopens its pools).
+
+Request bodies: as in requests, a `list`/`tuple` passed as `data=` is form data
+made of `(key, value)` pairs. Any other item, such as a `bytes` chunk, raises
+`TypeError` (requests silently produces a broken form body). Use `iter(chunks)`
+to stream a list of chunks. A generator body is not re-sent on a 307/308
+redirect or a retry: fasthttpc raises `UnrewindableBodyError` or does not retry,
+while requests resends an empty body. A file body is rewound and sent again. A
+type fasthttpc does not know raises `TypeError` and is never sent as an empty body.
 
 Proxies and redirects: an explicit `proxies=` dict replaces the environment
 completely (requests fills missing schemes from `HTTP_PROXY`/`HTTPS_PROXY`;

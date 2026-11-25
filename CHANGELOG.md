@@ -28,11 +28,50 @@
   `read` süresini kullanıyordu.
 
 ### Eklenenler
+- `fasthttpc.UnrewindableBodyError`; `Request.stream`, `Request.read()` /
+  `await Request.aread()` (akış gövdesini belleğe alır).
+- HTTP/3'te akış gövdesi istekten önce belleğe alınır (aioquic veriyi zaten
+  tamponlar; h3 denemesi h2/h1'e düşebilir ya da yeniden denenebilir).
 - `Session.pool_stats()` girdilerinde `in_use` (kirada bağlantı sayısı).
 - `fasthttpc.transport.iotimeout`: `IOTimeouts` ve `send_all` (istek başına
   okuma/yazma/toplam süre).
 
 ### Düzeltmeler
+- **Veri kaybı — `data=` ile verilen gövde sessizce BOŞ gönderiliyordu:**
+  `Session`/`AsyncSession` tanımadığı her `data=` türünü (`io.BytesIO`, açık dosya,
+  üreteç, `memoryview` ...) hata vermeden boş gövde olarak gönderiyordu; bayt listesi
+  (`[b"ab", b"cd"]`) urlencode içinde anlaşılmaz bir `TypeError` veriyordu. Artık:
+  dosya benzeri nesneler mevcut konumdan itibaren belleğe alınmadan akıtılır (boyut
+  biliniyorsa `Content-Length`, bilinmiyorsa HTTP/1.1'de `Transfer-Encoding:
+  chunked`; HTTP/2'de akış kontrolüne ve `max_frame_size`'a uyan DATA frame'leri,
+  `END_STREAM` son frame'de); bayt/str üreten iterable/üreteçler (AsyncSession'da
+  async iterable da) chunked akıtılır, boş parçalar atlanır; `bytes`/`bytearray`/
+  `memoryview` olduğu gibi gider; metin kipindeki dosya ve `str` parçalar UTF-8
+  kodlanır. `dict` ve `(anahtar, değer)` çiftlerinden oluşan `list`/`tuple` form
+  verisi kalır (requests gibi); çift olmayan öğe (bayt listesi) ve tanınmayan her
+  tür açık bir `TypeError` verir. Her parça gönderimi `Timeout.write` (kalan
+  `total` ile kısaltılmış) ile sınırlıdır.
+- **Akış gövdesi yeniden gönderimde boş/yarım gitmiyor:** 307/308 yönlendirmesi,
+  Digest 401 challenge'ı, yeniden deneme (`Retry`, `RetryPlugin`) ve bayat
+  bağlantı / HTTP/2 `GOAWAY` yeniden denemesinde seek edilebilir dosya başlangıç
+  konumuna sarılır; tükenmiş üreteç 307/308 ve Digest'te `UnrewindableBodyError`
+  verir, yeniden denemede ise denenmez (asıl hata ya da yanıt döner). Başa
+  sarılamayan akış, sunucunun kapattığı boştaki HTTP/1.1 bağlantısında harcanmaz.
+  Bildirilen uzunlukla (`Content-Length`) uyuşmayan akış `ValueError` ile kesilir.
+- `files=`: metin kipindeki dosya `TypeError` veriyordu (UTF-8 kodlanır); çıplak
+  dosya nesnesi dosya adısız (sunucuda düz form alanı) gidiyordu, artık `name`'in
+  son bileşeni (yoksa alan adı) dosya adıdır (requests gibi); `files=` ile verilen
+  `(anahtar, değer)` listesi biçimindeki `data=` sessizce düşüyordu, dict/çift
+  listesi dışı `data=` artık `TypeError`. `(ad, içerik, mime, başlıklar)` dörtlüsü,
+  `str`/`bytearray`/`memoryview` içerik ve `[(alan, değer), ...]` biçimi destekleniyor.
+- `Request(data=...)` aynı kodlama kurallarını kullanıyor (tanınmayan tür artık boş
+  gövde değil `TypeError`); `MockTransport` akış gövdesini handler'dan önce belleğe
+  alır (`request.content`, httpx gibi).
+- `DigestAuth` `qop=auth-int`: akış gövdesinin özeti boş gövde üzerinden
+  hesaplanmıyor (gövde belleğe alınıp özetlenir).
+- `AsyncSession` HTTP/1.1: hata ile kesilen istekte (ör. `Timeout.write`) bağlantı
+  gönderilmemiş verinin boşalması beklenmeden koparılıyor; okumayan sunucuda
+  kapanış takılıyordu.
 - Havuz: `release()` idempotent; aynı bağlantının ikinci iadesi semaphore'u bir
   daha artırıp `max_connections` sınırını sessizce aşabiliyordu. Bağlantı
   kurulamazsa slot `KeyboardInterrupt`'ta da iade edilir; `acquire(block=False)`
@@ -50,6 +89,14 @@
   uygulandıktan sonra gönderiliyor.
 
 ### Testler
+- `tests/test_upload_body.py` (+ `tests/upload_servers.py`): HTTP/1.1 düz/TLS ve
+  HTTP/2, senkron ve async: BytesIO, gerçek dosya, sıfırdan farklı konum, metin
+  kipi, üreteç, boş parçalı üreteç, async üreteç, bayt benzerleri, 8 MiB akış
+  (bellek tepe sınırı), 307/308 (dosya yeniden / üreteç hata), 303, yeniden deneme
+  (durum ve ağ hatası), Digest, kullanıcı `Content-Length`'i, desteklenmeyen tür,
+  bayt listesi, multipart, bayat keep-alive bağlantı, `Timeout.write`; sunucu
+  alınan gövdeyi ve çerçeveyi (`Content-Length`/chunked, DATA frame'leri,
+  END_STREAM) birebir doğrular. `test_http3.py`: HTTP/3'te akış gövdesi.
 - `tests/test_thread_safety.py`: 16 iş parçacığı × 20 istek (TLS HTTP/1.1, HTTP/2,
   düz HTTP); her yanıt kendi eşsiz yolu/gövdesiyle doğrulanır, eşzamanlı çerezlerin
   hepsi kavanozda, havuz sınırı istemci ve sunucu tarafında aşılmıyor, HTTP/2'de
@@ -62,6 +109,8 @@
 - `tests/thread_servers.py`: iş parçacıklı HTTP/2 (`h2`) ve "okumayan" sunucu.
 
 ### Dokümantasyon
+- `usage.md`: "Request bodies" (kabul edilen `data=` türleri, akış, yeniden
+  gönderim kuralları, `files=`); `migration-requests.md`, `migration-httpx.md`.
 - `usage.md`: "Using one `Session` from many threads" (garantiler, kilit tasarımı,
   `close()` anlamı); `timeouts-limits-retries.md`: senkron `write`; `limits.md`,
   `migration-requests.md`, README'ler güncellendi.
