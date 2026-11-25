@@ -713,3 +713,199 @@ def test_buffered_parser_cerceveleme():
     r = HTTP1Parser.parse(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: deflate\r\n\r\n"
                           + _zlib.compress(b"deflate-te"))
     assert r.content == b"deflate-te"
+
+
+# ---------------------------------------------------------------------------
+# F18 — CompressedCertificate (RFC 8879) açma sınırı: doğrulamadan ÖNCE bomba yok
+# ---------------------------------------------------------------------------
+from fasthttpc.security import cert_validator as _cv     # noqa: E402
+from fasthttpc.security.cert_validator import (         # noqa: E402
+    MAX_UNCOMPRESSED_CERTIFICATE, CertificateDecompressionError, decompress_certificate_message,
+)
+from fasthttpc.tls13 import TLSClientConnection         # noqa: E402
+
+from async_fakes import start_tls13                     # noqa: E402
+from tls_fakes import FakeSocket, FakeTLSServer, split_records, unseal  # noqa: E402
+
+_CERT_ALGS = {"zlib": 1, "br": 2, "zstd": 3}
+
+
+def _sikistir_cert(alg, data):
+    if alg == "zlib":
+        return _zlib.compress(data)
+    if alg == "br":
+        return streaming._decoder_module("br").compress(data)
+    return streaming._decoder_module("zstd").ZstdCompressor().compress(data)   # içerik boyutu başlıkta
+
+
+def _ccert(alg, comp, ilan, ek=b""):
+    """CompressedCertificate (hs 25): algorithm, uncompressed_length=ilan, compressed data."""
+    body = (struct.pack("!H", _CERT_ALGS.get(alg, alg) if isinstance(alg, str) else alg)
+            + ilan.to_bytes(3, "big") + len(comp).to_bytes(3, "big") + comp + ek)
+    return bytes([25]) + len(body).to_bytes(3, "big") + body
+
+
+def _cert_body(n=3000):
+    return b"\x00" + (n - 4).to_bytes(3, "big") + bytes(range(256)) * ((n - 4) // 256) + b"x" * ((n - 4) % 256)
+
+
+@pytest.mark.parametrize("alg", ["zlib", "br", "zstd"])
+def test_sikistirilmis_sertifika_tam_uzunlukta_acilir(alg):
+    body = _cert_body()
+    out = decompress_certificate_message(_ccert(alg, _sikistir_cert(alg, body), len(body)))
+    assert out == b"\x0b" + len(body).to_bytes(3, "big") + body
+
+
+@pytest.mark.parametrize("alg", ["zlib", "br", "zstd"])
+@pytest.mark.parametrize("fark", [-1, +1])
+def test_sikistirilmis_sertifika_uzunluk_uyusmazligi_bad_certificate(alg, fark):
+    body = _cert_body()
+    with pytest.raises(CertificateDecompressionError, match="uyuşmuyor") as ei:
+        decompress_certificate_message(_ccert(alg, _sikistir_cert(alg, body), len(body) + fark))
+    assert ei.value.alert == 42                           # RFC 8879 §4: bad_certificate
+    assert isinstance(ei.value, CertificateValidationError)
+
+
+@pytest.mark.parametrize("alg", ["zlib", "br", "zstd"])
+def test_sertifika_bombasi_hizli_ve_sinirli_bellekle_reddedilir(alg):
+    """Küçük girdi, devasa çıktı; ilan edilen uzunluk 4096. Düzeltmeden önce zlib/brotli
+    sınırsız açıyordu, zstd de başlıktaki içerik boyutu kadar (64 MiB) ayırıyordu."""
+    n = 512 * MB if alg == "br" else 64 * MB
+    if alg == "br":
+        comp = streaming._decoder_module("br").compress(bytes(n), quality=1)
+    else:
+        comp = _sikistir_cert(alg, bytes(n))
+    assert len(comp) < MB
+    tracemalloc.start()
+    t = time.monotonic()
+    try:
+        with pytest.raises(CertificateDecompressionError) as ei:
+            decompress_certificate_message(_ccert(alg, comp, 4096))
+        _, tepe = tracemalloc.get_traced_memory()
+    finally:
+        tracemalloc.stop()
+    assert ei.value.alert == 42
+    assert tepe < 2 * MB, tepe
+    assert time.monotonic() - t < 2
+
+
+def test_uncompressed_length_ust_siniri_acmadan_reddedilir(monkeypatch):
+    assert MAX_UNCOMPRESSED_CERTIFICATE == 100 * 1024       # BoringSSL SSL_MAX_CERT_LIST_DEFAULT
+
+    def acma_yok(*a, **kw):
+        raise AssertionError("sınırı aşan mesaj açılmamalı")
+
+    monkeypatch.setattr(_cv, "_decompress_bounded", acma_yok)
+    for ilan in (MAX_UNCOMPRESSED_CERTIFICATE + 1, 2 ** 24 - 1):
+        with pytest.raises(CertificateDecompressionError, match="sınırı") as ei:
+            decompress_certificate_message(_ccert("zlib", b"\x78\x9c\x03\x00", ilan))
+        assert ei.value.alert == 47                       # illegal_parameter (BoringSSL ile aynı)
+
+
+@pytest.mark.parametrize("msg,alert", [
+    (_ccert("zlib", _zlib.compress(b"abc"), 3, ek=b"\x00"), 50),        # mesajın sonunda fazladan bayt
+    (_ccert("zlib", b"", 3), 50),                                        # boş compressed data
+    (_ccert(4, b"\x00\x01", 3), 47),                                     # bilinmeyen algoritma
+    (_ccert("zlib", _zlib.compress(b"abc")[:-3], 3), 42),                # kesik zlib akışı
+    (_ccert("zlib", _zlib.compress(b"abc") + b"zz", 3), 42),             # akıştan sonra çöp
+    (_ccert("br", b"\xff\xff\xff\xff", 3), 42),                          # açılamayan brotli
+    (b"\x19\x00\x00\x03\x00\x01\x00", 50),                               # çok kısa
+])
+def test_bozuk_sikistirilmis_sertifika_alertleri(msg, alert):
+    with pytest.raises(CertificateDecompressionError) as ei:
+        decompress_certificate_message(msg)
+    assert ei.value.alert == alert
+
+
+# El sıkışma testlerinde bomba tek TLS kaydına sığmalı (sahte sunucular mesajı bölmez):
+# 12 MiB sıfırın zlib'i ~12 KB, 64 MiB'ın brotli'si ~100 bayt.
+_BOMBA = {"zlib": lambda: _zlib.compress(bytes(12 * MB), 9),
+          "br": lambda: streaming._decoder_module("br").compress(bytes(64 * MB), quality=1)}
+
+
+def _bomba_cert(alg):
+    comp = _BOMBA[alg]()
+    assert len(comp) < 16000
+
+    def f(cert_msg):
+        return _ccert(alg, comp, len(cert_msg) - 4)
+    return f
+
+
+def _gecerli_cert(alg):
+    def f(cert_msg):
+        return _ccert(alg, _sikistir_cert(alg, cert_msg[4:]), len(cert_msg) - 4)
+    return f
+
+
+def _sansio_el_sikisma(conn, server):
+    to_server = conn.initiate()
+    for _ in range(10):
+        to_client = server.receive(to_server) if to_server else b""
+        conn.receive_data(to_client)
+        to_server = conn.data_to_send()
+        if conn.handshake_complete and not to_server:
+            return
+
+
+@pytest.mark.parametrize("alg", ["zlib", "br"])
+def test_sansio_cekirdek_gecerli_sikistirilmis_sertifika(h2pki, h2ca, alg):
+    from tls13_fakeserver import FakeTLS13Server
+    conn = TLSClientConnection("localhost", "chrome_131", ca_path=h2ca)
+    _sansio_el_sikisma(conn, FakeTLS13Server(h2pki, compress_cert=_gecerli_cert(alg)))
+    assert conn.handshake_complete and conn.peer_certificate is not None
+
+
+@pytest.mark.parametrize("alg", ["zlib", "br"])
+def test_sansio_cekirdek_bomba_bad_certificate_alert_gonderir(h2pki, h2ca, alg):
+    from fasthttpc.tls13.errors import TLSError
+    from tls13_fakeserver import FakeTLS13Server
+    conn = TLSClientConnection("localhost", "chrome_131", ca_path=h2ca)
+    server = FakeTLS13Server(h2pki, compress_cert=_bomba_cert(alg))
+    to_client = server.receive(conn.initiate())
+    with pytest.raises(TLSError, match="Sıkıştırılmış sertifika"):
+        conn.receive_data(to_client)
+    server.receive(conn.data_to_send())              # istemci handshake anahtarıyla şifreli alert
+    assert server.alerts == [b"\x02\x2a"]            # fatal bad_certificate (RFC 8879 §4)
+
+
+@pytest.mark.parametrize("alg", ["zlib", "br"])
+def test_async_oturum_bomba_sertifika_reddedilir_ve_alert_gider(h2pki, h2ca, alg):
+    async def main():
+        srv, port, servers = await start_tls13(h2pki, compress_cert=_bomba_cert(alg))
+        async with srv:
+            async with AsyncSession(impersonate="chrome_131", verify=h2ca, timeout=5) as s:
+                with pytest.raises(ConnectionError, match="Sıkıştırılmış sertifika"):
+                    await s.get(f"https://localhost:{port}/")
+            for _ in range(100):
+                if servers and servers[0].alerts:
+                    break
+                await asyncio.sleep(0.02)
+            assert servers[0].alerts == [b"\x02\x2a"]
+    asyncio.run(asyncio.wait_for(main(), 20))
+
+
+@pytest.fixture
+def _no_pki(monkeypatch):
+    from fasthttpc.security import tls_adapter as ta
+    monkeypatch.setattr(ta, "validate_server_certificate", lambda payload, host, **kw: "LEAF")
+    monkeypatch.setattr(ta, "verify_certificate_verify", lambda payload, leaf, th, **kw: 0x0804)
+
+
+@pytest.mark.parametrize("alg", ["zlib", "br"])
+def test_sync_tlsadapter_gecerli_ve_bomba_sikistirilmis_sertifika(_no_pki, alg):
+    from fasthttpc.security.tls_adapter import TLSAdapter
+    body = _cert_body()
+    ok = _ccert("zlib", _zlib.compress(body), len(body))
+    srv = FakeTLSServer(flight=[("hs", 8), ("msg", ok), ("hs", 15), ("hs", 20)])
+    es = TLSAdapter.negotiate(FakeSocket(on_send=srv), "example.com", None)
+    assert es.state["using_app_keys"]
+
+    bomba = _ccert(alg, _BOMBA[alg](), 4096)
+    srv = FakeTLSServer(flight=[("hs", 8), ("msg", bomba), ("hs", 15), ("hs", 20)])
+    sock = FakeSocket(on_send=srv)
+    with pytest.raises(ConnectionError, match="Sıkıştırılmış sertifika"):
+        TLSAdapter.negotiate(sock, "example.com", None)
+    st = srv.state
+    rec = split_records(sock.sends[-1])[0]
+    assert unseal(st["ck"], st["civ"], 0, rec, st["name"]) == (b"\x02\x2a", 21)

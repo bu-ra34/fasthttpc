@@ -36,6 +36,7 @@ No Critical or High findings were identified.
 | FHC-15 | Info | Legacy CBC (MAC-then-encrypt) Lucky13 mitigation is best effort | Open (by design) |
 | FHC-16 | Info | DoH query string is built without URL-encoding the host name | Open |
 | FHC-17 | Info | PSK resumption reuses the ticket's peer certificate without re-checking validity | Open |
+| FHC-18 | Low | TLS 1.3 `CompressedCertificate` decompressed without a size limit, before authentication | Fixed |
 | — | — | Async TLS handshake failure sends no alert to the server | Fixed separately in 0.6.1 |
 
 ## Findings
@@ -362,6 +363,53 @@ PSK resumption is **off by default**. When it is on, a resumed connection report
 the certificate validated on the original handshake (tickets live at most 7
 days), and the certificate's expiry is not checked again. **Recommendation:**
 drop tickets whose `peer_certificate.not_valid_after_utc` has passed.
+
+### FHC-18 — Unbounded CompressedCertificate decompression (Low, Fixed)
+
+**Location:** `fasthttpc/security/cert_validator.py:108`
+(`decompress_certificate_message`), `:78` (`_decompress_bounded`) and `:68`
+(`MAX_UNCOMPRESSED_CERTIFICATE`). Callers: the async/sans-IO TLS 1.3 core
+(`fasthttpc/tls13/connection.py:670`, also used by `SyncTLSSocket`) and the sync
+`TLSAdapter` (`fasthttpc/security/tls_adapter.py:1029`). This finding came up
+while fixing FHC-07 and was not part of the original review.
+
+**Description.** fasthttpc offers certificate compression (RFC 8879) in the
+ClientHello, as the browsers it imitates do. A `CompressedCertificate` message
+was decompressed with `zlib.decompress()` and `brotli.decompress()`, with no
+limit on the output. The 3-byte `uncompressed_length` was only compared after
+decompression. The zstd branch passed `max_output_size`, but `zstandard` ignores
+it when the frame header carries a content size, so a frame that declares
+64 MiB allocated 64 MiB for a 4 KiB certificate. The message is processed before
+the certificate chain is verified.
+
+**Exploit scenario.** Anyone on the network path, or any server, needs no
+certificate at all: they answer the ClientHello with a `CompressedCertificate`
+whose payload is a compression bomb (about 100 bytes of brotli expand to 64 MiB,
+and the compressed data field allows up to 16 MiB). The client
+process runs out of memory during the handshake. That takes down every
+connection of the process, not just the one under attack.
+
+**Fix.** `uncompressed_length` is checked before anything is decompressed. It
+must not exceed 100 KiB (`MAX_UNCOMPRESSED_CERTIFICATE`), the same limit
+BoringSSL, and therefore Chrome, applies (`tls13_both.cc` rejects
+`uncompressed_len > max_cert_list`, whose default is `SSL_MAX_CERT_LIST_DEFAULT`
+= 100 KiB; Chrome's brotli callback decompresses into a buffer of exactly
+`uncompressed_len` bytes). Decompression is incremental and stops after
+`uncompressed_length + 1` bytes: zlib uses `decompressobj().decompress(data,
+max_length)`, and brotli and zstd use the bounded decoder from FHC-07. The output
+must be exactly `uncompressed_length` bytes, and a truncated stream or data after
+the end is rejected. Failures raise `CertificateDecompressionError` (a
+`CertificateValidationError`) and the client terminates the handshake with an
+alert encrypted under its handshake key. A message that cannot be decompressed,
+or whose length does not match, gets `bad_certificate`, as RFC 8879 section 4
+requires. A malformed message gets `decode_error`. An unknown algorithm, or a
+length above the limit, gets `illegal_parameter`, as in BoringSSL. The sync
+`TLSAdapter`, the async stream and `SyncTLSSocket` all send that alert.
+Regression tests: the F18 section of `tests/test_security_audit.py` (zlib, brotli
+and zstd bombs are rejected quickly with less than 2 MiB peak memory,
+exact-length messages still work, one byte short or long is rejected, the
+limit is enforced before decompression, and full handshakes on the sync, async
+and sans-IO paths send the alert).
 
 ## Checked and found OK
 

@@ -14,6 +14,19 @@
   akışlı ve akışsız yolların hepsinde geçerli; `stream=True` iken her parça en
   çok ~64 KiB'tır ve sınır toplam açılmış bayta uygulanır. Bir yanıtta en çok 5
   içerik kodlaması açılır (urllib3 gibi).
+- **Sıkıştırılmış sertifika açma sınırı (FHC-18):** TLS 1.3 `CompressedCertificate`
+  (RFC 8879) sertifika doğrulanmadan önce zlib/brotli ile sınırsız açılıyordu
+  (zstd de çerçeve başlığındaki içerik boyutu kadar bellek ayırıyordu); yoldaki
+  herhangi biri, sertifikası olmadan, küçük bir sıkıştırma bombasıyla süreci
+  bellek tükenmesiyle düşürebilirdi. Artık `uncompressed_length` açmadan önce
+  100 KiB ile sınırlanır (BoringSSL/Chrome'un `SSL_MAX_CERT_LIST_DEFAULT`
+  değeri), açma artımlıdır ve en çok `uncompressed_length + 1` bayt üretir; çıktı
+  tam o uzunlukta olmalıdır. Hata `CertificateDecompressionError`
+  (`CertificateValidationError` alt sınıfı) olur ve el sıkışma şifreli bir fatal
+  alert ile sonlandırılır (RFC 8879 §4: `bad_certificate`; bozuk mesajda
+  `decode_error`, sınır aşımında ve bilinmeyen algoritmada `illegal_parameter`).
+  Senkron `TLSAdapter`, async akış ve `SyncTLSSocket` aynı denetimi ve alert'i
+  kullanır.
 - **Yanıt çerçevelemesi RFC 9112 §6.1-6.3'e uygun (FHC-09):** `Transfer-Encoding`
   ile `Content-Length` birlikte gelirse TE kazanır ve bağlantı bir daha
   kullanılmaz (havuza dönmez). Birbirinden farklı ya da geçersiz `Content-Length`
@@ -48,7 +61,7 @@
   tests" iş akışında haftalık ve elle tetiklenerek Ubuntu/macOS/Windows
   makinelerinde Cloudflare, nginx ve Google'a karşı çalışıyor ("yalnızca yerel
   aioquic sunucusuyla test edildi" ifadeleri kaldırıldı). HTTP/3 deneysel kalıyor.
-- `docs/security-audit.md`: FHC-07 ve FHC-09 "Fixed"; yeni ayar
+- `docs/security-audit.md`: FHC-07 ve FHC-09 "Fixed", yeni bulgu FHC-18 (Fixed); yeni ayar
   `docs/timeouts-limits-retries.md`'de.
 
 ## [0.7.0] — 2026-11-16
