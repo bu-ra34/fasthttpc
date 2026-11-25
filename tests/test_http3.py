@@ -312,17 +312,86 @@ def test_server_goaway_with_invalid_id_closes_connection(pki, h3, goaway_id):
         assert s.get(url(h3)).http_version == "HTTP/3"      # yeni bağlantı kuruldu
 
 
+def _wait_for(cond, timeout=5.0):
+    """Başka bir iş parçacığının sürdüğü bağlantıyı (kilidine dokunmadan) gözle."""
+    deadline = time.monotonic() + timeout
+    while not cond():
+        assert time.monotonic() < deadline, "koşul gerçekleşmedi (zaman aşımı)"
+        time.sleep(0.01)
+
+
 def test_server_goaway_id_must_not_increase(pki, h3):
+    """RFC 9114 §5.2: sonraki GOAWAY kimliği ARTIRAMAZ (8 -> 12: H3_ID_ERROR). İki GOAWAY de aynı
+    bağlantıda, istek hâlâ sürerken gelir: istemci ilk GOAWAY'den sonra yeni istek BAŞLATMAZ (aioquic
+    >= 1.9 buna zaten izin vermez; tüm desteklenen sürümlerde aynı senaryo)."""
+    from concurrent.futures import ThreadPoolExecutor
     from fasthttpc.http3.core import Http3Error
+    path = "/goaway-hold=8"
+    with Session(http3="force", verify=pki["ca"]) as s, ThreadPoolExecutor(1) as ex:
+        fut = ex.submit(s.get, url(h3, path), timeout=10)  # akış 0: GOAWAY(8), yanıt bekletilir
+        conns = s._h3._conns
+        _wait_for(lambda: any(c.core is not None and c.core.goaway_id is not None
+                              for c in list(conns.values())))
+        conn = next(iter(conns.values()))
+        assert conn.core.goaway_id == 8 and not conn.core.closed
+        assert not fut.done()                   # akış 0 < 8: istek reddedilmedi, sürüyor
+        h3.send_goaway(path, 12)                # aynı bağlantıda ikinci GOAWAY
+        with pytest.raises(Http3Error, match="kod=0x108"):     # 8 -> 12: artış, H3_ID_ERROR
+            fut.result(10)
+        assert conn.core.closed and next(iter(s._h3._conns.values())) is conn
+
+
+def test_unrecorded_goaway_request_is_retried_not_leaked(pki, h3):
+    """aioquic >= 1.9 GOAWAY aldıktan sonra yeni istek başlatmayı reddeder (InvalidConnectionStateError).
+    fasthttpc o GOAWAY'i henüz işlememişse (yarış) istek HİÇ gönderilmemiştir: Http3RequestRefused olur,
+    yeni bağlantıda tekrarlanır; aioquic'in istisnası kullanıcıya sızmaz (CI'daki hata izi)."""
+    from aioquic.h3 import exceptions as h3exc
     with Session(http3="force", verify=pki["ca"]) as s:
-        s.get(url(h3, "/goaway=8"))
+        s.get(url(h3, "/goaway=8"))             # akış 0, ardından GOAWAY(8)
         conn = next(iter(s._h3._conns.values()))
         _wait_core(conn, lambda: conn.core.goaway_id is not None)
-        assert conn.core.goaway_id == 8 and not conn.core.closed
-        conn.core.goaway_id = None              # yeniden kullanılabilir say: ikinci GOAWAY gelsin
-        with pytest.raises(Http3Error, match="kod=0x108"):     # 8 -> 12: artış, H3_ID_ERROR
-            s.get(url(h3, "/goaway=12"))
-        assert conn.core.closed and next(iter(s._h3._conns.values())) is conn
+        conn.core.goaway_id = None              # yarış: aioquic GOAWAY'i gördü, fasthttpc görmedi
+        r = s.get(url(h3, "/sonra"))
+        assert r.status_code == 200 and r.http_version == "HTTP/3"
+        assert json.loads(r.body)["path"] == "/sonra"
+        if hasattr(h3exc, "InvalidConnectionStateError"):     # aioquic >= 1.9: reddetti -> yeni bağlantı
+            assert conn.core.draining and not conn.usable
+            assert next(iter(s._h3._conns.values())) is not conn
+        else:                                   # < 1.9: akış 4 < 8, aynı bağlantıda işlendi
+            assert next(iter(s._h3._conns.values())) is conn
+
+
+def _refuse_start(core):
+    """aioquic >= 1.9'un send_headers reddini (her sürümde) taklit et."""
+    from fasthttpc.http3.core import InvalidConnectionStateError
+
+    def send_headers(*a, **kw):
+        raise InvalidConnectionStateError("Cannot start a request after receiving GOAWAY")
+    core.h3.send_headers = send_headers
+
+
+def test_invalid_connection_state_becomes_request_refused(pki, h3):
+    from fasthttpc.http3.core import Http3RequestRefused
+    with Session(http3="force", verify=pki["ca"]) as s:
+        s.get(url(h3))
+        conn = next(iter(s._h3._conns.values()))
+        _refuse_start(conn.core)
+        with pytest.raises(Http3RequestRefused, match="aioquic"):
+            conn.core.send_request("GET", "localhost", "/", [], b"")
+        assert conn.core.draining and not conn.usable and not conn.core.streams
+        r = s.get(url(h3, "/yeni"))                       # yeni bağlantıda tekrarlandı
+        assert r.status_code == 200 and r.http_version == "HTTP/3"
+        assert next(iter(s._h3._conns.values())) is not conn
+
+    async def go():
+        async with AsyncSession(http3="force", verify=pki["ca"]) as a:
+            await a.get(url(h3))
+            first = next(iter(a._h3._conns.values()))
+            _refuse_start(first.core)
+            r = await a.get(url(h3, "/yeni"))
+            assert r.status_code == 200 and r.http_version == "HTTP/3"
+            assert first.core.draining and next(iter(a._h3._conns.values())) is not first
+    asyncio.run(go())
 
 
 def test_alt_svc_parse():
@@ -367,6 +436,13 @@ def test_options_validation():
     assert Http3Options.from_value("force").mode == "force"
     with pytest.raises(ValueError):
         Http3Options.from_value("yes")
+    # aioquic >= 1.9 1 ms altını/sonsuzu QuicConnection kurarken reddeder: her sürümde erken ValueError
+    assert Http3Options.from_value(Http3Options(idle_timeout=0.001)).idle_timeout == 0.001
+    for bad in (0, 0.0005, -1.0, float("inf"), float("nan")):
+        with pytest.raises(ValueError, match="idle_timeout"):
+            Http3Options.from_value(Http3Options(idle_timeout=bad))
+    with pytest.raises(ValueError, match="idle_timeout"):
+        Session(http3=Http3Options(mode="force", idle_timeout=0.0005))
 
 
 def test_core_imports_without_aioquic():

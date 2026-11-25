@@ -12,6 +12,9 @@
 pip install "fasthttpc[http3]"     # installs aioquic>=1.3
 ```
 
+Supported aioquic versions: 1.3 through 1.9 (the offline suite is run with
+1.3, 1.8 and 1.9.2). Python 3.10 gets at most aioquic 1.3.
+
 ```python
 from fasthttpc import Session, AsyncSession
 from fasthttpc.http3 import Http3Options
@@ -22,6 +25,9 @@ Session(http3=Http3Options(mode="auto", connect_timeout=3.0, disable_for=300.0,
                            idle_timeout=30.0))
 AsyncSession(http3=True)  # same options; asyncio only
 ```
+
+`idle_timeout` must be at least 0.001 seconds (QUIC advertises it in
+milliseconds); other values raise `ValueError` when the session is created.
 
 `http3=False` (the default) never uses QUIC. Without aioquic installed,
 enabling HTTP/3 raises `ImportError`.
@@ -75,6 +81,10 @@ A server's HTTP/3 GOAWAY marks the connection as not reusable; requests the
 server did not process are retried once on a new connection. aioquic before 1.8
 (the newest release for Python 3.10 is 1.3) drops GOAWAY frames, so fasthttpc
 parses them itself on those versions, with the same validation as aioquic 1.8.
+aioquic 1.9 also refuses to start a request once a GOAWAY was received or the
+connection is closing (RFC 9114 section 5.2). Such a request was never sent, so
+fasthttpc retries it once on a new connection too; aioquic's
+`InvalidConnectionStateError` does not reach the caller.
 
 ## Testing against real servers
 
