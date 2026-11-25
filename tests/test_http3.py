@@ -12,7 +12,7 @@ from fasthttpc import AsyncSession, Session  # noqa: E402
 from fasthttpc.http3 import Http3Options, parse_alt_svc  # noqa: E402
 from fasthttpc.security.cert_validator import CertificateValidationError  # noqa: E402
 
-from h3_servers import H3TestServer, NoFqdnHTTPServer, make_ca, make_leaf  # noqa: E402
+from h3_servers import HITS, H3TestServer, NoFqdnHTTPServer, make_ca, make_leaf  # noqa: E402
 
 
 @pytest.fixture(scope="module")
@@ -392,6 +392,87 @@ def test_invalid_connection_state_becomes_request_refused(pki, h3):
             assert r.status_code == 200 and r.http_version == "HTTP/3"
             assert first.core.draining and next(iter(a._h3._conns.values())) is not first
     asyncio.run(go())
+
+
+
+# --- H3_REQUEST_REJECTED (0x10B): işlenmedi -> yeni bağlantıda yeniden dene (RFC 9114 §4.1.1) ---------
+
+def test_request_rejected_is_retried_on_new_connection_sync(pki, h3):
+    path = f"/reject-once-sync-{id(pki)}"
+    with Session(http3="force", verify=pki["ca"]) as s:
+        s.get(url(h3))
+        first = next(iter(s._h3._conns.values()))
+        r = s.post(url(h3, path), data=b"govde")             # bytes gövde: aynen yeniden gönderilir
+        assert r.status_code == 200 and r.http_version == "HTTP/3"
+        assert json.loads(r.body)["body"] == "govde"
+        assert HITS[path] == 2                                # bir red + bir yeniden deneme
+        assert first.core.draining and next(iter(s._h3._conns.values())) is not first
+
+
+def test_request_rejected_is_retried_async_without_killing_siblings(pki, h3):
+    """Reddedilen isteğin yeniden denemesi, eski bağlantıda SÜREN istekleri kesmez."""
+    path = f"/reject-once-async-{id(pki)}"
+
+    async def go():
+        async with AsyncSession(http3="force", verify=pki["ca"]) as s:
+            await s.get(url(h3))
+            first = next(iter(s._h3._conns.values()))
+            slow, rejected = await asyncio.gather(s.get(url(h3, "/chunks")), s.get(url(h3, path)))
+            assert slow.body == b"part0;part1;part2;" and slow.http_version == "HTTP/3"
+            assert rejected.status_code == 200 and rejected.http_version == "HTTP/3"
+            assert HITS[path] == 2 and first.core.draining
+            assert next(iter(s._h3._conns.values())) is not first
+            assert first.finished                         # son akış bitince kendini kapattı
+    asyncio.run(go())
+
+
+def test_request_rejected_repeatedly_fails_after_bound(pki, h3):
+    from fasthttpc.http3.core import Http3RequestRefused
+    from fasthttpc.http3.manager import MAX_REFUSED_RETRIES
+    attempts = MAX_REFUSED_RETRIES + 1
+    path = f"/reject-always-sync-{id(pki)}"
+    with Session(http3="force", verify=pki["ca"]) as s:
+        with pytest.raises(Http3RequestRefused, match=f"{attempts} denemede de .*H3_REQUEST_REJECTED"):
+            s.get(url(h3, path))
+    assert HITS[path] == attempts                        # sınırlı: sonsuz döngü yok
+
+    apath = f"/reject-always-async-{id(pki)}"
+
+    async def go():
+        async with AsyncSession(http3="force", verify=pki["ca"]) as a:
+            with pytest.raises(Http3RequestRefused, match=f"{attempts} denemede de .*H3_REQUEST_REJECTED"):
+                await a.get(url(h3, apath))
+    asyncio.run(go())
+    assert HITS[apath] == attempts
+
+
+@pytest.mark.parametrize("kind", ["cancel", "reject-after-headers"])
+def test_cancelled_or_processed_request_is_not_retried(pki, h3, kind):
+    """H3_REQUEST_CANCELLED (0x10C) işlenmemişliği garanti ETMEZ; yanıt başlığından sonra gelen
+    REJECTED da işlenmiş isteğe aittir: ikisi de yeniden denenmez (RFC 9114 §4.1.1)."""
+    from fasthttpc.http3.core import Http3Error, Http3RequestRefused
+    code = "0x10c" if kind == "cancel" else "0x10b"
+    for mode in ("sync", "async"):
+        path = f"/{kind}-{mode}-{id(pki)}"
+        if mode == "sync":
+            with Session(http3="force", verify=pki["ca"]) as s:
+                with pytest.raises(Http3Error, match=f"sıfırlandı: {code}") as ei:
+                    s.get(url(h3, path))
+        else:
+            async def go():
+                async with AsyncSession(http3="force", verify=pki["ca"]) as a:
+                    await a.get(url(h3, path))
+            with pytest.raises(Http3Error, match=f"sıfırlandı: {code}") as ei:
+                asyncio.run(go())
+        assert not isinstance(ei.value, Http3RequestRefused)
+        assert HITS[path] == 1                             # yeniden denenmedi
+
+
+def test_streaming_body_is_not_replayed():
+    """Yeniden deneme varsayımı açık: yalnızca tamponlanmış bytes gövdeler aynen yeniden gönderilir."""
+    from fasthttpc.http3.manager import _replayable
+    assert _replayable(b"") and _replayable(b"x") and _replayable(bytearray(b"x"))
+    assert not _replayable(iter([b"x"])) and not _replayable(None)
 
 
 def test_alt_svc_parse():
