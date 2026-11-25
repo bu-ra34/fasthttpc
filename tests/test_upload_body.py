@@ -483,3 +483,34 @@ def test_async_uretec_gonderimi_write_ile_sinirli():
         t0 = time.perf_counter()
         _run(go())
         assert time.perf_counter() - t0 < 6
+
+
+def test_digest_auth_int_akis_govdesi_ozeti():
+    """qop=auth-int gövde özeti ister: akış gövdesi belleğe alınıp özetlenir (boş özet DEĞİL)."""
+    from test_auth import RFC, DigestServer
+    for data in (io.BytesIO(b"govde"), _gen(b"gov", b"de")):
+        srv = DigestServer(algorithm="SHA-256", qop="auth-int")
+        with Session(transport=MockTransport(srv)) as s:
+            r = s.post("https://example.org/dir/index.html", data=data,
+                       auth=DigestAuth(RFC["user"], RFC["pw"]))
+        assert r.status_code == 200 and srv.log[-1][1] is True
+
+
+def test_multipart_birim():
+    from fasthttpc.multipart import encode_multipart
+    body, ct = encode_multipart(
+        fields=[("a", "1"), ("a", b"2")],
+        files=[("f", ("x.txt", io.StringIO("ç"), "text/plain", {"X-Ek": "1"})),
+               ("f", ("y.bin", memoryview(b"\x01\x02"))),
+               ("n", (None, "alan"))],
+        boundary="B")
+    assert ct == "multipart/form-data; boundary=B"
+    assert body.count(b'name="a"') == 2
+    assert (b'name="f"; filename="x.txt"\r\nContent-Type: text/plain\r\nX-Ek: 1\r\n\r\n'
+            + "ç".encode()) in body
+    assert b'filename="y.bin"' in body and b"\x01\x02" in body
+    assert b'name="n"\r\n' in body and b"alan" in body          # dosya adı None: düz alan
+    with pytest.raises(TypeError, match="multipart"):
+        Request("POST", "https://x.test/", data=b"ham", files={"f": b"1"})
+    with pytest.raises(TypeError, match="2-4"):
+        encode_multipart(files={"f": ("a",)})
