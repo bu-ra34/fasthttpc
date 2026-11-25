@@ -38,6 +38,10 @@
 - Bağımsız sunucuyla birlikte-çalışma (OpenSSL TLS + `h2`): senkron ve async,
   üç profil, bağlantı ortasında tablo küçültme/büyütme, eşzamanlı stream'ler;
   ham HEADERS blokları sunucu tarafında denetlenir.
+- Artan GOAWAY kimliği testi (8 → 12, H3_ID_ERROR) aioquic 1.9'da yeni istek
+  başlatılamadığı için düşüyordu. İkinci GOAWAY artık aynı bağlantıda, istek
+  sürerken gönderiliyor (yerel sunucuda `/goaway-hold` yolu); test aioquic 1.3,
+  1.8 ve 1.9.2'de aynı senaryoyu sınar.
 
 ### Performans
 - Huffman kodlama tablo güdümlü (bit bit Python döngüsü yok); kısa dizelerin
@@ -50,6 +54,20 @@
 - `docs/http2.md`: tarayıcı başına HPACK davranışı tablosu ve kaynakları.
   `docs/limits.md`: "HPACK Huffman kodlama yok" sınırı kaldırıldı; Safari HPACK
   varsayımları ve 16 MiB tablo sınırı sapma tablosuna eklendi.
+
+### Düzeltmeler
+- **aioquic 1.9 uyumluluğu:** aioquic 1.9, GOAWAY alındıktan ya da bağlantı
+  kapanmaya başladıktan sonra yeni istek başlatmayı reddediyor (RFC 9114
+  §5.2, `InvalidConnectionStateError`). İstek hiç gönderilmediği için bu artık
+  `Http3RequestRefused` olur: bağlantı yeniden kullanılmaz, istek bir kez yeni
+  bağlantıda tekrarlanır (sync ve async). aioquic'in istisnası kullanıcıya
+  sızmaz. Desteklenen sürümler: aioquic 1.3–1.9.
+- **`Http3Options.idle_timeout` doğrulaması:** aioquic 1.9, 1 ms altı ya da
+  sonsuz değerle QuicConnection kurmayı reddettiği için hata ilk HTTP/3
+  isteğinde aioquic'in `ConnectionConfigurationError`'ı olarak çıkıyordu.
+  0,001 sn'nin altındaki, negatif, sonsuz ya da NaN değer artık her aioquic
+  sürümünde oturum kurulurken `ValueError` verir.
+
 
 ## [0.7.0] — 2026-11-16
 

@@ -65,8 +65,9 @@ GitHub-hosted runners, which allow outbound UDP/443 and do not intercept TLS:
   the installed aioquic version and the result of every test (`-rA`).
 - **Matrix:** Ubuntu with Python 3.10 and aioquic 1.3 (oldest supported
   version, uses fasthttpc's GOAWAY shim), Ubuntu with Python 3.13 and the latest
-  aioquic (native GOAWAY), and macOS and Windows with Python 3.12 and the latest
-  aioquic. The package is installed with the `http3`, `brotli` and `zstd` extras.
+  aioquic (native GOAWAY; 1.9 or later), and macOS and Windows with Python 3.12
+  and the latest aioquic. The package is installed with the `http3`, `brotli`
+  and `zstd` extras.
 - **Limits:** each test has a 120 s hard limit (`pytest-timeout`) and each job
   15 minutes. Tests are not retried: a retry could hide a real handshake or
   fallback bug. If a third-party server is down, re-run the failed job.
