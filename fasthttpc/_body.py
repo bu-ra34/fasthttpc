@@ -24,7 +24,7 @@ from __future__ import annotations
 import io
 import os
 import stat
-from typing import Any, AsyncIterator, Iterator, Optional
+from typing import Any, AsyncGenerator, Iterator, Optional
 
 __all__ = ["CHUNK_SIZE", "StreamingBody", "UnrewindableBodyError"]
 
@@ -211,7 +211,7 @@ class StreamingBody:
                 yield data
         self._end()
 
-    async def aiter_chunks(self) -> AsyncIterator[bytes]:
+    async def aiter_chunks(self) -> AsyncGenerator[bytes, None]:
         """Boş olmayan bayt parçaları (async). Gerçek dosyalar iş parçacığında okunur."""
         self._begin()
         if self._buffer is not None:

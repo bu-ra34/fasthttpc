@@ -503,3 +503,31 @@ def test_trio_auto_altsvc_h1e_duser(pki, dual):
                 assert r.headers["x-proto"] == "h1"
     trio.run(go)
     assert dual.tcp_hits == 3
+
+
+def test_http3_akis_govdesi_bellege_alinip_gonderilir(pki, h3):
+    """HTTP/3'te akış gövdesi (dosya/üreteç) belleğe alınıp eksiksiz gönderilir (boş DEĞİL)."""
+    import io
+
+    def gen():
+        yield b""
+        yield b"uretec-"
+        yield "ç".encode()
+
+    with Session(http3="force", verify=pki["ca"]) as s:
+        r1 = s.post(url(h3, "/f"), data=io.BytesIO(b"dosya-icerigi"))
+        r2 = s.post(url(h3, "/g"), data=gen())
+    assert r1.http_version == r2.http_version == "HTTP/3"
+    assert json.loads(r1.body)["body"] == "dosya-icerigi"
+    assert json.loads(r2.body)["body"] == "uretec-ç".encode().decode("latin-1")
+
+    async def agen():
+        yield b"async-"
+        yield b"uretec"
+
+    async def go():
+        async with AsyncSession(http3="force", verify=pki["ca"]) as s:
+            r = await s.post(url(h3, "/a"), data=agen())
+            assert r.http_version == "HTTP/3"
+            assert json.loads(r.body)["body"] == "async-uretec"
+    asyncio.run(go())
