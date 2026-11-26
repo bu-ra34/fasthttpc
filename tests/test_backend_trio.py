@@ -19,7 +19,7 @@ from fasthttpc import AsyncSession, Limits, Timeout  # noqa: E402
 from fasthttpc import _backend as B  # noqa: E402
 from fasthttpc.protocol.http2_parser import FrameType  # noqa: E402
 from tls13_fakeserver import PKI, http_responder  # noqa: E402
-from netutil import LoopThread, start_server  # noqa: E402
+from netutil import LoopThread, refused_port, start_server  # noqa: E402
 from async_fakes import AsyncFakeProxy, start_h2, start_tls13, start_stdlib_tls  # noqa: E402
 from test_async_h2 import echo, _path  # noqa: E402
 from test_async_pool import H1Server, ok  # noqa: E402
@@ -350,11 +350,7 @@ def test_h1_baglanti_zaman_asimi(backend):
 
 
 def test_h1_baglanti_reddi_oserror(backend):
-    import socket
-    s0 = socket.socket()
-    s0.bind(("127.0.0.1", 0))
-    port = s0.getsockname()[1]
-    s0.close()
+    port = refused_port()
 
     async def client():
         s = AsyncSession(impersonate=None, timeout=2)
