@@ -3,6 +3,39 @@
 ## [Unreleased]
 
 ### Güvenlik
+- **Açılmış gövde sınırı (FHC-07, sıkıştırma bombası):** yeni
+  `Limits(max_decompressed_size=...)`, varsayılan 256 MiB, `None` sınırı kapatır.
+  Content-Encoding (gzip, deflate, br, zstd ve `gzip, br` gibi zincirler) ve
+  HTTP/1.1 aktarım kodlamaları artık artımlı açılır; her adımın çıktısı sınırlıdır
+  (zlib `max_length`, brotli `output_buffer_limit`, zstd küçük girdi dilimleri),
+  bellek sınır denetiminden önce büyümez. Sınır aşılınca yeni
+  `fasthttpc.DecompressedSizeError` (`DecodeError` alt sınıfı) verilir; gövde asla
+  sessizce kısaltılmaz. HTTP/1.1, HTTP/2 ve HTTP/3, `Session` ve `AsyncSession`,
+  akışlı ve akışsız yolların hepsinde geçerli; `stream=True` iken her parça en
+  çok ~64 KiB'tır ve sınır toplam açılmış bayta uygulanır. Bir yanıtta en çok 5
+  içerik kodlaması açılır (urllib3 gibi).
+- **Sıkıştırılmış sertifika açma sınırı (FHC-18):** TLS 1.3 `CompressedCertificate`
+  (RFC 8879) sertifika doğrulanmadan önce zlib/brotli ile sınırsız açılıyordu
+  (zstd de çerçeve başlığındaki içerik boyutu kadar bellek ayırıyordu); yoldaki
+  herhangi biri, sertifikası olmadan, küçük bir sıkıştırma bombasıyla süreci
+  bellek tükenmesiyle düşürebilirdi. Artık `uncompressed_length` açmadan önce
+  100 KiB ile sınırlanır (BoringSSL/Chrome'un `SSL_MAX_CERT_LIST_DEFAULT`
+  değeri), açma artımlıdır ve en çok `uncompressed_length + 1` bayt üretir; çıktı
+  tam o uzunlukta olmalıdır. Hata `CertificateDecompressionError`
+  (`CertificateValidationError` alt sınıfı) olur ve el sıkışma şifreli bir fatal
+  alert ile sonlandırılır (RFC 8879 §4: `bad_certificate`; bozuk mesajda
+  `decode_error`, sınır aşımında ve bilinmeyen algoritmada `illegal_parameter`).
+  Senkron `TLSAdapter`, async akış ve `SyncTLSSocket` aynı denetimi ve alert'i
+  kullanır.
+- **Yanıt çerçevelemesi RFC 9112 §6.1-6.3'e uygun (FHC-09):** `Transfer-Encoding`
+  ile `Content-Length` birlikte gelirse TE kazanır ve bağlantı bir daha
+  kullanılmaz (havuza dönmez). Birbirinden farklı ya da geçersiz `Content-Length`
+  değerleri, bilinmeyen aktarım kodlaması (`compress` ...) ve `chunked`'dan sonra
+  gelen kodlama artık `ConnectionError`; aynı değerin tekrarı (`5, 5`) kabul
+  edilir. Son kodlaması `chunked` olmayan TE'de gövde bağlantı kapanana kadar
+  okunur; `gzip`/`deflate` aktarım kodlamaları açılır. HTTP/1.0 yanıtında TE
+  varsa çerçeveleme bozuk sayılır: gövde kapanışa kadar okunur, bağlantı
+  kapatılır.
 - **Çerez `Domain=` için Public Suffix List (FHC-08):** öznitelik artık pakete
   gömülü bir Public Suffix List anlık görüntüsüyle (ICANN ve PRIVATE bölümleri,
   tarayıcılar gibi) denetleniyor. Eskiden `evil.co.uk`'nin `Domain=co.uk`,
@@ -17,6 +50,21 @@
   konan çerezler aynı denetimden geçiyor.
 
 ### Davranış değişikliği
+- Geçersiz `Content-Length` (ör. `abc`) eskiden "kapanışa kadar oku"ya
+  düşüyordu; artık kurtarılamaz çerçeveleme hatasıdır (`ConnectionError`).
+- Art arda birden çok zstd çerçevesi içeren gövde artık tamamen açılır
+  (RFC 8878; eskiden yalnızca ilk çerçeve dönüyordu). Açılırken çıktı ürettikten
+  sonra bozulan gövde (ör. gzip CRC hatası) artık ham (sıkıştırılmış) döndürülmez,
+  `DecodeError` verir; hiç açılamayan gövde (başlıkta yanlış kodlama) eskisi gibi
+  ham geçer.
+- **HTTP/2 HEADERS baytları artık tarayıcınınki gibi:** HPACK kodlayıcı
+  Huffman kodlama (RFC 7541 Appendix B) ve bağlantı başına dinamik tablo
+  kullanıyor; her başlığı Huffman'sız ve indekslemesiz literal olarak gönderme
+  dönemi bitti. Tipik bir Chrome isteğinin başlık bloğu yeni bağlantıda 715
+  yerine 507 bayt, aynı bağlantıda tekrarlandığında 40 bayt. Akamai HTTP/2
+  dizeleri ve SETTINGS/WINDOW_UPDATE/PRIORITY değişmedi.
+- Chrome ve Firefox profillerinde `Cookie` başlığı HTTP/2'de tarayıcı gibi
+  parçalara bölünerek gönderilir (RFC 9113 §8.2.3); sunucu yine tek başlık görür.
 - Genel sonek olan `Domain=` taşıyan çerez (tek etiketli `com`, `local` dahil)
   artık host-only olarak saklanmıyor, hiç saklanmıyor (FHC-03'te host-only
   kalıyordu; tarayıcılar da reddeder).
@@ -35,6 +83,74 @@
   nokta yok, IDN için A-label); `CookieJar.header_for()` Unicode host da kabul
   ediyor.
 
+### Eklenenler
+- **Profil başına HPACK politikası** (`PROFILES[ad]["h2"]["hpack"]`,
+  `http2_parser.HpackPolicy`): Huffman kararı, hangi başlığın dinamik tabloya
+  gireceği, ad referansı, never-indexed alanlar, cookie parçalama ve tablo
+  boyutu güncellemesi. Chrome: Chromium/QUICHE `hpack_encoder.cc` (Huffman
+  yalnızca kısaysa, pseudo'lardan yalnızca `:authority` indekslenir); gerçek
+  Chrome 151 bayt yakalamalarıyla birebir. Firefox: `Http2Compression.cpp`
+  (her dize Huffman, `:path` her zaman literal, `authorization` ve 20 bayttan
+  kısa cookie parçaları never-indexed, son ad eşleşmesi). Safari: kapalı kaynak;
+  bir Safari 26.6.1 yakalamasının 277 baytlık HEADERS yüküyle doğrulanan kısım
+  dışında Chrome davranışı varsayıldı (`docs/limits.md`).
+- Sunucunun `SETTINGS_HEADER_TABLE_SIZE`'ı kodlayıcıya uygulanır (senkron ve
+  async): sonraki başlık bloğunun başına dinamik tablo boyutu güncellemesi
+  (arada daha küçük değer görüldüyse önce o) yazılır; Chrome yalnızca değer
+  değişince, Firefox her ayarda yazar. 16 MiB üstü ilanlar 16 MiB'ye sınırlanır.
+- `hpack_huffman_encode`, `hpack_huffman_size`, `HPACK_HUFFMAN_CODES` (kod
+  tablosu decode trie'sinden türetilir; RFC tablosuyla testte karşılaştırılır).
+- **secp521r1, x448, ffdhe2048 ve ffdhe3072 anahtar değişimi.** TLS 1.3'te
+  sunucu bu gruplardan birini HelloRetryRequest ile isterse 2. ClientHello o
+  grubun payını taşır (önceden açık hatayla kesiliyordu). TLS 1.2 ECDHE
+  ServerKeyExchange'te (RFC 8422) secp521r1 ve x448 kabul edilir. ffdhe yalnızca
+  TLS 1.3'tedir (RFC 7919 sabit asalları, g = 2; parametre çalışma anında
+  üretilmez); TLS 1.2 DHE suite'leri eskisi gibi her zaman reddedilir.
+- Karşı değer doğrulaması: P-521'de yalnızca tam uzunlukta uncompressed ve eğri
+  üzerindeki nokta, x448'de 56 byte ve sıfır olmayan paylaşılan sır, ffdhe'de p
+  uzunluğunda ve 1 < Y < p-1 olan değer kabul edilir. ffdhe paylaşılan sırrı p
+  uzunluğuna soldan sıfırla doldurulur (RFC 8446 §7.4.1).
+
+### Değişti
+- **Parmak izi DEĞİŞMEDİ:** her profilin supported_groups listesi ve ilk
+  key_share'leri bayt bayt aynıdır. Firefox/Safari secp521r1'i (ve
+  `firefox_133` ffdhe'yi) eskisi gibi yalnızca ilan eder, ilk pay göndermez.
+  Chrome ve `default` bu grupları ilan etmez; x448'i hiçbir profil ilan etmez.
+  Yeni testler her profilin grup/key_share baytlarını sabitler.
+- HelloRetryRequest'in seçtiği grup ClientHello'nun supported_groups'unda
+  ilan edilmemişse async (sans-IO) yol da artık `illegal_parameter` ile
+  reddeder (RFC 8446 §4.1.4; senkron yol zaten reddediyordu).
+  `TLSImpersonator.advertised_groups()` telde gerçekten ilan edilen listeyi döner.
+- TLS 1.2 ServerKeyExchange yalnızca eliptik eğri seçebilir: ffdhe ve
+  X25519MLKEM768 "eğrisi" el sıkışmanın başında açık hatayla reddedilir.
+- cryptography'nin FFDH kullanımdan kaldırma uyarısı yalnızca fasthttpc'nin
+  kendi çağrıları için susturulur. Destek ileride kaldırılırsa ffdhe grupları
+  ilan edilmeye devam eder, HRR ile istenirlerse açık hata verilir.
+
+### Düzeltmeler
+- Async HTTP/3 yolu yanıt gövdesini iki kez açmaya çalışıyordu (gzip'li her
+  yanıtta yersiz bir uyarı); gövde artık yalnızca oturumda, bir kez açılır.
+- `http2_parser.StreamingDecompressor` artık ortak açıcıyı kullanır: çok
+  parçalı zstd akışı her parçada yeni açıcıyla başladığı için bozuluyordu.
+- **aioquic 1.9 uyumluluğu:** aioquic 1.9, GOAWAY alındıktan ya da bağlantı
+  kapanmaya başladıktan sonra yeni istek başlatmayı reddediyor (RFC 9114
+  §5.2, `InvalidConnectionStateError`). İstek hiç gönderilmediği için bu artık
+  `Http3RequestRefused` olur: bağlantı yeniden kullanılmaz, istek bir kez yeni
+  bağlantıda tekrarlanır (sync ve async). aioquic'in istisnası kullanıcıya
+  sızmaz. Desteklenen sürümler: aioquic 1.3–1.9.
+- **`Http3Options.idle_timeout` doğrulaması:** aioquic 1.9, 1 ms altı ya da
+  sonsuz değerle QuicConnection kurmayı reddettiği için hata ilk HTTP/3
+  isteğinde aioquic'in `ConnectionConfigurationError`'ı olarak çıkıyordu.
+  0,001 sn'nin altındaki, negatif, sonsuz ya da NaN değer artık her aioquic
+  sürümünde oturum kurulurken `ValueError` verir.
+
+### Performans
+- Huffman kodlama tablo güdümlü (bit bit Python döngüsü yok); kısa dizelerin
+  kodlanmış hâli süreç genelinde önbellekte. Tipik Chrome başlık listesi (18
+  alan): aynı bağlantıda tekrar eden istek ~13,4 → ~12,3 µs (blok 715 → 40
+  bayt); yeni bağlantının ilk isteği ~13,7 → ~27 µs (blok 715 → 507 bayt;
+  süreçteki ilk bağlantıda, dize önbelleği soğukken ~90 µs).
+
 ### Paketleme
 - Liste `fasthttpc/public_suffix_list.dat.gz` olarak wheel ve sdist'te: sürüm
   `2026-11-23_15-54-01_UTC`, upstream commit
@@ -48,6 +164,10 @@
   paketin lisans ifadesi `MIT AND MPL-2.0` oldu (MPL yalnızca bu dosya için;
   kodun geri kalanı MIT).
 
+### Bağımlılıklar
+- `brotli` / `brotlicffi` en az 1.2 (`output_buffer_limit` için). Daha eski bir
+  sürüm kuruluysa girdi küçük dilimlerle verilir; sınır yine geçerlidir.
+
 ### Araçlar
 - `scripts/update_psl.py`: listeyi publicsuffix.org'dan indirir (ya da
   `--input` ile yerel dosyayı okur) ve paketlenmiş dosyayı yeniden üretir.
@@ -55,7 +175,24 @@
   bildirimi, VERSION/COMMIT satırları) ve aynı listeden bayt bayt aynı dosyayı
   üretir. Testler ağa çıkmaz.
 
-### Testler
+### Testler / CI
+- RFC 7541 Appendix B tablosu (257 sembol), C.4 ve C.6 örnekleri (tahliye
+  dahil) bayt bayt; tipik Chrome ve Firefox istekleri ile aynı bağlantıdaki
+  ikinci isteğin tam baytları; rastgele istek + tablo boyutu değişikliklerinde
+  kodlayıcı tablosunun bizim ve `hpack` paketinin çözücüsüyle senkronu.
+- Bağımsız sunucuyla birlikte-çalışma (OpenSSL TLS + `h2`): senkron ve async,
+  üç profil, bağlantı ortasında tablo küçültme/büyütme, eşzamanlı stream'ler;
+  ham HEADERS blokları sunucu tarafında denetlenir.
+- `tests/test_kex_groups.py`: gidiş-dönüş, geçersiz karşı değerler (eğri dışı
+  nokta, yanlış uzunluk, x448 sıfır sır, ffdhe Y=0/1/p-1/>=p), deterministik
+  ffdhe dolgu vakaları, HRR kuralları (senkron ve sans-IO), TLS 1.2 ECDHE.
+- `tests/test_interop_kex_groups.py`: `openssl s_server -groups` karşısında her
+  grup × TLS 1.3/1.2 × senkron/async. Yerel openssl bir grubu tanımıyorsa test
+  gerekçesiyle atlanır.
+- Artan GOAWAY kimliği testi (8 → 12, H3_ID_ERROR) aioquic 1.9'da yeni istek
+  başlatılamadığı için düşüyordu. İkinci GOAWAY artık aynı bağlantıda, istek
+  sürerken gönderiliyor (yerel sunucuda `/goaway-hold` yolu); test aioquic 1.3,
+  1.8 ve 1.9.2'de aynı senaryoyu sınar.
 - `tests/test_psl.py`: resmi PSL test vektörleri (upstream `tests/test_psl.txt`,
   dosyaya kopyalandı), joker/istisna, IDN, tembel ve thread-safe yükleme, paketlenmiş
   dosyanın içeriği ve güncelleme betiği (uydurma, küçük bir listeyle).
@@ -68,29 +205,18 @@
   tümden yok sayılıyor; IP'ye eşit `Domain=` host-only çerez veriyor.
 
 ### Dokümantasyon
+- `docs/http2.md`: tarayıcı başına HPACK davranışı tablosu ve kaynakları.
+  `docs/limits.md`: "HPACK Huffman kodlama yok" sınırı kaldırıldı; Safari HPACK
+  varsayımları ve 16 MiB tablo sınırı sapma tablosuna eklendi.
+- HTTP/3 belgeleri güncellendi: canlı HTTP/3 testleri 0.7.0'dan beri ayrı "Live
+  tests" iş akışında haftalık ve elle tetiklenerek Ubuntu/macOS/Windows
+  makinelerinde Cloudflare, nginx ve Google'a karşı çalışıyor ("yalnızca yerel
+  aioquic sunucusuyla test edildi" ifadeleri kaldırıldı). HTTP/3 deneysel kalıyor.
+- `docs/security-audit.md`: FHC-07 ve FHC-09 "Fixed", yeni bulgu FHC-18 (Fixed); yeni ayar
+  `docs/timeouts-limits-retries.md`'de.
 - `docs/security-audit.md`: FHC-08 kapatıldı, FHC-03'e not eklendi.
   `docs/usage.md` çerez bölümü, README ve README.tr (lisans, sınırlar,
   geliştirme) güncellendi.
-
-### Düzeltmeler
-- **aioquic 1.9 uyumluluğu:** aioquic 1.9, GOAWAY alındıktan ya da bağlantı
-  kapanmaya başladıktan sonra yeni istek başlatmayı reddediyor (RFC 9114
-  §5.2, `InvalidConnectionStateError`). İstek hiç gönderilmediği için bu artık
-  `Http3RequestRefused` olur: bağlantı yeniden kullanılmaz, istek bir kez yeni
-  bağlantıda tekrarlanır (sync ve async). aioquic'in istisnası kullanıcıya
-  sızmaz. Desteklenen sürümler: aioquic 1.3–1.9.
-- **`Http3Options.idle_timeout` doğrulaması:** aioquic 1.9, 1 ms altı ya da
-  sonsuz değerle QuicConnection kurmayı reddettiği için hata ilk HTTP/3
-  isteğinde aioquic'in `ConnectionConfigurationError`'ı olarak çıkıyordu.
-  0,001 sn'nin altındaki, negatif, sonsuz ya da NaN değer artık her aioquic
-  sürümünde oturum kurulurken `ValueError` verir.
-
-### Testler / CI
-- Artan GOAWAY kimliği testi (8 → 12, H3_ID_ERROR) aioquic 1.9'da yeni istek
-  başlatılamadığı için düşüyordu. İkinci GOAWAY artık aynı bağlantıda, istek
-  sürerken gönderiliyor (yerel sunucuda `/goaway-hold` yolu); test aioquic 1.3,
-  1.8 ve 1.9.2'de aynı senaryoyu sınar.
-
 
 ## [0.7.0] — 2026-11-16
 
