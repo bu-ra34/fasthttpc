@@ -12,7 +12,8 @@ yardımcı fonksiyonlar içerir. İki yol da aynı mantığı kullanır:
 
 KAPSAM — yalnızca modern ve güvenli alt küme; gerisi AÇIK HATAYLA reddedilir:
 
-  Anahtar değişimi : yalnızca ECDHE (x25519, secp256r1, secp384r1).
+  Anahtar değişimi : yalnızca ECDHE (x25519, x448, secp256r1, secp384r1,
+                     secp521r1; RFC 8422 — ClientHello'da ilan edilmiş olmalı).
                      Statik RSA, DHE, PSK, anonim, export: YOK.
   Suite'ler        : ECDHE-{ECDSA,RSA}-AES128-GCM-SHA256 (0xC02B/0xC02F),
                      ECDHE-{ECDSA,RSA}-AES256-GCM-SHA384 (0xC02C/0xC030),
@@ -61,7 +62,7 @@ from ..transport.lingering import shutdown_and_drain
 from .alerts import describe_alert
 from .cert_validator import CertificateValidationError
 from .keyshare import (
-    SUPPORTED_GROUPS,
+    ECDHE_GROUPS,
     compute_shared_secret,
     generate_key_share,
     group_name,
@@ -762,9 +763,10 @@ def verify_server_key_exchange(ske: ServerKeyExchange, client_random: bytes, ser
     from cryptography.hazmat.primitives import hashes as _h
     from cryptography.hazmat.primitives.asymmetric import ec, padding, rsa
 
-    if ske.group not in SUPPORTED_GROUPS:
+    # RFC 8422 §5.4: named_curve yalnızca eliptik eğri olabilir (ffdhe/hibrit gruplar değil).
+    if ske.group not in ECDHE_GROUPS:
         raise _illegal(f"Sunucu desteklenmeyen eğri seçti: {group_name(ske.group)} "
-                       f"(desteklenenler: x25519, secp256r1, secp384r1).")
+                       f"(desteklenenler: {', '.join(group_name(g) for g in sorted(ECDHE_GROUPS))}).")
     if ske.group not in offered_groups:
         raise _illegal(f"Sunucu supported_groups'ta ilan etmediğimiz eğriyi ({group_name(ske.group)}) seçti.")
 

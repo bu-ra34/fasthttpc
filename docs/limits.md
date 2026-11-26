@@ -12,10 +12,18 @@
   ClientHello, which then no longer matches the browser. `chrome_158`'s ML-DSA
   signature schemes likewise need `cryptography` 48 or newer, which provides
   ML-DSA. On older versions they are dropped.
-- secp521r1, x448 and ffdhe key exchange are not implemented. Profiles that
-  advertise them in `supported_groups` (Firefox, Safari) send no key_share for
-  them; a server that asks for one through HelloRetryRequest gets an explicit
-  error.
+- secp521r1, x448, ffdhe2048 and ffdhe3072 never get a key_share in the first
+  ClientHello (the browsers don't send one either). A server that accepts only
+  one of them costs a HelloRetryRequest round trip. The group must be one the
+  profile advertises: Firefox and Safari advertise secp521r1, only `firefox_133`
+  advertises ffdhe2048/3072, Chrome and `default` advertise none of them, and no
+  profile advertises x448. A HelloRetryRequest or TLS 1.2 ServerKeyExchange for
+  a group the profile did not advertise is rejected.
+- ffdhe is TLS 1.3 only (TLS 1.2 DHE stays rejected), and ffdhe4096/6144/8192
+  are not implemented. ffdhe uses `cryptography`'s finite-field Diffie-Hellman,
+  which `cryptography` has deprecated. If a future version removes it, the ffdhe
+  groups are still advertised (the ClientHello does not change), but a
+  HelloRetryRequest asking for one gets an explicit error.
 - TLS 1.2: ECDHE + AEAD only by default. CBC and static RSA need
   `legacy_tls=True` ([legacy TLS](features/legacy-tls.md)); DHE, PSK and
   TLS 1.1 or lower are always rejected.

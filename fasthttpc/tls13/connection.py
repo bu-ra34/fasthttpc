@@ -618,6 +618,13 @@ class TLSClientConnection:
         group = sh["selected_group"]
         if group is None:
             raise TLSError("illegal_parameter: HRR key_share grubu içermiyor")
+        # RFC 8446 §4.1.4: seçilen grup 1. ClientHello'nun supported_groups'unda
+        # ilan edilmiş OLMALI ve key_share'ini zaten gönderdiğimiz bir grup OLMAMALI.
+        advertised = _advertised_groups(self._imp)
+        if advertised is not None and group not in advertised:
+            raise TLSError(
+                f"illegal_parameter: HRR grubu 0x{group:04x} supported_groups'ta ilan edilmedi"
+            )
         if group not in _supported_groups() or group in _offered_groups(self._imp):
             raise TLSError(
                 f"illegal_parameter: HRR grubu 0x{group:04x} desteklenmiyor veya zaten teklif edilmişti"
@@ -832,6 +839,12 @@ def _supported_groups() -> tuple:
         return tuple(SUPPORTED_GROUPS)
     except ImportError:
         return (0x001D,)
+
+
+def _advertised_groups(imp) -> Optional[set]:
+    """ClientHello'nun supported_groups'unda ilan edilen gruplar (bilinmiyorsa None)."""
+    fn = getattr(imp, "advertised_groups", None)
+    return set(fn()) if callable(fn) else None
 
 
 def _offered_groups(imp) -> set:

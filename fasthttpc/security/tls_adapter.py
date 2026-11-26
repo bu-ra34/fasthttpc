@@ -39,6 +39,7 @@ from .keyshare import (
     message_hash,
     group_name,
     is_supported_group,
+    supported_group_names,
 )
 from . import session_tickets
 from . import mtls
@@ -828,13 +829,13 @@ def _handle_hrr(raw_socket: socket.socket, impersonator: TLSImpersonator,
         if group not in impersonator.advertised_groups():
             raise ConnectionError(
                 f"HelloRetryRequest supported_groups'ta ilan etmediğimiz grubu istedi: "
-                f"{group_name(group)}"
+                f"{group_name(group)} — protokol ihlali (illegal_parameter)."
             )
         if not is_supported_group(group):
             raise ConnectionError(
                 f"Sunucu HelloRetryRequest ile {group_name(group)} grubunu istedi; bu grup "
                 f"profilde ilan ediliyor ama bu istemci tarafından implemente edilmedi "
-                f"(desteklenenler: x25519, secp256r1, secp384r1)."
+                f"(desteklenenler: {supported_group_names()})."
             )
 
     ch2_record = impersonator.build_retry_client_hello(group, hrr.cookie)
