@@ -194,7 +194,9 @@ class FakeTLS13Server:
     def __init__(self, pki: PKI, *, suite: int = 0x1301, alpn: str | None = "http/1.1",
                  hrr_group: int | None = None, hrr_cookie: bytes | None = None,
                  tamper: set | None = None, tickets: int = 1,
-                 psk_store: dict | None = None):
+                 psk_store: dict | None = None, compress_cert=None):
+        # compress_cert(cert_msg) -> CompressedCertificate (hs 25) mesajı (RFC 8879) ya da None
+        self.compress_cert = compress_cert
         self.psk_store = psk_store
         self.resumed = False
         self.pki = pki
@@ -354,6 +356,8 @@ class FakeTLS13Server:
                              + struct.pack("!H", len(entry_ext)) + entry_ext
                              for d in self.pki.chain_der())
             cert_msg = hs(11, b"\x00" + len(certs).to_bytes(3, "big") + certs)
+            if self.compress_cert is not None:
+                cert_msg = self.compress_cert(cert_msg)
             self.transcript += cert_msg
             msgs.append(cert_msg)
         if "skip_cv" not in self.tamper and send_cert:
@@ -434,6 +438,9 @@ class FakeTLS13Server:
         return None
 
     def _on_encrypted(self, content: bytes, ctype: int) -> bytes:
+        if ctype == 21:                  # istemcinin (şifreli) alert'i: kaydet
+            self.alerts.append(content)
+            return b""
         alps = "alps" in self.tamper or "alps_new" in self.tamper
         if self.state == "WAIT_FINISHED" and alps and content[:1] == b"\x08":
             # ALPS: istemci EncryptedExtensions'ı Finished'tan ÖNCE gelir ve transcript'e girer.

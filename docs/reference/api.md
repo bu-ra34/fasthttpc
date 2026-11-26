@@ -16,6 +16,7 @@
 ::: fasthttpc.HTTPStatusError
 ::: fasthttpc.DecodeError
 ::: fasthttpc.MissingDecoderError
+::: fasthttpc.DecompressedSizeError
 ::: fasthttpc.Request
 ::: fasthttpc.Headers
 ::: fasthttpc.URL

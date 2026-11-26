@@ -48,6 +48,7 @@ from .cert_validator import (
     validate_server_certificate,
     verify_certificate_verify,
     decompress_certificate_message,
+    CertificateDecompressionError,
     CertificateValidationError,
 )
 
@@ -1030,7 +1031,13 @@ class TLSAdapter:
                     if hs_type == _HS_COMPRESSED_CERTIFICATE:
                         try:
                             effective_payload = decompress_certificate_message(hs_payload)
-                        except CertificateValidationError as e:
+                        except CertificateDecompressionError as e:
+                            # RFC 8879 §4: fatal alert (istemci handshake anahtarıyla), sonra kapat.
+                            try:
+                                esock.send_record(bytes((2, e.alert)), content_type=0x15,
+                                                  use_app_keys=False)
+                            except OSError as se:     # best-effort; asıl hata maskelenmez
+                                logger.debug("Sertifika açma alert'i gönderilemedi: %s", se)
                             raise ConnectionError(f"Sıkıştırılmış sertifika açılamadı: {e}") from e
                     else:
                         effective_payload = hs_payload
