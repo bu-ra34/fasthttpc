@@ -75,8 +75,9 @@ class WSServer:
 
     def _one(self, c):
         c.settimeout(10)
+        s = c
         try:
-            s = self.ctx.wrap_socket(c, server_side=True) if self.ctx else c
+            s = self.ctx.wrap_socket(c, server_side=True) if self.ctx else c   # c'yi devralır
             if self.ctx:
                 self.alpns.append(s.selected_alpn_protocol())
             head = b""
@@ -106,7 +107,7 @@ class WSServer:
         except (OSError, ssl.SSLError) as e:
             self.errors.append(e)
         finally:
-            c.close()
+            s.close()
 
     def close(self):
         self.ls.close()

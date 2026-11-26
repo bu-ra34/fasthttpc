@@ -38,6 +38,23 @@ def dual_endpoint() -> "tuple[list[str], int]":
     return ["127.0.0.1"], 0
 
 
+def linger_close(sock: socket.socket, timeout: float = 2.0) -> None:
+    """Soketi RST üretmeden kapatır: yazma yönünü kapatıp (FIN) karşı taraf kapatana ya da
+    ``timeout`` dolana kadar gelen veriyi okuyup atar, sonra kapatır.
+
+    Alım tamponunda okunmamış veri varken ``close()`` RST gönderir; RST, istemcinin henüz
+    okumadığı yanıtı onun çekirdeğinde siler (bkz. fasthttpc/transport/lingering.py)."""
+    try:
+        sock.shutdown(socket.SHUT_WR)
+        sock.settimeout(timeout)
+        while sock.recv(65536):
+            pass
+    except OSError:
+        pass
+    finally:
+        sock.close()
+
+
 async def _quiet(aw) -> None:
     try:
         await aw

@@ -78,6 +78,17 @@ fasthttpc = ["py.typed"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["."]
+# Her uyarı hatadır (ResourceWarning ve __del__/thread içindeki istisnalar dahil): sızan
+# soket/görev/dosya testi düşürür. İstisnalar yalnızca düzeltemediğimiz üçüncü taraf
+# uyarılarıdır, her biri dar kapsamlı ve gerekçeli:
+filterwarnings = [
+    "error",
+    # tlslite-ng 0.8.x, tlslite.api içinden tlslite.integration.tlsasyncdispatchermixin'i
+    # yükler; o modül Python 3.10/3.11'de kullanımdan kalkmış asyncore'u import eder
+    # (3.12+'da asyncore yok, import korumalı). Upstream: tlslite-ng asyncore desteğini
+    # kaldırmadı; yalnızca bu modülün bu uyarısı yok sayılır.
+    "ignore:The asyncore module is deprecated:DeprecationWarning:tlslite.integration.tlsasyncdispatchermixin",
+]
 markers = [
     "interop: bağımsız TLS sunucularına (openssl s_server, tlslite-ng) karşı uyumluluk testleri; varsayılan çalıştırmada da koşar",
     "live: real-internet tests (public HTTP/3 servers, badssl.com); skipped unless FASTHTTPC_LIVE=1",

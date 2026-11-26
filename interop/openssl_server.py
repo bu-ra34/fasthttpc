@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import os
 import queue
+import re
 import shutil
 import socket
 import subprocess
@@ -46,8 +47,20 @@ def text_mode_files() -> bool:
     return sys.platform == "win32" and not http_binmode_supported()
 
 
+# s_server dinlemeye başlayınca "ACCEPT 127.0.0.1:44321" ("[::1]:port") yazar (OpenSSL 1.1.0+).
+_ACCEPT_RE = re.compile(r"^ACCEPT(?:\s+\S*:(\d+))?\s*$")
+
+
 class SServer:
-    """Kullanım: with SServer("-cert", c, "-key", k, "-WWW", cwd=dir) as s: s.port ..."""
+    """Kullanım: with SServer("-cert", c, "-key", k, "-WWW", cwd=dir) as s: s.port ...
+
+    Port seçimi yarışsızdır: s_server ``-accept 127.0.0.1:0`` ile çekirdekten port alır ve
+    gerçek portu ``ACCEPT`` satırından okuruz. (Eski yol — boş port seç, kapat, s_server'a
+    ver — paralel test süreçlerinde yarışır: araya giren başka bir sunucu portu kapar,
+    s_server bağlanamayıp çıkar ama hazır olma yoklaması o yabancı sunucuya bağlanıp
+    "hazır" sanabilir.) ACCEPT satırı port içermeyen bir openssl'de boş port seçilir; hazır
+    olma yine ``ACCEPT`` satırıyla (yalnızca bizim sürecimizin çıktısı) anlaşılır.
+    """
 
     def __init__(self, *args: str, cwd: "str | None" = None):
         self.args = list(args)
@@ -56,40 +69,58 @@ class SServer:
         self.port = 0
         self.lines: "queue.Queue[str]" = queue.Queue()
         self.log: "list[str]" = []
+        self._pump_thread: "threading.Thread | None" = None
+        self._accepted = threading.Event()
+        self._accept_port: "int | None" = None
 
     def __enter__(self) -> "SServer":
+        fixed_port = False                 # True: bu openssl ACCEPT satırında port bildirmiyor
         for _ in range(5):
-            self.port = free_port()
-            extra = []
-            if sys.platform == "win32" and any(a in _HTTP_MODES for a in self.args) \
-                    and http_binmode_supported():
-                extra = ["-http_server_binmode"]   # aksi hâlde ikili dosyalar 0x1A'da kesilir
-            self.proc = subprocess.Popen(
-                [OPENSSL, "s_server", "-accept", f"127.0.0.1:{self.port}", *extra, *self.args],
-                stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                cwd=self.cwd, env={**os.environ, "OPENSSL_CONF": os.devnull})
-            threading.Thread(target=self._pump, daemon=True).start()
-            if self._wait_ready():
-                return self
+            port = free_port() if fixed_port else 0
+            if self._start(port):
+                self.port = self._accept_port if self._accept_port is not None else port
+                if self.port:
+                    return self
+                fixed_port = True          # dinliyor ama portu bilmiyoruz: boş portla yeniden
             self.close()
         raise RuntimeError("s_server başlatılamadı: " + "".join(self.log)[-500:])
 
-    def _pump(self):
-        for raw in iter(self.proc.stdout.readline, b""):
+    def _start(self, port: int) -> bool:
+        extra = []
+        if sys.platform == "win32" and any(a in _HTTP_MODES for a in self.args) \
+                and http_binmode_supported():
+            extra = ["-http_server_binmode"]   # aksi hâlde ikili dosyalar 0x1A'da kesilir
+        self.log = []
+        self.lines = queue.Queue()
+        self._accepted = threading.Event()
+        self._accept_port = None
+        self.proc = subprocess.Popen(
+            [OPENSSL, "s_server", "-accept", f"127.0.0.1:{port}", *extra, *self.args],
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            cwd=self.cwd, env={**os.environ, "OPENSSL_CONF": os.devnull})
+        # Pompa kendi sürecinin borusunu alır (self.proc yeniden denemede değişir).
+        self._pump_thread = threading.Thread(target=self._pump, args=(self.proc.stdout,), daemon=True)
+        self._pump_thread.start()
+        return self._wait_ready()
+
+    def _pump(self, stream):
+        for raw in iter(stream.readline, b""):
             line = raw.decode("utf-8", "replace")
             self.log.append(line)
             self.lines.put(line)
+            if not self._accepted.is_set():
+                m = _ACCEPT_RE.match(line.strip())
+                if m:
+                    self._accept_port = int(m.group(1)) if m.group(1) else None
+                    self._accepted.set()
 
-    def _wait_ready(self, timeout=8.0) -> bool:
-        end = time.time() + timeout
-        while time.time() < end:
-            if self.proc.poll() is not None:
-                return False
-            try:
-                socket.create_connection(("127.0.0.1", self.port), timeout=0.2).close()
+    def _wait_ready(self, timeout=20.0) -> bool:
+        end = time.monotonic() + timeout
+        while time.monotonic() < end:
+            if self._accepted.wait(0.02):
                 return True
-            except OSError:
-                time.sleep(0.02)
+            if self.proc.poll() is not None:     # bind/argüman hatası: süreç çıktı
+                return self._accepted.is_set()
         return False
 
     def send(self, text: str):
@@ -106,14 +137,25 @@ class SServer:
         raise TimeoutError(f"s_server çıktısında {needle!r} yok: {''.join(self.log)[-800:]}")
 
     def close(self):
-        if self.proc and self.proc.poll() is None:
+        if self.proc is None:
+            return
+        if self.proc.poll() is None:
             self.proc.kill()
-            self.proc.wait(5)
-        for f in (self.proc.stdin, self.proc.stdout) if self.proc else ():
-            try:
-                f.close()
-            except Exception:
-                pass
+        self.proc.wait(10)
+        # Pompa iş parçacığı boruyu okurken boruyu kapatmak yarıştır: kapanan bir
+        # BufferedReader üzerinde readline() yapan iş parçacığı ValueError alır ("I/O
+        # operation on closed file" / "PyMemoryView_FromBuffer(): info->buf must not be
+        # NULL") ve PytestUnhandledThreadExceptionWarning olur. Süreç öldüğü için boru EOF
+        # verir: önce pompanın bitmesini bekleyip sonra boruları kapatırız.
+        if self._pump_thread is not None:
+            self._pump_thread.join(10)
+            assert not self._pump_thread.is_alive(), "s_server çıktı pompası bitmedi"
+        for f in (self.proc.stdin, self.proc.stdout):
+            if f is not None:
+                try:
+                    f.close()
+                except OSError:          # stdin: süreç öldü, tampondaki veri gönderilemedi
+                    pass
 
     def __exit__(self, *exc):
         self.close()

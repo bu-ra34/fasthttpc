@@ -17,6 +17,8 @@ import ssl
 import struct
 import threading
 
+from netutil import linger_close
+
 from cryptography import x509
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import ec, padding, rsa, x25519
@@ -140,12 +142,7 @@ class StdlibTLS12:
         except Exception as e:  # noqa: BLE001 - testte hata listesi
             self.errors.append(e)
         finally:
-            for s in (conn, raw):
-                if s is not None:
-                    try:
-                        s.close()
-                    except OSError:
-                        pass
+            linger_close(conn if conn is not None else raw)
 
     def close(self):
         self._stop = True
