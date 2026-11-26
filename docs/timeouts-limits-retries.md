@@ -13,7 +13,7 @@ Session(timeout=Timeout(10.0, connect=5.0))      # connect 5, read/write/pool 10
 |---|---|
 | `connect` | TCP connect + TLS handshake |
 | `read` | Waiting for data (inactivity period on async) |
-| `write` | Sending data (on the sync side it shares the read socket timeout) |
+| `write` | Sending data. On `Session`, every send must be handed to the OS within `write`, capped by what is left of `total`. A send is one TLS record (at most 16 KiB), or at most 64 KiB of plain `http://` data. See below |
 | `pool` | Waiting for a free pooled connection. Takes the first argument like the other fields; if it ends up `None`, `Session` uses the connect timeout and `AsyncSession` waits without limit |
 | `total` | Per-request budget for getting/opening the connection plus the whole response including the body (default `None`, no limit); unlike `read` it also catches servers that trickle data slowly. With `stream=True` it covers the request up to the response headers; each read of the streamed body is then bounded by `read` |
 
@@ -27,6 +27,29 @@ that opened the connection. This holds for `Session` and `AsyncSession`,
 streaming and non-streaming. A timeout raises `TimeoutError` (`asyncio.TimeoutError`
 on `AsyncSession`, the same class on Python 3.11+); timed-out requests are not
 retried automatically, because the server may already be processing them.
+
+### `write` on `Session`
+
+Sends and reads have separate limits on `Session`. Each send is bounded by
+`write`, capped by the remaining `total`. That covers the HTTP/1.1 request head
+and body, every HTTP/2 frame (HEADERS, body DATA, WINDOW_UPDATE, PING/SETTINGS
+acks, RST_STREAM), TLS records (including a KeyUpdate answer) and the sends of a
+proxy CONNECT or SOCKS5 handshake. While an HTTP/2 body is being sent, waiting for
+the server's WINDOW_UPDATE (flow control) is also part of the send and is bounded
+by `write`, not `read`. After each send the socket goes back to the request's `read`
+timeout, so reads are never shortened or lengthened by `write`. The TCP connect,
+the reads of a proxy tunnel and the TLS handshake are bounded by `connect`.
+
+`write` limits how long one send may make no progress. It does not limit the whole
+upload: a large body sent to a server that keeps reading never times out. If the
+server stops reading (its receive buffer and ours are full) or never opens the
+HTTP/2 window, the request fails after `write` seconds with a `TimeoutError` whose
+message names `Timeout.write` (the same class as every other timeout; `AsyncSession`
+raises `asyncio.TimeoutError` for its drain timeout). If `total` runs out first, the
+message names `Timeout.total` instead. A request whose send timed out may have
+been partly sent: its connection is closed and, like other timeouts, the request
+is not resent on another connection (only a `Retry` policy you configured may
+retry it). HTTP/3 (experimental) is bounded by one timeout for the whole exchange.
 
 ## `Limits`
 

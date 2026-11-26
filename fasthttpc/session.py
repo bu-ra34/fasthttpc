@@ -12,8 +12,10 @@ Düzeltmeler:
   - response.elapsed otomatik doldurulur
 """
 from __future__ import annotations
+import copy
 import functools
 import os
+import threading
 import time
 from typing import (TYPE_CHECKING, Any, Generator, Iterable, Optional, TypedDict,
                     Union)
@@ -22,7 +24,8 @@ from .models.urls     import URL
 from .models.headers  import Headers, check_header_field, check_request_line
 from .models.request  import Request
 from .models.response import Response, HTTPStatusError
-from .transport.connection_pool import ConnectionPool
+from .transport.connection_pool import POOL_CLOSED_MESSAGE, ConnectionPool
+from .transport.iotimeout       import IOTimeouts, is_attributed, total_timeout_error
 from .transport.plain           import PlainSocket
 from .transport.proxy           import ProxyConfig, absolute_form, authority, forward_proxy_headers
 from .security.tls_adapter      import TLSAdapter
@@ -70,6 +73,7 @@ _BodyGen = Generator[bytes, None, None]
 class _AcquireKw(TypedDict, total=False):
     proxy: str
     connect_timeout: Optional[float]
+    io: IOTimeouts
 
 
 class _LegacyKw(TypedDict, total=False):
@@ -137,6 +141,21 @@ def _discard_stream(resp: Response) -> None:
     except Exception as e:  # noqa: BLE001 - yönlendirme gövdesi önemsiz
         logger.debug("yönlendirme gövdesi okunamadı: %s", e)
     resp.close()
+
+
+def _from_cache(entry: "CacheEntry", req: Request, metrics: "RequestMetrics | None") -> Response:
+    """304 yanıtı için önbellekteki yanıtın BU isteğe ait kopyası.
+
+    Önbellekteki Response birden çok iş parçacığına paylaşılır; ``request``/``metrics``/
+    ``history`` doğrudan ona yazılsaydı istekler birbirinin alanlarını ezerdi."""
+    cached = copy.copy(entry.response)
+    cached.headers = Headers(entry.response.headers)
+    cached.history = []
+    cached.next = None
+    cached.request = req
+    if metrics:
+        cached.metrics = metrics
+    return cached
 
 
 class _StreamContext:
@@ -412,6 +431,9 @@ class Session:
 
         self._receiver = AdaptiveReceiver()
         self._pool     = get_pool()
+        # close() kalıcıdır ve iş parçacıkları arasında bir kez çalışır (bkz. close()).
+        self._close_lock = threading.Lock()
+        self._closed     = False
         # HTTP/3 (opsiyonel, aioquic): True -> Alt-Svc keşfi + h2'ye düşüş, "force" -> doğrudan h3.
         self._h3: "SyncHttp3 | None" = None
         from .http3.options import Http3Options
@@ -576,11 +598,7 @@ class Session:
                 resp.elapsed = time.perf_counter() - metrics.request_start
         self._update_cookies(resp_headers, req.url)
         if status_code == 304 and cache_entry:
-            cached = cache_entry.response
-            cached.request = req
-            if metrics:
-                cached.metrics = metrics
-            return cached
+            return _from_cache(cache_entry, req, metrics)
         if self._cache and method.upper() == "GET":
             self._cache.store(str(url), method, resp)
         return resp
@@ -593,48 +611,61 @@ class Session:
         yeniden kullanılan (keep-alive / HTTP/2) bağlantıda bağlantıyı açan ilk
         isteğin süresi kalıyor; istek düzeyi ``timeout=`` ve ``Timeout.total``
         yok sayılıyordu. ``total`` (``start``'tan, yani havuzdan alma/bağlanma
-        dahil sayılır) her okumadan önce kalan süreye göre kısaltılır
+        dahil sayılır) her okumadan/gönderimden önce kalan süreye göre kısaltılır
         (h1: :meth:`_read_app_data`, h2: ``Http2Connection.deadline``).
+
+        Süreler bağlantının soket sarmalayıcısına (``sock.io``) yazılır: bağlantı bu
+        isteğe (bu iş parçacığına) kiralıyken her gönderim ``write``, her okuma ``read``
+        ile sınırlıdır; akış gövdesi başka bir iş parçacığında okunsa da aynı süreler
+        geçerlidir ve başka bir isteğe sızmaz (sonraki kiracı kendininkini yazar).
         """
         tmo = self._tmo()
         read = tmo.read_timeout
+        write = tmo.write_timeout
         total = tmo.total
         deadline = None if total is None else start + total
-        conn.conn_data["deadline"] = deadline
-        if deadline is None:
-            conn.socket.raw_socket.settimeout(read)
-        else:
-            left = deadline - time.perf_counter()
-            if left <= 0:
-                raise TimeoutError("İstek toplam süre sınırını (Timeout.total) aştı.")
-            conn.socket.raw_socket.settimeout(min(read, left))
+        io = IOTimeouts(read, write, deadline)
+        sock = conn.socket
+        sock.io = io
+        sock.raw_socket.settimeout(io.budget(read))     # total dolduysa TimeoutError
         h2 = conn.h2_conn
         if h2 is not None:
             h2.read_timeout = read
+            h2.write_timeout = write
             h2.deadline = deadline
 
     def _end_deadline(self, conn: "HTTPConnection") -> None:
         """Toplam süre sınırını kaldırır (akış gövdesi yalnızca ``read`` ile sınırlı;
         istek bitti). Soket, isteğin tam ``read`` süresine döner."""
+        io: "IOTimeouts | None" = getattr(conn.socket, "io", None)
+        had = False
+        if io is not None and io.deadline is not None:
+            io.deadline = None
+            had = True
         h2 = conn.h2_conn
-        had = conn.conn_data.pop("deadline", None) is not None
         if h2 is not None and h2.deadline is not None:
             h2.deadline = None
             had = True
         if had and not conn.is_closed:
-            conn.socket.raw_socket.settimeout(self._tmo().read_timeout)
+            conn.socket.raw_socket.settimeout(io.read if io is not None else self._tmo().read_timeout)
 
     def _read_app_data(self, conn: "HTTPConnection") -> bytes:
         """Sadece Application Data döner; post-handshake handshake mesajları
         (NewSessionTicket vb.) TLS katmanında yutulur."""
-        dl = conn.conn_data.get("deadline")
+        sock = conn.socket
+        io: "IOTimeouts | None" = getattr(sock, "io", None)
         while True:
-            if dl is not None:
-                kalan = dl - time.perf_counter()
-                if kalan <= 0:
-                    raise TimeoutError("İstek toplam süre sınırını (Timeout.total) aştı.")
-                conn.socket.raw_socket.settimeout(min(self._tmo().read_timeout, kalan))
-            rec: "tuple[bytes, int]" = conn.socket.recv_record(skip_post_handshake=True)
+            by_total = False
+            if io is not None and io.deadline is not None:
+                t, by_total = io.limit(io.read)
+                sock.raw_socket.settimeout(t)
+            try:
+                rec: "tuple[bytes, int]" = sock.recv_record(skip_post_handshake=True)
+            except TimeoutError as e:
+                # Süre kurulurken total belirleyiciyse neden total'dır (saat yeniden okunmaz).
+                if by_total and not is_attributed(e):
+                    raise total_timeout_error() from None
+                raise
             msg, m_type = rec
             if m_type == 23:
                 return msg
@@ -644,7 +675,7 @@ class Session:
                 raise ConnectionError(f"Sunucudan şifreli TLS alert: {describe_alert(bytes(msg))}")
             # m_type == 22 buraya artık gelmez (skip_post_handshake yuttu)
 
-                                                                              
+
 
     @staticmethod
     def _body_framing(method: str, status_code: int, headers: Headers) -> str:
@@ -888,8 +919,16 @@ class Session:
                 acq: _AcquireKw = {"proxy": rot_proxy} if rot_proxy is not None else {}
                 if self._tmo() is not self.timeout:    # istek düzeyi timeout=
                     acq["connect_timeout"] = self._tmo().connect_timeout
+                if (rot_proxy is not None or self.pool.proxy is not None
+                        or self.pool.env_proxies is not None):
+                    # Proxy tüneli (CONNECT/SOCKS5) gönderimleri: write (+ kalan total).
+                    total = self._tmo().total
+                    # read: tünel okumalarının süresi (connect; gönderimden sonra geri yüklenir).
+                    acq["io"] = IOTimeouts(self._tmo().connect_timeout, self._tmo().write_timeout,
+                                           None if total is None else attempt_start + total)
                 conn = self.pool.acquire(req.url, timeout=self._tmo().pool, **acq)
                 is_new_conn = not conn.tls_established
+                new_h2: "Http2Connection | None" = None
                 logger.debug("conn id=%s yeni=%s tls=%s h2=%s",
                              id(conn), is_new_conn, conn.tls_established,
                              conn.h2_conn is not None)
@@ -920,14 +959,15 @@ class Session:
                     alpn = conn.socket.state.get("alpn", "")
                     if alpn == "h2":
                         logger.debug("TLS 1.3 kuruldu (ALPN: h2)")
-                        h2 = Http2Connection(conn.socket, profile=self.impersonate)
-                        conn.h2_conn = h2
-                        h2.send_preface_and_settings()
+                        new_h2 = Http2Connection(conn.socket, profile=self.impersonate)
+                        conn.h2_conn = new_h2
                     else:
                         logger.debug("TLS 1.3 kuruldu (ALPN: http/1.1)")
 
                 # Yeni ya da yeniden kullanılan bağlantı: zaman aşımı HER istekte.
                 self._arm_timeouts(conn, attempt_start)
+                if new_h2 is not None:
+                    new_h2.send_preface_and_settings()     # gönderim: write ile sınırlı
 
                 if conn.h2_conn is not None:
                     resp = self._send_h2_request(conn, req, metrics, cache_entry, method, url,
@@ -1085,11 +1125,8 @@ class Session:
 
                                      
                 if status_code == 304 and cache_entry:
-                    cached          = cache_entry.response
-                    cached.request  = req
-                    if metrics: cached.metrics = metrics                              
                     self.pool.release(conn)
-                    return cached
+                    return _from_cache(cache_entry, req, metrics)
 
                              
                 if self._cache and method.upper() == "GET":
@@ -1324,7 +1361,12 @@ class Session:
         ``stream=True``: gövde OKUNMADAN döner; ``r.iter_content``/``iter_lines``/
         ``iter_bytes``/``raw`` ile okunur, ``r.close()`` (ya da ``with``) ile bırakılır.
         Gövde sonuna kadar okununca bağlantı havuza döner.
+
+        İş parçacığı güvenlidir: aynı oturum birden çok iş parçacığından aynı anda
+        kullanılabilir. ``close()`` sonrasında ``RuntimeError``.
         """
+        if self._closed:
+            raise RuntimeError(POOL_CLOSED_MESSAGE)
         url, url_creds = _api.split_userinfo(url)
         url = _api.apply_params(url, self.params, params)
         current_url    = url
@@ -1556,13 +1598,32 @@ class Session:
                                                                                 
 
     def close(self) -> None:
-        if self._h3 is not None:
-            self._h3.close()
-        self.pool.close_all()
+        """Oturumu KALICI olarak kapatır; herhangi bir iş parçacığından, birden çok kez
+        çağrılabilir (yalnızca ilk çağrı iş yapar).
+
+        Başka iş parçacıklarında süren istekler KESİLMEZ: o anda bağlantısını almış her
+        alışveriş biter (yanıt ya da akış gövdesi sonuna kadar okunabilir) ve kullandığı
+        bağlantı havuza dönmeden kapatılır. Boştaki bağlantılar hemen kapanır. Bağlantı
+        almamış her istek — ``close()`` sonrasında başlayanlar, havuzda boş slot
+        bekleyenler ve süren bir çağrının sonraki adımı (yönlendirme, yeniden deneme,
+        auth challenge'ı) — ``RuntimeError`` verir. ``cert=`` yol/ikili olarak
+        verildiyse özel anahtar, kirada bağlantı kalmayınca bırakılır (süren bir
+        el sıkışması yarıda anahtarsız kalmaz)."""
+        with self._close_lock:
+            if self._closed:
+                return
+            self._closed = True
+        try:
+            if self._h3 is not None:
+                self._h3.close()
+        finally:
+            self.pool.close(on_drained=self._release_cert)
+            if self.transport is not None:
+                self.transport.close()
+
+    def _release_cert(self) -> None:
         if self.client_cert is not None and self._owns_cert:
             self.client_cert.close()          # özel anahtar referansını bırak
-        if self.transport is not None:
-            self.transport.close()
 
     def __enter__(self) -> "Session":
         return self

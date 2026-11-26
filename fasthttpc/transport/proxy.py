@@ -36,6 +36,7 @@ from urllib.parse import unquote, urlsplit
 
 from .._log import get_logger
 from .happy_eyeballs import CONNECTION_ATTEMPT_DELAY, create_connection
+from .iotimeout import IOTimeouts, send_all
 
 logger = get_logger("proxy")
 
@@ -300,15 +301,19 @@ def _host_header(host: str, port: int) -> str:
     return f"{host}:{port}"
 
 
-def http_connect(sock: socket.socket, proxy: ProxyConfig, host: str, port: int) -> None:
-    """Bağlı soket üzerinde HTTP CONNECT tüneli kurar (RFC 9110 §9.3.6)."""
+def http_connect(sock: socket.socket, proxy: ProxyConfig, host: str, port: int,
+                 io: Optional[IOTimeouts] = None) -> None:
+    """Bağlı soket üzerinde HTTP CONNECT tüneli kurar (RFC 9110 §9.3.6).
+
+    ``io`` verilirse gönderim ``io.write`` (kalan ``total`` ile kısaltılmış) ile sınırlıdır;
+    okumalar soketin zaman aşımıyla (connect) yapılır."""
     target = _host_header(host, port)
     lines = [f"CONNECT {target} HTTP/1.1", f"Host: {target}"]
     if proxy.username is not None:
         cred = f"{proxy.username}:{proxy.password or ''}".encode("utf-8")
         lines.append("Proxy-Authorization: Basic " + base64.b64encode(cred).decode("ascii"))
     lines.append("Proxy-Connection: keep-alive")
-    sock.sendall(("\r\n".join(lines) + "\r\n\r\n").encode("ascii"))
+    send_all(sock, ("\r\n".join(lines) + "\r\n\r\n").encode("ascii"), io)
 
     # Yanıtı byte byte oku: başlıklardan sonrası tünel verisidir ve TLS
     # katmanına aittir, fazla okunmamalı.
@@ -342,12 +347,13 @@ _SOCKS5_REPLIES = {
 }
 
 
-def socks5_connect(sock: socket.socket, proxy: ProxyConfig, host: str, port: int) -> None:
-    """Bağlı soket üzerinde SOCKS5 CONNECT yapar (RFC 1928 / RFC 1929)."""
+def socks5_connect(sock: socket.socket, proxy: ProxyConfig, host: str, port: int,
+                   io: Optional[IOTimeouts] = None) -> None:
+    """Bağlı soket üzerinde SOCKS5 CONNECT yapar (RFC 1928 / RFC 1929); ``io``: bkz. http_connect."""
     methods = [0x00]
     if proxy.username is not None:
         methods = [0x02, 0x00]
-    sock.sendall(bytes([0x05, len(methods)]) + bytes(methods))
+    send_all(sock, bytes([0x05, len(methods)]) + bytes(methods), io)
     ver, method = _recv_exact(sock, 2)
     if ver != 0x05:
         raise ProxyError(f"SOCKS5 değil (sürüm={ver}).")
@@ -360,7 +366,7 @@ def socks5_connect(sock: socket.socket, proxy: ProxyConfig, host: str, port: int
         pwd = (proxy.password or "").encode("utf-8")
         if len(user) > 255 or len(pwd) > 255:
             raise ProxyError("SOCKS5 kullanıcı adı/parola 255 byte'ı aşamaz.")
-        sock.sendall(bytes([0x01, len(user)]) + user + bytes([len(pwd)]) + pwd)
+        send_all(sock, bytes([0x01, len(user)]) + user + bytes([len(pwd)]) + pwd, io)
         _v, status = _recv_exact(sock, 2)
         if status != 0x00:
             raise ProxyError("SOCKS5 kimlik doğrulaması başarısız (kullanıcı/parola).")
@@ -375,7 +381,7 @@ def socks5_connect(sock: socket.socket, proxy: ProxyConfig, host: str, port: int
         if len(name) > 255:
             raise ProxyError("SOCKS5 için host adı çok uzun.")
         addr = b"\x03" + bytes([len(name)]) + name
-    sock.sendall(b"\x05\x01\x00" + addr + struct.pack("!H", port))
+    send_all(sock, b"\x05\x01\x00" + addr + struct.pack("!H", port), io)
 
     ver, rep, _rsv, atyp = _recv_exact(sock, 4)
     if ver != 0x05:
@@ -393,13 +399,14 @@ def socks5_connect(sock: socket.socket, proxy: ProxyConfig, host: str, port: int
         raise ProxyError(f"SOCKS5 yanıtında bilinmeyen adres tipi: {atyp}")
 
 
-def open_tunnel(sock: socket.socket, proxy: ProxyConfig, host: str, port: int) -> None:
+def open_tunnel(sock: socket.socket, proxy: ProxyConfig, host: str, port: int,
+                io: Optional[IOTimeouts] = None) -> None:
     """Proxy'ye BAĞLI soket üzerinde hedef host:port'a tünel kurar."""
     logger.debug("Proxy tüneli: %r -> %s:%d", proxy, host, port)
     if proxy.scheme == "http":
-        http_connect(sock, proxy, host, port)
+        http_connect(sock, proxy, host, port, io)
     else:
-        socks5_connect(sock, proxy, host, port)
+        socks5_connect(sock, proxy, host, port, io)
 
 
 def connect_to_proxy(proxy: ProxyConfig, timeout: Optional[float] = 30.0) -> socket.socket:
@@ -417,14 +424,16 @@ def connect_to_proxy(proxy: ProxyConfig, timeout: Optional[float] = 30.0) -> soc
 
 
 def connect_via_proxy(proxy: ProxyConfig, host: str, port: int,
-                      timeout: Optional[float] = 30.0) -> socket.socket:
+                      timeout: Optional[float] = 30.0,
+                      io: Optional[IOTimeouts] = None) -> socket.socket:
     """Proxy'ye TCP bağlanır, tüneli kurar ve ham soketi döner.
 
-    Dönen soket üzerinde doğrudan ``TLSAdapter.negotiate`` çalıştırılabilir.
+    Dönen soket üzerinde doğrudan ``TLSAdapter.negotiate`` çalıştırılabilir. Tünel
+    okumaları ``timeout`` (connect) ile, gönderimleri verilmişse ``io.write`` ile sınırlıdır.
     """
     sock = connect_to_proxy(proxy, timeout=timeout)
     try:
-        open_tunnel(sock, proxy, host, port)
+        open_tunnel(sock, proxy, host, port, io)
     except BaseException:
         sock.close()
         raise

@@ -81,6 +81,15 @@ async def _maybe(out: Any) -> Any:
     return await out if inspect.isawaitable(out) else out
 
 
+class _InnerTimeout(Exception):
+    """``_timed_exchange``: içteki (read/write) zaman aşımını dıştaki total'dan ayırt etmek
+    için taşıyıcı; bilerek ``TimeoutError`` alt sınıfı DEĞİL."""
+
+    def __init__(self, err: BaseException) -> None:
+        super().__init__(err)
+        self.err = err
+
+
 class ProxyRotator:
     """
     Proxy listesini round-robin veya TTFB bazlı rotate eder.
@@ -856,14 +865,23 @@ class AsyncSession:
         total = self._tmo().total
         if total is None:
             return await self._exchange(method, u, proxy, req_headers, raw_body, metrics, stream=stream)
-        t0 = time.perf_counter()
+        # Nedeni saati yeniden okuyarak değil, hatanın NEREDEN geldiğine bakarak belirle:
+        # içteki read/write zaman aşımı _InnerTimeout ile taşınır (TimeoutError değildir),
+        # dıştaki wait_for'un kendi zaman aşımı ise total'dır. Eskiden "geçen süre < total"
+        # karşılaştırması kaba saatli platformlarda (Windows) total'ı içteki hataya bağlıyordu.
+        async def inner() -> _ExchangeResult:
+            try:
+                return await self._exchange(method, u, proxy, req_headers, raw_body, metrics,
+                                            stream=stream)
+            except (TimeoutError, asyncio.TimeoutError) as e:
+                raise _InnerTimeout(e) from None
+
         try:
-            r: _ExchangeResult = await B.wait_for(
-                self._exchange(method, u, proxy, req_headers, raw_body, metrics, stream=stream), total)
+            r: _ExchangeResult = await B.wait_for(inner(), total)
             return r
+        except _InnerTimeout as e:
+            raise e.err from None        # içteki read/write zaman aşımı: mesajı korunur
         except asyncio.TimeoutError:
-            if time.perf_counter() - t0 < total:
-                raise                    # içteki read/write zaman aşımı: mesajı korunur
             raise asyncio.TimeoutError(
                 f"İstek toplam süre sınırını (Timeout.total={total} sn) aştı.") from None
 

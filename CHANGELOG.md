@@ -50,6 +50,29 @@
   konan çerezler aynı denetimden geçiyor.
 
 ### Davranış değişikliği
+- **`Session` iş parçacığı güvenli:** tek oturum birden çok iş parçacığından aynı
+  anda kullanılabilir (havuz, çerez kavanozu, önbellek ve TLS durumu paylaşılır).
+  Bir bağlantı (HTTP/1.1 ya da HTTP/2) aynı anda yalnızca bir isteğe kiralanır;
+  senkron HTTP/2 bağlantısı tek stream taşır. Boş bağlantı yoksa iş parçacığı
+  origin başına `max_connections`'a kadar yeni bağlantı açar, sınırdaysa
+  `Timeout.pool` kadar bekleyip `TimeoutError` alır (kilitlenme yok). İstek düzeyi
+  ayarlar (`timeout=`, `auth=`, `cookies=` ...) başka iş parçacığına sızmaz:
+  süreler isteğin kiraladığı bağlantıya yazılır. Belgelerdeki "thread-safe
+  değildir" uyarıları kaldırıldı.
+- **`Session.close()` kalıcı ve belirlenimli:** herhangi bir iş parçacığından,
+  birden çok kez çağrılabilir. Bağlantısını almış süren istekler kesilmez ve
+  beklenmez; bittiklerinde bağlantıları havuza dönmeden kapatılır. Boştaki
+  bağlantılar hemen kapanır. Bağlantı almamış her istek (sonradan başlayanlar,
+  slot bekleyenler, süren çağrının yönlendirme/yeniden deneme/auth adımı)
+  `RuntimeError` verir; eskiden kapatılan oturum sessizce yeni bağlantı açıyordu.
+  `cert=` yol olarak verildiyse özel anahtar, kirada bağlantı kalmayınca bırakılır.
+- **`Timeout.write` senkron tarafta uygulanıyor:** her gönderim (HTTP/1.1 istek
+  başı ve gövdesi, HTTP/2 frame'leri ve gövde DATA'sı, TLS kayıtları, proxy
+  CONNECT/SOCKS5 gönderimleri) `write` içinde işletim sistemine teslim edilmeli,
+  kalan `total` ile kısaltılır; gövde gönderirken HTTP/2 WINDOW_UPDATE beklemesi de
+  `write` ile sınırlı. Gönderimden sonra soket isteğin `read` süresine döner.
+  Aşılınca mesajında `Timeout.write` geçen `TimeoutError`. Eskiden gönderimler
+  `read` süresini kullanıyordu.
 - Geçersiz `Content-Length` (ör. `abc`) eskiden "kapanışa kadar oku"ya
   düşüyordu; artık kurtarılamaz çerçeveleme hatasıdır (`ConnectionError`).
 - Art arda birden çok zstd çerçevesi içeren gövde artık tamamen açılır
@@ -84,6 +107,9 @@
   ediyor.
 
 ### Eklenenler
+- `Session.pool_stats()` girdilerinde `in_use` (kirada bağlantı sayısı).
+- `fasthttpc.transport.iotimeout`: `IOTimeouts` ve `send_all` (istek başına
+  okuma/yazma/toplam süre).
 - **Profil başına HPACK politikası** (`PROFILES[ad]["h2"]["hpack"]`,
   `http2_parser.HpackPolicy`): Huffman kararı, hangi başlığın dinamik tabloya
   gireceği, ad referansı, never-indexed alanlar, cookie parçalama ve tablo
@@ -125,10 +151,34 @@
 - `tests/test_interop_kex_groups.py`: `openssl s_server -groups` karşısında her
   grup × TLS 1.3/1.2 × senkron/async. Yerel openssl bir grubu tanımıyorsa test
   gerekçesiyle atlanır.
+- Artan GOAWAY kimliği testi (8 → 12, H3_ID_ERROR) aioquic 1.9'da yeni istek
+  başlatılamadığı için düşüyordu. İkinci GOAWAY artık aynı bağlantıda, istek
+  sürerken gönderiliyor (yerel sunucuda `/goaway-hold` yolu); test aioquic 1.3,
+  1.8 ve 1.9.2'de aynı senaryoyu sınar.
+- `tests/test_thread_safety.py`: 16 iş parçacığı × 20 istek (TLS HTTP/1.1, HTTP/2,
+  düz HTTP); her yanıt kendi eşsiz yolu/gövdesiyle doğrulanır, eşzamanlı çerezlerin
+  hepsi kavanozda, havuz sınırı istemci ve sunucu tarafında aşılmıyor, HTTP/2'de
+  bağlantı başına tek açık stream; istek düzeyi zaman aşımı sızmıyor; `close()`
+  süren isteklerle; `DigestAuth` `nc` eşsizliği.
+- `tests/test_write_timeout.py`: hiç okumayan yerel sunucuya büyük gövdeyle
+  `write` (HTTP/1.1 düz/TLS, HTTP/2 gönderim ve akış kontrolü beklemesi), `read`'in
+  bağımsızlığı, `total`'ın üst sınırı, gönderimden sonra okuma süresinin geri
+  gelmesi; `send_all` ve proxy el sıkışması birim testleri.
+- `tests/thread_servers.py`: iş parçacıklı HTTP/2 (`h2`) ve "okumayan" sunucu.
 - TLS 1.2 `no_ccs` testi her koşuda hem AES-GCM hem ChaCha20-Poly1305 ile,
   bilet olan/olmayan sunucuyla ve gövdesi "HelloRequest, dev uzunluk" gibi
   görünen şifreli Finished'la (sahte sunucu nonce'u seçer) sync ve async
   sınanır. Son varyant düzeltme öncesi koddaki hatayı her seferinde üretir.
+- `tests/test_psl.py`: resmi PSL test vektörleri (upstream `tests/test_psl.txt`,
+  dosyaya kopyalandı), joker/istisna, IDN, tembel ve thread-safe yükleme, paketlenmiş
+  dosyanın içeriği ve güncelleme betiği (uydurma, küçük bir listeyle).
+- `tests/test_security_audit.py` (F8): `co.uk`, `github.io`, `herokuapp.com`,
+  joker/istisna ve IDN (`рф`, `公司.cn`) senaryoları; host'un kendisi genel
+  sonekse host-only çerez; `Session` ve `AsyncSession` ile yönlendirme ara
+  yanıtında konan çerezin kardeş sitelere gitmediği. FHC-03 testleri yeni
+  davranışa göre sıkılaştırıldı: `Domain=com`, IP host'ta IP'den farklı
+  `Domain=` ve host'un domain-match etmediği `Domain=` taşıyan çerez artık
+  tümden yok sayılıyor; IP'ye eşit `Domain=` host-only çerez veriyor.
 
 ### Değişti
 - **Parmak izi DEĞİŞMEDİ:** her profilin supported_groups listesi ve ilk
@@ -145,8 +195,57 @@
 - cryptography'nin FFDH kullanımdan kaldırma uyarısı yalnızca fasthttpc'nin
   kendi çağrıları için susturulur. Destek ileride kaldırılırsa ffdhe grupları
   ilan edilmeye devam eder, HRR ile istenirlerse açık hata verilir.
+- Artan GOAWAY kimliği testi (8 → 12, H3_ID_ERROR) aioquic 1.9'da yeni istek
+  başlatılamadığı için düşüyordu. İkinci GOAWAY artık aynı bağlantıda, istek
+  sürerken gönderiliyor (yerel sunucuda `/goaway-hold` yolu); test aioquic 1.3,
+  1.8 ve 1.9.2'de aynı senaryoyu sınar.
+
+### Performans
+- Huffman kodlama tablo güdümlü (bit bit Python döngüsü yok); kısa dizelerin
+  kodlanmış hâli süreç genelinde önbellekte. Tipik Chrome başlık listesi (18
+  alan): aynı bağlantıda tekrar eden istek ~13,4 → ~12,3 µs (blok 715 → 40
+  bayt); yeni bağlantının ilk isteği ~13,7 → ~27 µs (blok 715 → 507 bayt;
+  süreçteki ilk bağlantıda, dize önbelleği soğukken ~90 µs).
+
+### Dokümantasyon
+- `docs/http2.md`: tarayıcı başına HPACK davranışı tablosu ve kaynakları.
+  `docs/limits.md`: "HPACK Huffman kodlama yok" sınırı kaldırıldı; Safari HPACK
+  varsayımları ve 16 MiB tablo sınırı sapma tablosuna eklendi.
+- HTTP/3 belgeleri güncellendi: canlı HTTP/3 testleri 0.7.0'dan beri ayrı "Live
+  tests" iş akışında haftalık ve elle tetiklenerek Ubuntu/macOS/Windows
+  makinelerinde Cloudflare, nginx ve Google'a karşı çalışıyor ("yalnızca yerel
+  aioquic sunucusuyla test edildi" ifadeleri kaldırıldı). HTTP/3 deneysel kalıyor.
+- `docs/security-audit.md`: FHC-07 ve FHC-09 "Fixed", yeni bulgu FHC-18 (Fixed); yeni ayar
+  `docs/timeouts-limits-retries.md`'de.
+- `usage.md`: "Using one `Session` from many threads" (garantiler, kilit tasarımı,
+  `close()` anlamı); `timeouts-limits-retries.md`: senkron `write`; `limits.md`,
+  `migration-requests.md`, README'ler güncellendi.
+- `docs/security-audit.md`: FHC-08 kapatıldı, FHC-03'e not eklendi.
+  `docs/usage.md` çerez bölümü, README ve README.tr (lisans, sınırlar,
+  geliştirme) güncellendi.
 
 ### Düzeltmeler
+- Havuz: `release()` idempotent; aynı bağlantının ikinci iadesi semaphore'u bir
+  daha artırıp `max_connections` sınırını sessizce aşabiliyordu. Bağlantı
+  kurulamazsa slot `KeyboardInterrupt`'ta da iade edilir; `acquire(block=False)`
+  `ValueError` vermiyor.
+- Önbellek: `304` yanıtında paylaşılan önbellek nesnesinin `request`/`metrics`
+  alanı her istekte eziliyordu; artık her isteğe ayrı kopya döner.
+- `DigestAuth`: aynı challenge'ı eşzamanlı alan istekler sayacı sıfırlıyor, aynı
+  nonce ile aynı `nc` tekrar gönderiliyordu (sunucuda replay); durum artık kilit
+  altında ve mevcut challenge yeniden kullanılıyor.
+- Senkron HTTP/3: `close()` ve kullanılamaz bağlantının değiştirilmesi süren bir
+  isteği beklemiyor ya da kesmiyor; bağlantı son kullanıcı bitince kapanır.
+- Chrome trust anchor sırasının süreç başına tek kez belirlenmesi iş parçacıkları
+  arasında yarışabiliyordu.
+- Yeni HTTP/2 bağlantısının ön eki (preface + SETTINGS) isteğin zaman aşımı
+  uygulandıktan sonra gönderiliyor.
+- Zaman aşımının nedeni (`total` mı `write`/`read` mi) artık süre kurulurken
+  belirleniyor; hata sonrası saati yeniden okumak kaba çözünürlüklü saatte
+  (Windows, ~15,6 ms) `total` aşımını `Timeout.write` diye raporlayabiliyordu.
+  Senkron okumalarda `total` kaynaklı zaman aşımı da `Timeout.total` mesajıyla
+  yükselir; `AsyncSession`'da içteki zaman aşımı dıştaki `total`'dan saatle değil
+  kaynağıyla ayırt edilir.
 - Async HTTP/3 yolu yanıt gövdesini iki kez açmaya çalışıyordu (gzip'li her
   yanıtta yersiz bir uyarı); gövde artık yalnızca oturumda, bir kez açılır.
 - `http2_parser.StreamingDecompressor` artık ortak açıcıyı kullanır: çok
@@ -198,13 +297,6 @@
   hemen kapatılıyor ve aynı bağlantıda süren istekler "bağlantı kapatıldı"
   hatasıyla düşüyordu. Bağlantı artık son akışı bitince kapanır.
 
-### Performans
-- Huffman kodlama tablo güdümlü (bit bit Python döngüsü yok); kısa dizelerin
-  kodlanmış hâli süreç genelinde önbellekte. Tipik Chrome başlık listesi (18
-  alan): aynı bağlantıda tekrar eden istek ~13,4 → ~12,3 µs (blok 715 → 40
-  bayt); yeni bağlantının ilk isteği ~13,7 → ~27 µs (blok 715 → 507 bayt;
-  süreçteki ilk bağlantıda, dize önbelleği soğukken ~90 µs).
-
 ### Paketleme
 - Liste `fasthttpc/public_suffix_list.dat.gz` olarak wheel ve sdist'te: sürüm
   `2026-11-23_15-54-01_UTC`, upstream commit
@@ -218,7 +310,6 @@
   paketin lisans ifadesi `MIT AND MPL-2.0` oldu (MPL yalnızca bu dosya için;
   kodun geri kalanı MIT).
 
-
 ### Bağımlılıklar
 - `brotli` / `brotlicffi` en az 1.2 (`output_buffer_limit` için). Daha eski bir
   sürüm kuruluysa girdi küçük dilimlerle verilir; sınır yine geçerlidir.
@@ -229,49 +320,6 @@
   Biçimi denetler (joker yalnızca en soldaki etiket, iki bölüm de var, MPL
   bildirimi, VERSION/COMMIT satırları) ve aynı listeden bayt bayt aynı dosyayı
   üretir. Testler ağa çıkmaz.
-
-### Testler / CI
-- RFC 7541 Appendix B tablosu (257 sembol), C.4 ve C.6 örnekleri (tahliye
-  dahil) bayt bayt; tipik Chrome ve Firefox istekleri ile aynı bağlantıdaki
-  ikinci isteğin tam baytları; rastgele istek + tablo boyutu değişikliklerinde
-  kodlayıcı tablosunun bizim ve `hpack` paketinin çözücüsüyle senkronu.
-- Bağımsız sunucuyla birlikte-çalışma (OpenSSL TLS + `h2`): senkron ve async,
-  üç profil, bağlantı ortasında tablo küçültme/büyütme, eşzamanlı stream'ler;
-  ham HEADERS blokları sunucu tarafında denetlenir.
-- `tests/test_kex_groups.py`: gidiş-dönüş, geçersiz karşı değerler (eğri dışı
-  nokta, yanlış uzunluk, x448 sıfır sır, ffdhe Y=0/1/p-1/>=p), deterministik
-  ffdhe dolgu vakaları, HRR kuralları (senkron ve sans-IO), TLS 1.2 ECDHE.
-- `tests/test_interop_kex_groups.py`: `openssl s_server -groups` karşısında her
-  grup × TLS 1.3/1.2 × senkron/async. Yerel openssl bir grubu tanımıyorsa test
-  gerekçesiyle atlanır.
-- Artan GOAWAY kimliği testi (8 → 12, H3_ID_ERROR) aioquic 1.9'da yeni istek
-  başlatılamadığı için düşüyordu. İkinci GOAWAY artık aynı bağlantıda, istek
-  sürerken gönderiliyor (yerel sunucuda `/goaway-hold` yolu); test aioquic 1.3,
-  1.8 ve 1.9.2'de aynı senaryoyu sınar.
-- `tests/test_psl.py`: resmi PSL test vektörleri (upstream `tests/test_psl.txt`,
-  dosyaya kopyalandı), joker/istisna, IDN, tembel ve thread-safe yükleme, paketlenmiş
-  dosyanın içeriği ve güncelleme betiği (uydurma, küçük bir listeyle).
-- `tests/test_security_audit.py` (F8): `co.uk`, `github.io`, `herokuapp.com`,
-  joker/istisna ve IDN (`рф`, `公司.cn`) senaryoları; host'un kendisi genel
-  sonekse host-only çerez; `Session` ve `AsyncSession` ile yönlendirme ara
-  yanıtında konan çerezin kardeş sitelere gitmediği. FHC-03 testleri yeni
-  davranışa göre sıkılaştırıldı: `Domain=com`, IP host'ta IP'den farklı
-  `Domain=` ve host'un domain-match etmediği `Domain=` taşıyan çerez artık
-  tümden yok sayılıyor; IP'ye eşit `Domain=` host-only çerez veriyor.
-
-### Dokümantasyon
-- `docs/http2.md`: tarayıcı başına HPACK davranışı tablosu ve kaynakları.
-  `docs/limits.md`: "HPACK Huffman kodlama yok" sınırı kaldırıldı; Safari HPACK
-  varsayımları ve 16 MiB tablo sınırı sapma tablosuna eklendi.
-- HTTP/3 belgeleri güncellendi: canlı HTTP/3 testleri 0.7.0'dan beri ayrı "Live
-  tests" iş akışında haftalık ve elle tetiklenerek Ubuntu/macOS/Windows
-  makinelerinde Cloudflare, nginx ve Google'a karşı çalışıyor ("yalnızca yerel
-  aioquic sunucusuyla test edildi" ifadeleri kaldırıldı). HTTP/3 deneysel kalıyor.
-- `docs/security-audit.md`: FHC-07 ve FHC-09 "Fixed", yeni bulgu FHC-18 (Fixed); yeni ayar
-  `docs/timeouts-limits-retries.md`'de.
-- `docs/security-audit.md`: FHC-08 kapatıldı, FHC-03'e not eklendi.
-  `docs/usage.md` çerez bölümü, README ve README.tr (lisans, sınırlar,
-  geliştirme) güncellendi.
 
 ## [0.7.0] — 2026-11-16
 

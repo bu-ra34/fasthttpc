@@ -26,11 +26,13 @@ _TAI_ORDER: dict[int, list[bytes]] = {}
 
 def _process_tai_order(ids: list[bytes]) -> list[bytes]:
     key = id(ids)
-    if key not in _TAI_ORDER:
+    order = _TAI_ORDER.get(key)
+    if order is None:
         order = list(ids)
         _SYS_RANDOM.shuffle(order)
-        _TAI_ORDER[key] = order
-    return _TAI_ORDER[key]
+        # setdefault atomik: iki iş parçacığı aynı anda karıştırsa da süreçte TEK sıra kalır.
+        order = _TAI_ORDER.setdefault(key, order)
+    return order
 
 
 def encrypted_extensions_types(hs_payload: bytes) -> list[int]:
