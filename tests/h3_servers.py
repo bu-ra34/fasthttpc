@@ -9,6 +9,7 @@ import json
 import socket
 import socketserver
 import ssl
+import sys
 import threading
 from urllib.parse import parse_qs, urlsplit
 
@@ -203,7 +204,15 @@ class H3TestServer:
         return self
 
     def _run(self):
-        loop = asyncio.new_event_loop()
+        # Windows: UDP sunucusu ProactorEventLoop'ta DEĞİL, SelectorEventLoop'ta koşar.
+        # Proactor datagram taşıması (CPython 3.12, proactor_events._ProactorDatagramTransport.
+        # _loop_reading) recvfrom'dan gelen OSError'da protocol.error_received() çağırıp
+        # yeni okuma BAŞLATMAZ: tek bir ICMP kaynaklı hata (istemcinin kapattığı porta giden
+        # yanıt; Windows bunu sonraki alımda raporlar) sunucunun alımını sessizce ve kalıcı
+        # olarak durdurur, modül boyunca paylaşılan sunucuya sonraki tüm el sıkışmalar zaman
+        # aşımına uğrar (Windows CI: test_request_rejected_repeatedly_fails_after_bound'dan
+        # sonraki 11 HTTP/3 testi). Selector taşıması hatayı bildirir ve okumayı sürdürür.
+        loop = asyncio.SelectorEventLoop() if sys.platform == "win32" else asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
         self._loop = loop
         cfg = QuicConfiguration(is_client=False, alpn_protocols=["h3"])
@@ -228,6 +237,7 @@ class H3TestServer:
                     self.port = 0
             else:
                 raise OSError("aynı numarada TCP+UDP portu bulunamadı")
+            self._quic_server = srv
             self._stop = asyncio.Event()
             self._ready.set()
             await self._stop.wait()
@@ -239,6 +249,16 @@ class H3TestServer:
             self._ready.set()
         finally:
             close_loop(loop)            # UDP soketi ve kalan görevler döngüyle birlikte kapanır
+
+    def send_raw(self, data: bytes, addr) -> None:
+        """Sunucu UDP soketinden ``addr``'e ham datagram (ör. kapalı porta: ICMP tetikler)."""
+        sent = threading.Event()
+
+        def go():
+            self._quic_server._transport.sendto(data, addr)
+            sent.set()
+        self._loop.call_soon_threadsafe(go)
+        assert sent.wait(5), "datagram gönderilemedi (zaman aşımı)"
 
     def send_goaway(self, path, goaway_id):
         """``/goaway-hold`` isteği ``path``'i bekleten bağlantıda bir GOAWAY(goaway_id) daha gönder

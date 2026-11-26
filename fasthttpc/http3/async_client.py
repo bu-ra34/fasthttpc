@@ -56,10 +56,30 @@ class AsyncH3Connection:
         self._after_event()
 
     def _on_udp_error(self, exc) -> None:
-        if self.core is not None and not self.core.closed and not self.core.handshake_done:
-            self.core.error = Http3ConnectError(f"UDP hatası: {exc}", exc)
-            self.core._fail_all(self.core.error, mark_closed=True)
+        core = self.core
+        if core is not None and not core.closed:
+            if not core.handshake_done:
+                core.error = Http3ConnectError(f"UDP hatası: {exc}", exc)
+                core._fail_all(core.error, mark_closed=True)
+            elif self._udp_error_is_fatal(exc):
+                # El sıkışmadan SONRA: eş artık yok (ICMP reddi) ya da taşıma okumayı bıraktı.
+                # Bağlantı "kullanılabilir" kalsaydı sonraki istekler yanıt alamayıp zaman
+                # aşımına uğrardı; kapatılır, sıradaki istek yeni bağlantı kurar.
+                core.error = Http3Error(f"UDP hatası: {exc}")
+                core._fail_all(core.error, mark_closed=True)
         self._after_event()
+
+    def _udp_error_is_fatal(self, exc) -> bool:
+        """Kurulu bağlantıda UDP hatası bağlantıyı bitirir mi?
+
+        ICMP kaynaklı ret/sıfırlama her zaman. Windows ProactorEventLoop'ta HER alım hatası:
+        datagram taşıması (CPython 3.12 ``_ProactorDatagramTransport._loop_reading``) hatada
+        ``error_received`` çağırıp yeni okuma başlatmaz, soket bir daha veri vermez. Diğer
+        döngülerde geçici gönderim hataları (ENOBUFS, EMSGSIZE) QUIC kayıp kurtarmasına kalır."""
+        if isinstance(exc, (ConnectionRefusedError, ConnectionResetError)):
+            return True
+        proactor = getattr(asyncio, "ProactorEventLoop", None)
+        return proactor is not None and isinstance(self.loop, proactor)
 
     def _after_event(self) -> None:
         core = self.core

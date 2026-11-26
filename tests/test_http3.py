@@ -700,6 +700,73 @@ def test_yanitsiz_adres_yoklama_penceresinde_birakilir(monkeypatch):
         silent.close()
 
 
+# --- Kayıp ve ICMP dayanıklılığı (Windows CI'daki el sıkışma zaman aşımları) --------------------
+
+def test_ilk_initial_kaybolursa_pto_ile_el_sikisilir(pki, h3, monkeypatch):
+    """İstemcinin ilk Initial datagram'ı kaybolursa sürücü aioquic'in PTO zamanlayıcısıyla
+    yeniden gönderir; el sıkışması varsayılan connect_timeout'tan (3 sn) çok önce biter
+    (PTO ~0,2 sn). Sync ve async sürücü."""
+    from fasthttpc.http3 import async_client, sync_client
+    orig_flush = sync_client.SyncH3Connection._flush
+
+    def flush(self):
+        if not getattr(self, "_dusuruldu", False):
+            dg = self.core.transmit()
+            self._dusuruldu = bool(dg)
+            for data, _a in dg[1:]:                      # ilk datagram (Initial) kaybolur
+                self._sock.send(data)
+            return
+        orig_flush(self)
+    monkeypatch.setattr(sync_client.SyncH3Connection, "_flush", flush)
+    t = time.monotonic()
+    with Session(http3="force", verify=pki["ca"]) as s:
+        assert s.get(url(h3)).http_version == "HTTP/3"
+    assert time.monotonic() - t < 2.0
+
+    orig_after = async_client.AsyncH3Connection._after_event
+
+    def after(self):
+        if not getattr(self, "_dusuruldu", False) and self._transport is not None:
+            dg = self.core.transmit()
+            self._dusuruldu = bool(dg)
+            for data, _a in dg[1:]:
+                self._transport.sendto(data)
+        orig_after(self)
+    monkeypatch.setattr(async_client.AsyncH3Connection, "_after_event", after)
+
+    async def go():
+        t = time.monotonic()
+        async with AsyncSession(http3="force", verify=pki["ca"]) as a:
+            assert (await a.get(url(h3))).http_version == "HTTP/3"
+        assert time.monotonic() - t < 2.0
+    asyncio.run(go())
+
+
+def test_sunucu_icmp_hatasindan_sonra_almaya_devam_eder(pki, h3):
+    """Sunucu kapalı bir porta datagram gönderir (Windows'ta sonraki alım ICMP kaynaklı hata
+    verir). Paylaşılan test sunucusu yine de yeni bağlantıları kabul etmeli: Proactor
+    datagram taşıması bu hatada okumayı bırakıyordu (bkz. h3_servers.H3TestServer._run)."""
+    for _ in range(3):
+        h3.send_raw(b"\x00" * 32, ("127.0.0.1", _free_udp_port()))
+    time.sleep(0.1)
+    with Session(http3="force", verify=pki["ca"]) as s:
+        assert s.get(url(h3)).http_version == "HTTP/3"
+
+
+def test_kurulu_baglantida_udp_reddi_baglantiyi_dusurur(pki, h3):
+    """El sıkışmadan sonra gelen ICMP reddi (ConnectionRefusedError) bağlantıyı kapatır;
+    sonraki istek yeni bağlantı kurar (eski bağlantı sessizce "kullanılabilir" kalmaz)."""
+    async def go():
+        async with AsyncSession(http3="force", verify=pki["ca"]) as a:
+            assert (await a.get(url(h3))).http_version == "HTTP/3"
+            first = next(iter(a._h3._conns.values()))
+            first._on_udp_error(ConnectionRefusedError(111, "Connection refused"))
+            assert first.core.closed and not first.usable
+            assert (await a.get(url(h3))).http_version == "HTTP/3"
+            assert next(iter(a._h3._conns.values())) is not first
+    asyncio.run(go())
+
+
 def test_multi_address_all_dead_fails_within_timeout(pki, monkeypatch):
     s1 = socket.socket(socket.AF_INET, socket.SOCK_DGRAM); s1.bind(("127.0.0.1", 0))
     port = s1.getsockname()[1]            # sessiz adres; ikinci adres: kapalı port
