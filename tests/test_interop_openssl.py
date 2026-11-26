@@ -145,8 +145,7 @@ def test_sadece_p256_sunan_sunucu_hrr_yolu(env, mode):
     """İstemci ilk ClientHello'da x25519 payı yollar; P-256-only sunucu HelloRetryRequest ister."""
     with env.server("p256", "-groups", "P-256", "-msg") as s:
         r = _get(mode, s.port, env.ca_path)
-        s.wait_line("HelloRetryRequest|Retry", 3) if False else None
-        log = "".join(s.log)
+        log = s.wait_count("ClientHello", 2)
     assert r.status_code == 200 and r.content == b"merhaba interop"
     # HRR gerçekten yaşandı mı: sunucu iki ClientHello okudu
     assert log.count("ClientHello") >= 2, "HRR yolu tetiklenmedi: " + log[:600]

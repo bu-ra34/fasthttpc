@@ -57,7 +57,7 @@ TLS13 = [("secp521r1", "firefox_160"), ("secp521r1", "firefox_133"), ("secp521r1
 def test_tls13_hrr_ile_grup(env, request, group, profile, mode):
     with _grup_sunucusu(env, group, "-tls1_3") as s:
         r = _get(mode, s.port, env.ca_path, profile=_profil(request, profile))
-        log = "".join(s.log)
+        log = s.wait_count("ClientHello", 2)
     assert r.status_code == 200 and r.content == b"merhaba interop"
     # Profil bu grup için ilk payı göndermez: sunucu HRR istedi ve iki ClientHello okudu.
     assert log.count("ClientHello") >= 2, "HRR yolu tetiklenmedi: " + log[:600]
@@ -71,7 +71,7 @@ TLS12 = [("secp521r1", "firefox_160"), ("secp521r1", "firefox_133"), ("X448", "t
 def test_tls12_ecdhe_grup(env, request, group, profile, mode):
     with _grup_sunucusu(env, group, "-tls1_2", "-cipher", "ECDHE-ECDSA-AES128-GCM-SHA256") as s:
         r = _get(mode, s.port, env.ca_path, profile=_profil(request, profile))
-        log = "".join(s.log)
+        log = s.wait_count("ServerKeyExchange", 1)
     assert r.status_code == 200 and r.content == b"merhaba interop"
     assert "ServerKeyExchange" in log and log.count("ClientHello") == 1
 

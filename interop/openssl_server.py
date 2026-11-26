@@ -162,6 +162,19 @@ class SServer:
             time.sleep(0.02)
         raise TimeoutError(f"s_server çıktısında {needle!r} yok: {''.join(self.log)[-800:]}")
 
+    def wait_count(self, needle: str, n: int, timeout=10.0) -> str:
+        """Çıktıda ``needle`` en az ``n`` kez görünene (ya da süre dolana) kadar bekler; tüm
+        çıktıyı döner. ``-msg`` satırları pompa iş parçacığıyla eşzamansız gelir: istemci yanıtı
+        aldığı anda okunan günlük, sunucunun o el sıkışmaya ait satırlarını henüz içermeyebilir
+        (yüklü makinede/paralel koşuda aralıklı düşen denetimler)."""
+        end = time.time() + timeout
+        while time.time() < end:
+            log = "".join(self.log)
+            if log.count(needle) >= n:
+                return log
+            time.sleep(0.02)
+        return "".join(self.log)
+
     def close(self):
         if self.proc is None:
             return
