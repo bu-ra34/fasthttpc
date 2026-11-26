@@ -246,7 +246,11 @@ class DigestAuth(Auth):
             ha1 = h(f"{ha1}:{ch.nonce}:{cnonce}".encode())
         a2 = f"{request.method}:{uri}"
         if ch.qop == "auth-int":
-            a2 += ":" + h(request.body or b"")
+            # Gövde özeti: akış gövdesi (dosya) belleğe alınır; tükenmiş üreteç
+            # UnrewindableBodyError verir (yanlış özetle gönderilmez).
+            stream = getattr(request, "stream", None)
+            body = stream.read() if stream is not None else request.body
+            a2 += ":" + h(body or b"")
         ha2 = h(a2.encode("latin-1", "replace"))
         if ch.qop:
             response = h(f"{ha1}:{ch.nonce}:{nc}:{cnonce}:{ch.qop}:{ha2}".encode())

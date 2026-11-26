@@ -11,6 +11,7 @@ from http.cookies import SimpleCookie
 from typing import TYPE_CHECKING, Any, Callable, Mapping, Optional, TypeAlias, Union
 from urllib.parse import unquote, urlencode, urlsplit
 
+from ._body import StreamingBody
 from .config import Timeout
 from .multipart import encode_multipart
 
@@ -131,12 +132,62 @@ def _has(headers: "dict[str, Any]", name: str) -> bool:
     return any(k.lower() == name for k in headers)
 
 
-def encode_body(data: Any, json: Any, files: Any, headers: "dict[str, Any]") -> bytes:
-    """``data/json/files`` -> bayt gövde; gerekirse Content-Type ``headers``'a eklenir."""
+# ``data=``/``json=``/``files=`` kodlanmış gövdesi: bellekte bayt ya da akış (bkz. _body).
+Body: TypeAlias = Union[bytes, StreamingBody]
+
+_ACCEPTED_DATA = (
+    "Kabul edilenler: bytes/bytearray/memoryview (olduğu gibi), str (UTF-8), dict ya da "
+    "(anahtar, değer) çiftlerinden oluşan list/tuple (form, urlencoded), dosya benzeri nesne "
+    "(.read(); akıtılır) ve bytes/str üreten iterable/üreteç (akıtılır; AsyncSession'da "
+    "async iterable da).")
+
+
+def _header(headers: "dict[str, Any]", name: str) -> Optional[str]:
+    for k, v in headers.items():
+        if k.lower() == name and v is not None:
+            return str(v)
+    return None
+
+
+def _form_pairs(data: "list[Any] | tuple[Any, ...]", what: str) -> "list[tuple[Any, Any]]":
+    """``(anahtar, değer)`` çiftleri listesi (requests gibi); çift olmayan öğe -> TypeError."""
+    pairs: list[tuple[Any, Any]] = []
+    for item in data:
+        if (isinstance(item, (str, bytes, bytearray, memoryview))
+                or not isinstance(item, (tuple, list)) or len(item) != 2):
+            raise TypeError(
+                f"{what} list/tuple olarak verildiğinde yalnızca (anahtar, değer) çiftleri "
+                f"içerebilir (form verisi; requests ile aynı), {type(item).__name__} öğesi geldi. "
+                "Bayt parçalarını akıtmak için bir üreteç ya da iter(liste), tek gövde için "
+                "b\"\".join(liste) verin.")
+        pairs.append((item[0], item[1]))
+    return pairs
+
+
+def _multipart_fields(data: Any) -> "Mapping[str, Any] | list[tuple[Any, Any]] | None":
+    if data is None:
+        return None
+    if isinstance(data, Mapping):
+        return data
+    if isinstance(data, (list, tuple)):
+        return _form_pairs(data, "files= ile birlikte data=")
+    raise TypeError(
+        "files= ile birlikte data= yalnızca dict ya da (anahtar, değer) çiftleri olabilir "
+        f"(multipart form alanları), {type(data).__name__} geldi.")
+
+
+def encode_body(data: Any, json: Any, files: Any, headers: "dict[str, Any]",
+                *, allow_async: bool = False) -> Body:
+    """``data/json/files`` -> gövde; gerekirse Content-Type ``headers``'a eklenir.
+
+    Bellekte bayt ya da akış (:class:`~fasthttpc._body.StreamingBody`: dosya nesnesi,
+    iterable; ``allow_async`` iken async iterable) döner. Tanınmayan tür ``TypeError``
+    verir (eskiden sessizce BOŞ gövde gönderiliyordu). Akış için ``headers``'taki
+    kullanıcı ``Transfer-Encoding: chunked``'ı chunked'ı, uzunluğu bilinmeyen akışta
+    kullanıcının ``Content-Length``'i bildirilen uzunluğu belirler."""
     import json as jsonlib
     if files is not None:
-        body, ct = encode_multipart(fields=data if isinstance(data, dict) else None,
-                                    files=files)
+        body, ct = encode_multipart(fields=_multipart_fields(data), files=files)
         if not _has(headers, "content-type"):
             headers["Content-Type"] = ct
         return body
@@ -144,15 +195,75 @@ def encode_body(data: Any, json: Any, files: Any, headers: "dict[str, Any]") -> 
         if not _has(headers, "content-type"):
             headers["Content-Type"] = "application/json"
         return jsonlib.dumps(json).encode("utf-8")
-    if isinstance(data, (dict, list, tuple)):
-        if not _has(headers, "content-type"):
-            headers["Content-Type"] = "application/x-www-form-urlencoded"
-        return urlencode(data, doseq=True).encode("ascii")
+    if data is None:
+        return b""
+    if isinstance(data, StreamingBody):
+        return data
+    if isinstance(data, bytes):
+        return data
+    if isinstance(data, (bytearray, memoryview)):
+        return bytes(data)
     if isinstance(data, str):
         return data.encode("utf-8")
-    if isinstance(data, (bytes, bytearray)):
-        return bytes(data)
-    return b""
+    if hasattr(data, "read"):
+        return _stream_framing(StreamingBody.from_file(data), headers)
+    if isinstance(data, (Mapping, list, tuple)):
+        if not _has(headers, "content-type"):
+            headers["Content-Type"] = "application/x-www-form-urlencoded"
+        form = data if isinstance(data, Mapping) else _form_pairs(data, "data=")
+        return urlencode(form, doseq=True).encode("ascii")
+    try:
+        return memoryview(data).tobytes()       # tampon protokolü (array.array, mmap...)
+    except TypeError:
+        pass
+    if hasattr(data, "__aiter__"):
+        if not allow_async:
+            raise TypeError("data= async iterable yalnızca AsyncSession ile kullanılabilir; "
+                            "Session için senkron bir iterable/üreteç verin.")
+        return _stream_framing(StreamingBody.from_async_iterable(data), headers)
+    if hasattr(data, "__iter__"):
+        return _stream_framing(StreamingBody.from_iterable(data), headers)
+    raise TypeError(f"data= için desteklenmeyen tür: {type(data).__name__}. {_ACCEPTED_DATA}")
+
+
+def _stream_framing(sb: StreamingBody, headers: "dict[str, Any]") -> StreamingBody:
+    te = _header(headers, "transfer-encoding")
+    cl = _header(headers, "content-length")
+    if te is not None and "chunked" in te.lower():
+        sb.length = None                          # kullanıcı chunked istedi
+    elif sb.length is None and cl is not None:
+        if not cl.strip().isdigit():
+            raise ValueError(f"Geçersiz Content-Length başlığı: {cl!r}")
+        sb.length = int(cl)                       # bilinen toplam uzunluk (chunked'sız)
+    return sb
+
+
+def request_body(req: "Request") -> Body:
+    """Request nesnesinin gönderilecek gövdesi (akış varsa akış)."""
+    return req.stream if req.stream is not None else req.body
+
+
+def body_replayable(body: Any) -> bool:
+    """Gövde (yeniden) gönderilebilir mi? Bayt her zaman; akış yalnızca başa sarılabiliyorsa."""
+    return not isinstance(body, StreamingBody) or body.replayable
+
+
+def not_replayed(err: BaseException) -> None:
+    """Yeniden denenmeyen hataya açıklama ekler (Python 3.11+ ``add_note``)."""
+    add_note = getattr(err, "add_note", None)
+    if add_note is not None:
+        add_note("fasthttpc: akış gövdesi (data= üreteç/iterator) başa sarılamadığından "
+                 "istek yeniden denenmedi.")
+
+
+UNREWINDABLE_REDIRECT = (
+    "{status} yönlendirmesi gövdenin yeniden gönderilmesini gerektiriyor ama data= ile verilen "
+    "akış (üreteç/iterator ya da konumu bilinmeyen dosya) başa sarılamıyor. Seek edilebilir bir "
+    "dosya ya da bytes verin veya allow_redirects=False ile yönlendirmeyi kendiniz izleyin.")
+UNREWINDABLE_AUTH = (
+    "Kimlik doğrulama challenge'ı (ör. Digest 401) isteğin gövdeyle yeniden gönderilmesini "
+    "gerektiriyor ama data= ile verilen akış (üreteç/iterator) başa sarılamıyor. Seek edilebilir "
+    "bir dosya ya da bytes verin ya da önce gövdesiz bir istekle challenge'ı alın.")
 
 
 # --- çerezler -------------------------------------------------------------------
@@ -275,7 +386,7 @@ REDIRECT_STATUSES = (301, 302, 303, 307, 308)
 
 
 def next_request(resp: "Response", method: str, current_url: object,
-                 headers: "dict[str, Any] | None", body: bytes) -> "Request | None":
+                 headers: "dict[str, Any] | None", body: Body) -> "Request | None":
     """``allow_redirects=False`` iken ``r.next``: izlenecek yönlendirme isteği (ya da None)."""
     from .models.request import Request
     from .models.urls import URL
@@ -292,7 +403,8 @@ def next_request(resp: "Response", method: str, current_url: object,
                 if k.lower() not in ("authorization", "cookie", "proxy-authorization")}
     if resp.status_code in (301, 302, 303):
         method, body = "GET", b""
-        hdrs = {k: v for k, v in hdrs.items() if k.lower() not in ("content-type", "content-length")}
+        hdrs = {k: v for k, v in hdrs.items()
+                if k.lower() not in ("content-type", "content-length", "transfer-encoding")}
     return Request(method, target, headers=hdrs, data=body or None)
 
 

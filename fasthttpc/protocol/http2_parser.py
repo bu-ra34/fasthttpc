@@ -1560,26 +1560,46 @@ class Http2Connection:
                 except OSError:
                     pass
 
-    def _send_data(self, stream_id: int, body: bytes) -> None:
-        if not body:
-            frame = HTTP2Frame(0, FrameType.DATA, FrameFlags.END_STREAM, stream_id, b"")
-            self.sock.send_record(frame.serialize())
-            return
+    def _send_data(self, stream_id: int, body: "bytes | Iterable[bytes]") -> None:
+        """Gövdeyi DATA frame'leriyle gönderir; END_STREAM SON frame'dedir.
 
-        max_frame = self._peer_settings.get("max_frame_size", 16384)
-        offset = 0
-        while offset < len(body):
-            chunk = body[offset: offset + max_frame]
-            self._await_window(stream_id, len(chunk))
+        ``body``: bayt ya da bayt parçaları üreten iterable (akış gövdesi; belleğe
+        alınmaz). Frame'ler ``max_frame_size``'ı ve bağlantı + stream gönderim pencerelerini
+        aşmaz (pencere kapalıysa WINDOW_UPDATE beklenir, bkz. :meth:`_await_window`). Son
+        frame'in hangisi olduğu ancak kaynak bitince bilindiğinden bir parça geride
+        tutulur. Her frame gönderimi soket sarmalayıcısının ``io``'suyla (``Timeout.write``,
+        kalan ``total``) sınırlıdır."""
+        parts: "Iterable[bytes]" = (body,) if isinstance(body, (bytes, bytearray, memoryview)) else body
+        pending: "Optional[memoryview]" = None
+        for chunk in parts:
+            if not chunk:
+                continue
+            max_frame = self._peer_settings.get("max_frame_size", 16384)
+            mv = memoryview(chunk)
+            for off in range(0, len(mv), max_frame):
+                if pending is not None:
+                    self._send_data_frame(stream_id, pending, end_stream=False)
+                pending = mv[off:off + max_frame]
+        self._send_data_frame(stream_id, pending if pending is not None else memoryview(b""),
+                              end_stream=True)
 
-            offset += len(chunk)
-            is_last = offset >= len(body)
-            flags = FrameFlags.END_STREAM if is_last else 0
-            frame = HTTP2Frame(len(chunk), FrameType.DATA, flags, stream_id, chunk)
-            self.sock.send_record(frame.serialize())
-
-            self._conn_window_send -= len(chunk)
-            self._stream_windows[stream_id] -= len(chunk)
+    def _send_data_frame(self, stream_id: int, data: memoryview, end_stream: bool) -> None:
+        """En çok bir frame'lik veri; pencere yetmiyorsa pencereye sığan parçalara bölünür."""
+        off, n = 0, len(data)
+        while True:
+            take = n - off
+            if take:
+                self._await_window(stream_id, 1)
+                take = min(take, self._conn_window_send, self._stream_windows.get(stream_id, 0))
+            last = off + take >= n
+            flags = FrameFlags.END_STREAM if (end_stream and last) else 0
+            self.sock.send_record(_frame_bytes(FrameType.DATA, flags, stream_id,
+                                               data[off:off + take].tobytes()))
+            self._conn_window_send -= take
+            self._stream_windows[stream_id] -= take
+            off += take
+            if last:
+                return
 
     def request_stream(
         self,
@@ -1587,11 +1607,14 @@ class Http2Connection:
         authority: str,
         path: str,
         headers: list[tuple[str, str]],
-        body: bytes = b"",
+        body: "bytes | Iterable[bytes]" = b"",
         scheme: str = "https",
     ) -> "H2ClientStream":
         """İsteği gönderir, yanıt BAŞLIKLARI gelene kadar bekler ve gövdeyi isteğe
         bağlı (parça parça) okuyan bir :class:`H2ClientStream` döner.
+
+        ``body`` bayt ya da bayt parçaları üreten iterable olabilir (akış gövdesi:
+        DATA frame'leriyle parça parça gönderilir, bkz. :meth:`_send_data`).
 
         Bağlantı, akış bitene/``close()`` edilene kadar bu akışa aittir (kilit
         tutulur): bu minimal istemcide aynı anda tek stream vardır. Geri basınç:
@@ -1613,8 +1636,9 @@ class Http2Connection:
             if self.debug:
                 self._dbg(f"giden headers: {full_headers}")
 
-            self._send_headers(stream_id, full_headers, end_stream=(len(body) == 0))
-            if body:
+            in_memory = isinstance(body, (bytes, bytearray, memoryview))
+            self._send_headers(stream_id, full_headers, end_stream=in_memory and not body)
+            if not in_memory or body:
                 self._send_data(stream_id, body)
 
             st = H2ClientStream(self, stream_id)
@@ -1633,7 +1657,7 @@ class Http2Connection:
         authority: str,
         path: str,
         headers: list[tuple[str, str]],
-        body: bytes = b"",
+        body: "bytes | Iterable[bytes]" = b"",
         scheme: str = "https",
     ) -> tuple[int, list[tuple[str, str]], bytes]:
         """

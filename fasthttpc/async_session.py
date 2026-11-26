@@ -13,8 +13,9 @@ import warnings
 from . import _backend as B
 from ._log import get_logger
 from . import _api
-from ._api import (USE_CLIENT_DEFAULT, AuthArg, CookiesArg, HeaderDict, HeadersArg, ParamsArg,
-                   TimeoutArg)
+from ._api import (USE_CLIENT_DEFAULT, AuthArg, Body, CookiesArg, HeaderDict, HeadersArg,
+                   ParamsArg, TimeoutArg)
+from ._body import StreamingBody, UnrewindableBodyError
 from .auth import resolve_auth, netrc_credentials, BasicAuth
 
 logger = get_logger("async")
@@ -795,9 +796,17 @@ class AsyncSession:
         return _Opened(reader, writer, alpn, release, key=key,
                        loop=B.current_token(), forward_proxy=fwd)
 
-    async def _h1_finish(self, o: "_Opened", reusable: bool) -> None:
-        """İstek bitti: bağlantıyı havuza koyar ya da kapatır; slot HER durumda geri verilir."""
+    async def _h1_finish(self, o: "_Opened", reusable: bool, abort: bool = False) -> None:
+        """İstek bitti: bağlantıyı havuza koyar ya da kapatır; slot HER durumda geri verilir.
+
+        ``abort``: istek hata ile kesildi (ör. ``Timeout.write`` aşıldı): gönderilmemiş
+        veri beklenmeden bağlantı koparılır (yoksa ``wait_closed`` okumayan sunucuda takılır)."""
         try:
+            if abort and not reusable:
+                inner = getattr(o.writer, "writer", o.writer)    # AsyncTLSStream -> StreamWriter
+                transport = getattr(inner, "transport", None)
+                if transport is not None:
+                    transport.abort()
             if reusable:
                 self._idle_purge()
                 o.last_used = time.perf_counter()
@@ -854,7 +863,7 @@ class AsyncSession:
         return conn
 
     async def _timed_exchange(self, method: str, u: URL, proxy: Optional[ProxyConfig],
-                              req_headers: "dict[str, str]", raw_body: bytes,
+                              req_headers: "dict[str, str]", raw_body: Body,
                               metrics: Optional[RequestMetrics], stream: bool = False) -> _ExchangeResult:
         """:meth:`_exchange` + ``Timeout.total`` (istek başına toplam süre sınırı).
 
@@ -886,7 +895,7 @@ class AsyncSession:
                 f"İstek toplam süre sınırını (Timeout.total={total} sn) aştı.") from None
 
     async def _exchange(self, method: str, u: URL, proxy: Optional[ProxyConfig],
-                        req_headers: "dict[str, str]", raw_body: bytes,
+                        req_headers: "dict[str, str]", raw_body: Body,
                         metrics: Optional[RequestMetrics], stream: bool = False) -> _ExchangeResult:
         """Bağlantıyı bulur/kurar ve isteği h2 veya HTTP/1.1 ile yapar.
 
@@ -897,7 +906,8 @@ class AsyncSession:
         check_request_line(method, u.raw_path.decode("latin-1"))
         for k, v in req_headers.items():
             check_header_field(k, str(v))
-        if self._h3 is not None and u.scheme == "https":     # h3 yalnızca https
+        if (self._h3 is not None and u.scheme == "https"     # h3 yalnızca https
+                and not isinstance(raw_body, StreamingBody)):  # akış: _raw_request belleğe aldı
             if proxy is not None or self._rotator is not None:
                 if self._h3.state.force:
                     raise ConnectionError("http3='force' bir HTTP proxy ile kullanılamaz (UDP).")
@@ -942,7 +952,7 @@ class AsyncSession:
                     return await self._h2_exchange(conn, method, u, req_headers, raw_body, metrics,
                                                    stream=stream)
                 except H2StreamRefused as e:
-                    if attempt == 0:
+                    if attempt == 0 and _api.body_replayable(raw_body):
                         logger.debug("h2 stream işlenmedi, yeni bağlantıda yeniden: %s", e)
                         continue
                     raise ConnectionError(f"HTTP/2 isteği başarısız: {e}") from e
@@ -953,6 +963,10 @@ class AsyncSession:
             except _StaleConn as st:
                 # Havuzdaki bağlantı sunucu tarafında kapanmıştı ve yanıttan HİÇ bayt
                 # gelmedi: bir kez, taze bağlantıyla yeniden dene (zaman aşımı hariç).
+                # Başa sarılamayan akış gövdesi yeniden gönderilmez (boş/yarım gitmez).
+                if not _api.body_replayable(raw_body):
+                    _api.not_replayed(st.cause)
+                    raise st.cause from None
                 logger.debug("Bayat bağlantı, yeniden deneniyor (%s)", st.cause)
                 opened = await self._open(u, proxy, metrics, reuse=False)
                 if opened.alpn == "h2":     # pragma: no cover - h1 olarak bilinen kaynak
@@ -968,22 +982,24 @@ class AsyncSession:
                           "transfer-encoding", "upgrade"})
 
     async def _h2_exchange(self, conn: AsyncHttp2Connection, method: str, u: URL,
-                           req_headers: "dict[str, str]", raw_body: bytes,
+                           req_headers: "dict[str, str]", raw_body: Body,
                            metrics: Optional[RequestMetrics], stream: bool = False) -> _ExchangeResult:
         h2_headers = [(k.lower(), str(v)) for k, v in req_headers.items()
                       if k.lower() not in self._H2_SKIP]
         host = f"[{u.host}]" if ":" in u.host else u.host
         authority = host if u.port == 443 else f"{host}:{u.port}"
         if metrics:
-            metrics.bytes_sent = len(raw_body) + sum(len(k) + len(v) for k, v in h2_headers)
+            metrics.bytes_sent = sum(len(k) + len(v) for k, v in h2_headers) + (
+                0 if isinstance(raw_body, StreamingBody) else len(raw_body))
         send_time = time.perf_counter()
+        h2_body = raw_body.aiter_chunks() if isinstance(raw_body, StreamingBody) else raw_body
         # Bu İSTEĞİN süreleri: bağlantı yeniden kullanılıyorsa onu açan isteğin
         # süreleri (ör. timeout=None -> sınırsız) burada geçerli DEĞİLDİR.
         tmo = self._tmo()
         try:
             if stream:
                 h = await conn.request_stream(method, authority, u.raw_path.decode("latin-1"),
-                                              h2_headers, raw_body,
+                                              h2_headers, h2_body,
                                               read_timeout=tmo.read, write_timeout=tmo.write)
                 if metrics:
                     metrics.first_byte_time = h.first_byte_time or time.perf_counter()
@@ -992,13 +1008,15 @@ class AsyncSession:
                     headers.add(k, v)
                 return h.status, headers, _AsyncH2Stream(h), send_time, "HTTP/2"
             r = await conn.request(method, authority, u.raw_path.decode("latin-1"),
-                                   h2_headers, raw_body,
+                                   h2_headers, h2_body,
                                    read_timeout=tmo.read, write_timeout=tmo.write)
         except H2StreamRefused:
             raise
         except (Http2StreamError, Http2ConnectionError) as e:
             raise ConnectionError(f"HTTP/2 isteği başarısız: {e}") from e
         if metrics:
+            if isinstance(raw_body, StreamingBody):
+                metrics.bytes_sent += raw_body.sent
             metrics.first_byte_time = r.first_byte_time or time.perf_counter()
         headers = Headers()
         for k, v in r.headers:
@@ -1151,8 +1169,32 @@ class AsyncSession:
                 return
             yield c
 
+    async def _send_h1_stream(self, writer: Any, head: bytes, body: StreamingBody,
+                              chunked: bool) -> int:
+        """HTTP/1.1 istek başlığı + akış gövdesi (chunked ya da Content-Length); her
+        parçadan sonra ``drain`` ``Timeout.write`` ile sınırlıdır. Gönderilen bayt sayısı."""
+        write_to = self._tmo().write
+        writer.write(head)
+        await B.wait_for(writer.drain(), write_to)
+        sent = len(head)
+        chunks = body.aiter_chunks()
+        try:
+            async for chunk in chunks:
+                if chunked:
+                    chunk = b"".join((b"%x\r\n" % len(chunk), chunk, b"\r\n"))
+                writer.write(chunk)
+                await B.wait_for(writer.drain(), write_to)
+                sent += len(chunk)
+        finally:
+            await chunks.aclose()
+        if chunked:
+            writer.write(b"0\r\n\r\n")
+            await B.wait_for(writer.drain(), write_to)
+            sent += 5
+        return sent
+
     async def _h1_exchange(self, opened: "_Opened", method: str, u: URL,
-                           req_headers: "dict[str, str]", raw_body: bytes,
+                           req_headers: "dict[str, str]", raw_body: Body,
                            metrics: Optional[RequestMetrics], stream: bool = False) -> _ExchangeResult:
         """Bağlantıda tek HTTP/1.1 isteği. Bağlantı yeniden kullanılabilirse havuza
         döner; aksi halde (Connection: close, HTTP/1.0, eof çerçeveli gövde, hata,
@@ -1161,6 +1203,7 @@ class AsyncSession:
         read_to = self._tmo().read
         reusable = False
         finished = False
+        failed = False           # istek yarıda kaldı: bağlantı tamponu boşaltılmadan kesilir
         got_bytes = False        # yanıttan en az 1 bayt geldi mi (yeniden deneme güvenliği)
         try:
             target = u.raw_path.decode()
@@ -1175,12 +1218,20 @@ class AsyncSession:
             for k, v in pairs:
                 req_line += f"{k}: {v}\r\n"
             req_line += "\r\n"
-            raw_request = req_line.encode("ascii") + (raw_body or b"")
-            if metrics:
-                metrics.bytes_sent = len(raw_request)
+            if isinstance(raw_body, StreamingBody):
+                chunked = any(k.lower() == "transfer-encoding" and "chunked" in str(v).lower()
+                              for k, v in req_headers.items())
+                n_sent = await self._send_h1_stream(writer, req_line.encode("ascii"),
+                                                    raw_body, chunked)
+                if metrics:
+                    metrics.bytes_sent = n_sent
+            else:
+                raw_request = req_line.encode("ascii") + (raw_body or b"")
+                if metrics:
+                    metrics.bytes_sent = len(raw_request)
 
-            writer.write(raw_request)
-            await B.wait_for(writer.drain(), self._tmo().write)
+                writer.write(raw_request)
+                await B.wait_for(writer.drain(), self._tmo().write)
             send_time = time.perf_counter()
 
             hdr_acc = bytearray()
@@ -1256,6 +1307,7 @@ class AsyncSession:
             )
             return status_code, resp_headers, bytes(body_raw), send_time, "HTTP/1.1"
         except BaseException as e:
+            failed = True
             if (opened.reused and not got_bytes
                     and isinstance(e, (ConnectionError, OSError))
                     and not isinstance(e, (TimeoutError, asyncio.TimeoutError))):
@@ -1266,14 +1318,14 @@ class AsyncSession:
             raise
         finally:
             if not finished:
-                await self._h1_finish(opened, reusable)
+                await self._h1_finish(opened, reusable, abort=failed)
 
     async def _raw_request(
         self,
         method:  str,
         url:     str,
         headers: Optional[HeaderDict] = None,
-        body:    bytes           = b"",
+        body:    Body            = b"",
         metrics: Optional[RequestMetrics] = None,
         stream:  bool            = False,
     ) -> Response:
@@ -1306,8 +1358,20 @@ class AsyncSession:
                 cond = self._cache.build_conditional_headers(cache_entry)
                 req_headers.update(cond)
 
-        raw_body: bytes = req_dict.get("body", b"")
-        if raw_body:
+        raw_body: Body = req_dict.get("body") or b""
+        if isinstance(raw_body, StreamingBody) and self._h3_may_try(u, proxy_cfg):
+            # HTTP/3: akış gövdesi belleğe alınır (aioquic gönderimi zaten tamponlar; h3
+            # denemesi h2/h1'e düşebilir ya da yeni bağlantıda yinelenebilir).
+            raw_body = await raw_body.aread()
+        if isinstance(raw_body, StreamingBody):
+            # Çerçeve: uzunluk biliniyorsa Content-Length, yoksa chunked (h2'de başlık düşer).
+            req_headers = {k: v for k, v in req_headers.items()
+                           if k.lower() not in ("content-length", "transfer-encoding")}
+            if raw_body.length is not None:
+                req_headers["Content-Length"] = str(raw_body.length)
+            else:
+                req_headers["Transfer-Encoding"] = "chunked"
+        elif raw_body:
             req_headers["Content-Length"] = str(len(raw_body))
 
         if metrics:
@@ -1371,8 +1435,14 @@ class AsyncSession:
                                                                                 
     # --- Faz 5 kancaları: transport + retry -------------------------------
 
+    def _h3_may_try(self, u: URL, proxy: Optional[ProxyConfig]) -> bool:
+        """Bu istek için HTTP/3 denenecek mi (h3 açık, https, proxy yok, hedef biliniyor)?"""
+        h3 = self._h3
+        return (h3 is not None and u.scheme == "https" and proxy is None and self._rotator is None
+                and h3.state.target_for(u.host, u.port) is not None)
+
     async def _send(self, method: str, url: str, headers: Optional[HeaderDict] = None,
-                    body: bytes = b"", metrics: Optional[RequestMetrics] = None,
+                    body: Body = b"", metrics: Optional[RequestMetrics] = None,
                     stream: bool = False) -> Response:
         """Tek isteği transport'a (verilmişse) ya da ağa gönderir."""
         if self.transport is None:
@@ -1408,16 +1478,24 @@ class AsyncSession:
         """``self.retries`` politikasına göre ``_send``'i tekrarlar."""
         retry = self.retries
         attempt = 0
+        body = kwargs.get("body")
         while True:
             try:
                 resp = await self._send(method, url, **kwargs)
             except Exception as e:
                 if not retry.should_retry_error(method, e, attempt):
                     raise
+                if not _api.body_replayable(body):
+                    _api.not_replayed(e)      # akış gövdesi tükendi: boş/yarım gövde gitmez
+                    raise
                 attempt += 1
                 delay = retry.get_delay(attempt)
             else:
                 if not retry.should_retry_status(method, resp.status_code, attempt):
+                    return resp
+                if not _api.body_replayable(body):
+                    logger.debug("HTTP %s: akış gövdesi başa sarılamıyor, yeniden denenmiyor",
+                                 resp.status_code)
                     return resp
                 attempt += 1
                 delay = retry.get_delay(attempt, resp)
@@ -1458,7 +1536,7 @@ class AsyncSession:
         return arg
 
     async def _hop(self, auth: "Auth | None", method: str, url: str, headers: HeaderDict,
-                   body: bytes, metrics: RequestMetrics, req_hooks: "_api.HookMap",
+                   body: Body, metrics: RequestMetrics, req_hooks: "_api.HookMap",
                    hkw: "dict[str, Any]", stream: bool = False) -> "tuple[Response, list[Response]]":
         """Tek yönlendirme adımı: auth akışı (401 yeniden denemesi dahil) + hook'lar.
 
@@ -1484,7 +1562,8 @@ class AsyncSession:
             h.update({k: None for k in removed if k.lower() not in lower})
             target = url if req.url is base.url else str(req.url)
             resp = await self._send_with_retries(req.method, target, headers=h,
-                                           body=req.body or b"", metrics=metrics, stream=stream)
+                                                 body=_api.request_body(req), metrics=metrics,
+                                                 stream=stream)
             resp = await self._call_hooks("response", resp, req_hooks, **hkw)
             if flow is None:
                 return resp, extras
@@ -1495,6 +1574,8 @@ class AsyncSession:
             if stream:
                 await _discard_stream(resp)     # 401 ara yanıtı: bağlantı havuza dönsün
             extras.append(resp)
+            if not _api.body_replayable(_api.request_body(req)):
+                raise UnrewindableBodyError(_api.UNREWINDABLE_AUTH)
 
     async def request(
         self,
@@ -1528,7 +1609,7 @@ class AsyncSession:
         history: list[Response] = []
         metrics = RequestMetrics(request_start=time.perf_counter())
         merged = self._merged_headers(headers)
-        body = _api.encode_body(data, json, files, merged)
+        body = _api.encode_body(data, json, files, merged, allow_async=True)
         req_hooks = _api.normalize_hooks(hooks)
         req_cookies = _api.parse_cookie_arg(cookies)
         tmo = _api.resolve_timeout(timeout, self.timeout)
@@ -1560,8 +1641,8 @@ class AsyncSession:
                         if plugin.should_retry(resp, attempt):
                             delay = plugin.delay_for(resp, attempt)
                             break
-                    if delay is None:
-                        break
+                    if delay is None or not _api.body_replayable(body):
+                        break         # akış gövdesi başa sarılamıyorsa yeniden denenmez
                     await resp.aclose()      # tekrar denenecek yanıt (akışsa bağlantıyı bırak)
                     if delay:
                         await B.sleep(delay)
@@ -1603,7 +1684,12 @@ class AsyncSession:
                     method = "GET"
                     body   = b""
                     merged = {k: v for k, v in merged.items()
-                              if k.lower() not in ("content-type", "content-length")}
+                              if k.lower() not in ("content-type", "content-length",
+                                                   "transfer-encoding")}
+                elif not _api.body_replayable(body):
+                    # 307/308: gövde AYNEN yeniden gönderilmeli; tükenmiş üreteç boş/yarım gider.
+                    raise UnrewindableBodyError(
+                        _api.UNREWINDABLE_REDIRECT.format(status=resp.status_code))
 
                 redirect_count += 1
                 logger.debug("Yönlendirme (%s) -> %s", resp.status_code, current_url)

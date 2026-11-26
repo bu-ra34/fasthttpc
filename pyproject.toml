@@ -128,4 +128,5 @@ files = [
     "fasthttpc/transport/mock.py",
     "fasthttpc/transport/iotimeout.py",
     "fasthttpc/multipart.py",
+    "fasthttpc/_body.py",
 ]

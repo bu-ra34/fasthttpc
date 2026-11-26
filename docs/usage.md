@@ -18,6 +18,90 @@ generic `request(method, url, ...)`. Redirects are followed by default
 (`allow_redirects=False` to disable; `max_redirects=` on the session) and the
 chain is in `r.history`.
 
+### Request bodies: `data=`, `json=`, `files=`
+
+`data=` accepts the same kinds of values in `Session` and `AsyncSession`:
+
+| `data=` | Sent as |
+|---|---|
+| `bytes`, `bytearray`, `memoryview` (any bytes-like object) | the bytes as they are, `Content-Length` |
+| `str` | UTF-8 encoded, `Content-Length` |
+| `dict`, or a `list`/`tuple` of `(key, value)` pairs | form data (`application/x-www-form-urlencoded`) |
+| file-like object (anything with `.read()`) | **streamed** from its current position, not read into memory |
+| iterable or generator of `bytes`/`str` chunks | **streamed** with `Transfer-Encoding: chunked` |
+| async iterable / async generator (`AsyncSession` only) | **streamed** with `Transfer-Encoding: chunked` |
+
+Any other type raises `TypeError`. A `list`/`tuple` is always form data, as in
+requests. If one of its items is not a `(key, value)` pair, for example a list of
+`bytes` chunks, you get a `TypeError`. To stream such a list pass `iter(chunks)`,
+or pass `b"".join(chunks)` to send it as one body. `json=` is serialised to UTF-8
+JSON. With `files=`, `data=` must be a dict or a list of pairs (multipart form
+fields).
+
+```python
+with Session() as s, open("backup.tar", "rb") as f:
+    s.put("https://example.com/upload", data=f)          # Content-Length from the file size
+
+def rows():
+    for row in produce_rows():
+        yield row.encode() + b"\n"
+
+with Session() as s:
+    s.post("https://example.com/ingest", data=rows())    # chunked
+```
+
+How streaming works:
+
+- **Length.** For a file, the length is taken from `os.fstat()` (regular files)
+  or `seek`/`tell`. It is counted from the current position to the end of the
+  file and sent as `Content-Length`. Exactly that many bytes are sent: if the file
+  grows during the upload the extra bytes are not read, and if it shrinks the
+  request fails with `ValueError` and the connection is closed. Pipes, sockets
+  and generators have no known length and are sent chunked. To send such a
+  stream without chunked encoding (some servers refuse it), set the
+  `Content-Length` header yourself. The stream must then produce exactly that
+  many bytes, or the request fails with `ValueError`.
+- **Text.** A text-mode file (`open(path)`, `io.StringIO`) and `str` chunks are
+  encoded as UTF-8. Their byte length is not known in advance, so a text-mode
+  file is always sent chunked. Open the file in binary mode (`"rb"`) to get
+  `Content-Length`.
+- **Empty chunks** from an iterable are skipped. They do not end the chunked
+  body early.
+- **HTTP/2.** Streamed bodies go out as DATA frames that stay within the server's
+  flow-control window and maximum frame size. `END_STREAM` is set on the last
+  frame, and `content-length` is sent when the length is known.
+- **HTTP/3** (opt-in): the body is read into memory before the request. aioquic
+  buffers stream data itself, and an HTTP/3 attempt may fall back to HTTP/2 or be
+  retried on a new connection, which means sending the body again.
+- **Memory.** A file is read in 64 KiB pieces. `AsyncSession` reads real files in
+  a worker thread so the event loop is not blocked. Every piece is sent within
+  `Timeout.write`, capped by what is left of `Timeout.total`.
+
+A streamed body can only be read once. When it has to be sent again, fasthttpc
+behaves as follows:
+
+- **307/308 redirects and Digest 401 challenges.** A file whose position is
+  known (seekable) is rewound to where it started. An iterable that is not an
+  iterator (`iter(x) is not x`, for example a class whose `__iter__` returns a
+  new generator each time) is iterated again. A generator or other one-shot
+  iterator raises `fasthttpc.UnrewindableBodyError`. 301, 302 and 303
+  redirects switch to `GET` and drop the body, as before.
+- **Retries** (`retries=`/`Retry`, `RetryPlugin`, reconnecting after a stale
+  keep-alive connection or an HTTP/2 `GOAWAY`). A rewindable body is sent again
+  from the start. A consumed generator is not retried: you get the original
+  error, or the response that would have triggered the retry. An empty or
+  partial body is never sent.
+- **Reused HTTP/1.1 connections.** Before a one-shot stream is sent on an idle
+  connection from the pool, fasthttpc checks that the server has not closed it.
+
+`files=` values can be `bytes`, `str`, a file object, or a tuple
+`(filename, content[, content_type[, headers]])`, given as a dict or as a list of
+`(field, value)` pairs. File contents are read into memory, and text-mode files
+are encoded as UTF-8. A bare file object gets the last component of its `name`
+as its filename, like requests does. With `MockTransport`, a streamed request
+body is read into memory before your handler runs, so `request.content` holds
+the bytes (httpx does the same).
+
 ### Using one `Session` from many threads
 
 `Session` is thread-safe: one instance can be shared by any number of threads,
