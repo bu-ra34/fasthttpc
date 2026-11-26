@@ -111,13 +111,21 @@ def test_chunked_trailer_tuketilir_ve_baglanti_temiz_kalir(sv):
     ("GET", 304, {}, "none"),
     ("GET", 101, {}, "none"),
     ("HEAD", 200, {"content-length": "5"}, "none"),
-    ("GET", 200, {"content-length": "abc"}, "eof"),
 ])
 def test_body_framing(metot, kod, hdr, beklenen):
     h = Headers()
     for k, v in hdr.items():
         h[k] = v
     assert Session._body_framing(metot, kod, h) == beklenen
+
+
+def test_body_framing_gecersiz_content_length_hatadir():
+    # RFC 9112 §6.3 madde 5: geçersiz Content-Length kurtarılamaz çerçeveleme hatası
+    # (eskiden sessizce "kapanışa kadar oku"ya düşülüyordu; bkz. FHC-09).
+    h = Headers()
+    h["content-length"] = "abc"
+    with pytest.raises(ConnectionError, match="Content-Length"):
+        Session._body_framing("GET", 200, h)
 
 
 def test_timeout_total_damla_damla_sunucuyu_keser(sv):

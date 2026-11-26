@@ -47,8 +47,10 @@
 - HTTP/3 is experimental: it is not used through proxies or with `cert=`, is
   not used under trio (`http3=True` falls back, `"force"` raises
   `Http3ConnectError`), buffers whole response bodies, never uses resumption or
-  0-RTT, and its QUIC TLS handshake is aioquic's (no browser ClientHello). It has
-  only been tested against a local aioquic server. See [HTTP/3](features/http3.md).
+  0-RTT, and its QUIC TLS handshake is aioquic's (no browser ClientHello). Live
+  tests against public servers (Cloudflare, nginx, Google) run only weekly and
+  on demand in a separate workflow, not on every push or pull request (see
+  [Live HTTP/3 tests](testing.md#live-http3-tests)). See [HTTP/3](features/http3.md).
 
 ## Client
 
@@ -93,4 +95,4 @@ the sources. The table below lists everything known not to match the real browse
 
 - Young project with a small user base. There has been an internal security
   review ([Security review (2026-11)](security-audit.md), with open findings
-  such as no limit on decompressed body size), but no external audit.
+  such as no Public Suffix List for cookie domains), but no external audit.

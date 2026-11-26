@@ -20,14 +20,16 @@ def test_brotli_beklenmeyen_hata_yukselir(monkeypatch):
     if not http1_parser._BROTLI:
         pytest.skip("brotli yok")
 
+    # _decompress artık ortak (çıktısı sınırlı) artımlı açıcıyı kullanır: brotli'nin
+    # Decompressor'ı patlarsa beklenmeyen hata yine yutulmadan yükselmeli.
     class Patlak:
-        error = http1_parser._brotli.error
-
-        @staticmethod
-        def decompress(data):
+        def process(self, data, output_buffer_limit=None):
             raise RuntimeError("programlama hatası")
 
-    monkeypatch.setattr(http1_parser, "_brotli", Patlak)
+        def can_accept_more_data(self):
+            return True
+
+    monkeypatch.setattr(http1_parser._brotli, "Decompressor", Patlak)
     with pytest.raises(RuntimeError):
         HTTP1Parser._decompress(b"x", "br")
 
@@ -39,14 +41,17 @@ def test_akis_bozuk_gzip_ham_chunk_doner_ve_loglanir(caplog):
     assert any("açılamadı" in r.message for r in caplog.records)
 
 
-def test_akis_beklenmeyen_hata_yukselir():
-    d = StreamingDecompressor("gzip")
+def test_akis_beklenmeyen_hata_yukselir(monkeypatch):
+    from fasthttpc import streaming
 
     class Patlak:
-        def process(self, chunk):
+        def decompress(self, chunk, max_length=0):
             raise RuntimeError("beklenmeyen")
 
-    d._obj = Patlak()
+    # StreamingDecompressor artık streaming.IncrementalDecoder'ı sarar: açıcı nesnesi
+    # beklenmeyen bir hata verirse yutulmaz.
+    monkeypatch.setattr(streaming.zlib, "decompressobj", lambda *a: Patlak())
+    d = StreamingDecompressor("gzip")
     with pytest.raises(RuntimeError):
         d.decompress(b"x")
 

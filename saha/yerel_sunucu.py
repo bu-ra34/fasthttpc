@@ -28,6 +28,12 @@ Yollar (sorgu parametreleri ``?k=v``):
   /hdrflood        CRLF CRLF göndermeden ~512 KB başlık akıtır, sonra bağlantıyı açık tutar
   /chunk0x         chunked; boyut satırı ``0x5`` (gevşek int(x, 16) kabul eder, RFC reddeder)
   /chunknocrlf     chunked; chunk verisinden sonra CRLF yerine ``XX``
+  /bomb?enc=E&n=N  N sıfır baytı E ile sıkıştırır (``gzip``, ``deflate``, ``br``, ``zstd`` ya da
+                   uygulanma sırasıyla zincir: ``gzip,br``); Content-Length; keep-alive
+  /frame?c=DURUM   çerçeveleme denetimi (FHC-09): ``tecl`` (TE chunked + yanlış CL, bağlantı
+                   açık kalır), ``tegzip`` (TE gzip, chunked), ``tegzipclose`` (TE gzip, CL'siz
+                   değil kapanışla), ``teunknown``, ``techunkedgzip``, ``clsame`` (5, 5),
+                   ``cldiff``, ``clinvalid``, ``http10te``, ``tebomb`` (TE gzip, chunked; 1 MB sıfır)
 """
 from __future__ import annotations
 
@@ -40,6 +46,7 @@ import struct
 import tempfile
 import threading
 import time
+import zlib
 from urllib.parse import parse_qs, urlsplit
 
 try:  # yalnızca /br yolu kullanır
@@ -260,8 +267,81 @@ class YerelSunucu:
             h.append(f"Content-Length: {len(govde)}")
         s.sendall(("\r\n".join(h) + "\r\n\r\n").encode("latin-1") + govde)
 
+    @staticmethod
+    def _sikistir(enc: str, ham: bytes) -> bytes:
+        for e in enc.split(","):          # uygulanma sırasıyla
+            e = e.strip()
+            if e == "gzip":
+                ham = gzip.compress(ham)
+            elif e == "deflate":
+                ham = zlib.compress(ham)
+            elif e == "br":
+                ham = brotli.compress(ham)
+            elif e == "zstd":
+                ham = zstandard.ZstdCompressor().compress(ham)
+            else:
+                raise ValueError(e)
+        return ham
+
+    @staticmethod
+    def _chunked(govde: bytes, parca: int = 7) -> bytes:
+        out = b"".join(b"%x\r\n%s\r\n" % (len(govde[i:i + parca]), govde[i:i + parca])
+                       for i in range(0, len(govde), parca))
+        return out + b"0\r\n\r\n"
+
+    def _cerceve(self, s, durum: str) -> bool:
+        """/frame?c=...: RFC 9112 §6.1-6.3 kenar durumları. True -> bağlantı açık kalsın."""
+        ok = b"HTTP/1.1 200 OK\r\n"
+        if durum == "tecl":
+            # TE chunked + (yanlış) CL; bağlantı AÇIK kalır: istemci yeniden kullanmamalı
+            s.sendall(ok + b"Transfer-Encoding: chunked\r\nContent-Length: 3\r\n\r\n"
+                      + self._chunked(b"hello"))
+            return True
+        if durum == "tegzip":
+            s.sendall(ok + b"Transfer-Encoding: gzip, chunked\r\n\r\n"
+                      + self._chunked(gzip.compress(b"te-gzip-govde")))
+            return True
+        if durum == "tegzipclose":
+            s.sendall(ok + b"Transfer-Encoding: gzip\r\nContent-Length: 2\r\n\r\n"
+                      + gzip.compress(b"kapanisa-kadar"))
+            return False
+        if durum == "teunknown":
+            s.sendall(ok + b"Transfer-Encoding: compress, chunked\r\n\r\n" + self._chunked(b"x"))
+            return True
+        if durum == "techunkedgzip":
+            s.sendall(ok + b"Transfer-Encoding: chunked, gzip\r\n\r\n" + gzip.compress(b"x"))
+            return False
+        if durum == "clsame":
+            s.sendall(ok + b"Content-Length: 5\r\nContent-Length: 5, 5\r\n\r\nhello")
+            return True
+        if durum == "cldiff":
+            s.sendall(ok + b"Content-Length: 5\r\nContent-Length: 6\r\n\r\nhello!")
+            return True
+        if durum == "clinvalid":
+            s.sendall(ok + b"Content-Length: 5x\r\n\r\nhello")
+            return True
+        if durum == "http10te":
+            # HTTP/1.0 + TE: çerçeveleme bozuk sayılır, gövde kapanışa kadar (RFC 9112 §6.1)
+            s.sendall(b"HTTP/1.0 200 OK\r\nTransfer-Encoding: chunked\r\nContent-Length: 1\r\n"
+                      b"Connection: keep-alive\r\n\r\n" + self._chunked(b"ab"))
+            return False
+        if durum == "tebomb":
+            s.sendall(ok + b"Transfer-Encoding: gzip, chunked\r\n\r\n"
+                      + self._chunked(gzip.compress(bytes(1024 * 1024)), 4096))
+            return True
+        self._gonder(s, "404 Not Found", [], b"yok")
+        return True
+
     def _yanit(self, s, metot, yol, q, basliklar, govde, ilk) -> bool:
         """True → bağlantı açık kalsın."""
+        if yol == "/bomb":
+            enc = q.get("enc", "gzip")
+            z = self._sikistir(enc, bytes(int(q.get("n", str(1024 * 1024)))))
+            self._gonder(s, "200 OK", [("Content-Encoding", enc.replace(",", ", ")),
+                                       ("Content-Type", "application/octet-stream")], z)
+            return True
+        if yol == "/frame":
+            return self._cerceve(s, q.get("c", ""))
         if yol == "/id":
             i = q.get("i", "")
             ek = govde.decode("latin-1") if metot == "POST" else ""

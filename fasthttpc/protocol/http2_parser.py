@@ -12,7 +12,6 @@ from __future__ import annotations
 import collections
 import functools
 import struct
-import zlib
 import socket
 import time
 import threading
@@ -20,25 +19,10 @@ from dataclasses import dataclass
 from enum import IntEnum
 from typing import Iterable, Iterator, Optional, Generator
 
-                                        
-try:
-    import brotli as _brotli; _BROTLI = True
-except ImportError:
-    _BROTLI = False
-try:
-    import zstandard as _zstd; _ZSTD = True; _zstd_dctx = _zstd.ZstdDecompressor()
-except ImportError:
-    _ZSTD = False
-
 from .._log import get_logger
+# Content-Encoding açma tek yerde: fasthttpc.streaming (çıktısı sınırlı açıcı, FHC-07).
+from ..streaming import DEFAULT_MAX_DECOMPRESSED_SIZE, IncrementalDecoder
 logger = get_logger("http2")
-
-# Bozuk sıkıştırılmış veride beklenen hata tipleri (gerisi yukarı yükselir).
-_DECOMPRESS_ERRORS: tuple = (zlib.error, ValueError, EOFError)
-if _BROTLI:
-    _DECOMPRESS_ERRORS += (getattr(_brotli, "error", ValueError),)
-if _ZSTD:
-    _DECOMPRESS_ERRORS += (_zstd.ZstdError,)
 
 
                                                                                
@@ -2166,59 +2150,21 @@ class WebSocketConnection:
 
 class StreamingDecompressor:
     """
-    Brotli + Zstandard + gzip streaming decompress.
-    iter_content() ile chunk-by-chunk decode için.
+    Geriye dönük uyumluluk: chunk-by-chunk açıcı. Artık
+    :class:`fasthttpc.streaming.IncrementalDecoder` üzerine ince bir sarmalayıcıdır;
+    böylece Session/AsyncSession ile AYNI, çıktısı sınırlı açıcıyı kullanır (gzip,
+    deflate, br, zstd, virgüllü zincir). Toplam açılmış çıktı ``max_size``'ı aşarsa
+    :class:`~fasthttpc.streaming.DecompressedSizeError` (FHC-07).
     """
-    def __init__(self, encoding: str):
+    def __init__(self, encoding: str, max_size: Optional[int] = DEFAULT_MAX_DECOMPRESSED_SIZE):
         self._enc = encoding.lower()
-        self._obj = None
-        self._init_decompressor()
-
-    def _init_decompressor(self) -> None:
-        if "gzip" in self._enc:
-            self._obj = zlib.decompressobj(zlib.MAX_WBITS | 16)
-        elif "deflate" in self._enc:
-            self._obj = zlib.decompressobj(-zlib.MAX_WBITS)
-        elif "br" in self._enc and _BROTLI:
-            import brotli
-            self._obj = brotli.Decompressor()
-        elif "zstd" in self._enc and _ZSTD:
-            self._obj = _zstd.ZstdDecompressor().stream_reader(b"")
-        elif "br" in self._enc or "zstd" in self._enc:
-            # Açıcı kurulu değil: sıkıştırılmış veri sessizce ham geçirilmez.
-            from ..streaming import _decoder_module
-            _decoder_module("br" if "br" in self._enc else "zstd")   # MissingDecoderError
+        self._dec = IncrementalDecoder(self._enc, max_size)
 
     def decompress(self, chunk: bytes) -> bytes:
-        if not self._obj or not chunk:
-            return chunk
-        try:
-            obj_type = type(self._obj).__name__
-                                                      
-            if obj_type == "Decompress":
-                return self._obj.decompress(chunk)
-                                 
-            if hasattr(self._obj, 'process'):
-                return self._obj.process(chunk)
-                                
-            if hasattr(self._obj, 'read'):
-                import io
-                buf = io.BytesIO(chunk)
-                self._obj = _zstd.ZstdDecompressor().stream_reader(buf)
-                return self._obj.read()
-        except _DECOMPRESS_ERRORS as e:
-            logger.warning("Akış açılamadı (%s), ham chunk döndürülüyor: %s", self._enc, e)
-            return chunk
-        return chunk
+        return self._dec.decode(chunk)
 
     def flush(self) -> bytes:
-        if isinstance(self._obj, zlib.Decompress):
-            try:
-                return self._obj.flush()
-            except zlib.error as e:
-                logger.warning("Akış flush hatası (%s): %s", self._enc, e)
-                return b""
-        return b""
+        return self._dec.flush()
 
 
 def _tls_kw(session, port) -> dict:
