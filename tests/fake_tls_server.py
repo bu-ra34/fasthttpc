@@ -2,7 +2,8 @@
 Testler için minimal sahte TLS 1.3 sunucusu (ağ gerektirmez, 127.0.0.1).
 
 Yalnızca istemcinin handshake yolunu sınamak için yazıldı; gerçek bir sunucu
-DEĞİLDİR. Desteklenenler: x25519 / secp256r1 / secp384r1 key_share,
+DEĞİLDİR. Desteklenenler: fasthttpc.security.keyshare'in tüm (EC)DHE grupları
+(x25519, x448, secp256r1/384r1/521r1, ffdhe2048/3072) key_share,
 HelloRetryRequest (grup + cookie), ikinci HRR (hata testi), AES-128-GCM
 (0x1301) ve AES-256-GCM (0x1302), ECDSA-P256 CertificateVerify, Finished.
 Handshake sonrası tek bir HTTP/1.1 isteğine sabit yanıt döner.
@@ -205,8 +206,12 @@ class FakeTLS13Server:
                     pass
                 return
 
-        group = self.group if self.group is not None else next(
-            g for g in ch["key_shares"] if g in (0x001D, 0x0017, 0x0018))   # GREASE/PQ girdilerini atla
+        if self.group is not None:
+            group = self.group
+        elif self.hrr_group is not None:
+            group = self.hrr_group          # HRR sonrası: istenen grubun payı (CH2'de tek pay)
+        else:
+            group = next(g for g in ch["key_shares"] if g in (0x001D, 0x0017, 0x0018))  # GREASE/PQ'yu atla
         peer = ch["key_shares"][group]
         priv, pub = generate_key_share(group)
         shared = compute_shared_secret(group, priv, peer)

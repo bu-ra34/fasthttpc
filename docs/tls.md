@@ -5,7 +5,8 @@
 fasthttpc prefers **TLS 1.3** (including HelloRetryRequest with cookie). If the
 server selects TLS 1.2, a **safe subset** is supported:
 
-- ECDHE (x25519, secp256r1, secp384r1) with ECDSA/RSA certificates.
+- ECDHE (x25519, x448, secp256r1, secp384r1, secp521r1) with ECDSA/RSA
+  certificates. The server's curve must be one the profile advertises.
 - AES-128-GCM, AES-256-GCM, ChaCha20-Poly1305.
 - Extended Master Secret and `renegotiation_info` are **mandatory**; the
   `DOWNGRD` sentinel in ServerHello.random is checked.
@@ -63,11 +64,28 @@ over HTTP/3. With resumption off, every connection does a full handshake and
 
 ## Key exchange groups
 
-x25519, secp256r1, secp384r1, and the hybrid post-quantum group
-**X25519MLKEM768** when the installed `cryptography` provides ML-KEM (version
-47 or newer). X25519MLKEM768 is offered by the Chrome and Firefox profiles and by
-`safari_27`, not by `safari_18` or `default`; see [profiles](profiles.md).
-secp521r1, x448 and ffdhe are not implemented; no key_share is sent for them.
+x25519, x448, secp256r1, secp384r1, secp521r1, ffdhe2048, ffdhe3072, and the
+hybrid post-quantum group **X25519MLKEM768** when the installed `cryptography`
+provides ML-KEM (version 47 or newer). X25519MLKEM768 is offered by the Chrome
+and Firefox profiles and by `safari_27`, not by `safari_18` or `default`; see
+[profiles](profiles.md).
+
+The first ClientHello is decided by the profile alone: like the browsers, no
+profile sends a key_share for secp521r1, x448 or ffdhe. If the server picks one
+of them with HelloRetryRequest, the second ClientHello carries a key_share for
+it. The group must be in the profile's `supported_groups` and must not be one a
+key_share was already sent for, and a second HelloRetryRequest ends the
+handshake (RFC 8446 §4.1.4). TLS 1.2 ServerKeyExchange may pick any advertised
+ECDHE curve (x25519, x448, secp256r1, secp384r1, secp521r1). ffdhe is TLS 1.3
+only.
+
+Peer values are checked:
+
+- secp256r1/384r1/521r1: uncompressed point of the exact length, on the curve.
+- x25519/x448: exact length; an all-zero shared secret is rejected.
+- ffdhe2048/3072 (RFC 7919 groups, fixed primes, generator 2): the public value
+  must be exactly as long as p and satisfy 1 < Y < p-1. The shared secret is
+  left-padded with zeros to the length of p.
 
 ## Signature schemes
 
