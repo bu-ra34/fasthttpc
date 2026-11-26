@@ -25,7 +25,7 @@ from .models.headers  import Headers, check_header_field, check_request_line
 from .models.request  import Request
 from .models.response import Response, HTTPStatusError
 from .transport.connection_pool import POOL_CLOSED_MESSAGE, ConnectionPool
-from .transport.iotimeout       import IOTimeouts
+from .transport.iotimeout       import IOTimeouts, is_attributed, total_timeout_error
 from .transport.plain           import PlainSocket
 from .transport.proxy           import ProxyConfig, absolute_form, authority, forward_proxy_headers
 from .security.tls_adapter      import TLSAdapter
@@ -651,9 +651,17 @@ class Session:
         sock = conn.socket
         io: "IOTimeouts | None" = getattr(sock, "io", None)
         while True:
+            by_total = False
             if io is not None and io.deadline is not None:
-                sock.raw_socket.settimeout(io.budget(io.read))
-            rec: "tuple[bytes, int]" = sock.recv_record(skip_post_handshake=True)
+                t, by_total = io.limit(io.read)
+                sock.raw_socket.settimeout(t)
+            try:
+                rec: "tuple[bytes, int]" = sock.recv_record(skip_post_handshake=True)
+            except TimeoutError as e:
+                # Süre kurulurken total belirleyiciyse neden total'dır (saat yeniden okunmaz).
+                if by_total and not is_attributed(e):
+                    raise total_timeout_error() from None
+                raise
             msg, m_type = rec
             if m_type == 23:
                 return msg

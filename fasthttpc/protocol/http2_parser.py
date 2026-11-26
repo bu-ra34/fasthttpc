@@ -31,7 +31,8 @@ except ImportError:
     _ZSTD = False
 
 from .._log import get_logger
-from ..transport.iotimeout import IOTimeouts, TOTAL_TIMEOUT_MESSAGE, send_all, write_timeout_error
+from ..transport.iotimeout import (IOTimeouts, is_attributed, send_all, total_timeout_error,
+                                  write_timeout_error)
 logger = get_logger("http2")
 
 # Bozuk sıkıştırılmış veride beklenen hata tipleri (gerisi yukarı yükselir).
@@ -1382,16 +1383,31 @@ class Http2Connection:
             return rec0
         else:
             base = self.read_timeout
+        # Zaman aşımının nedeni süre KURULURKEN belirlenir (total kısalttı mı?); hata
+        # sonrası saati yeniden okumak kaba çözünürlüklü saatlerde yanlış nedene götürür.
+        by_total = False
         if dl is not None:
             left = dl - time.perf_counter()
             if left <= 0:
-                raise TimeoutError(TOTAL_TIMEOUT_MESSAGE)
-            base = left if base is None else min(base, left)
+                raise total_timeout_error()
+            if base is None or left < base:
+                base, by_total = left, True
         if base is not None or dl is not None:
             raw = self.sock.raw_socket
             if raw.gettimeout() != base:
                 raw.settimeout(base)
-        rec: tuple[bytes, int] = self.sock.recv_record(skip_post_handshake=True)
+        try:
+            rec: tuple[bytes, int] = self.sock.recv_record(skip_post_handshake=True)
+        except TimeoutError as e:
+            if is_attributed(e):
+                raise                  # ör. okuma sırasında yapılan gönderimin yazma hatası
+            if by_total:
+                raise total_timeout_error() from None
+            if self._send_wait:
+                raise write_timeout_error(
+                    self.write_timeout,
+                    "HTTP/2 akış kontrolü penceresi (WINDOW_UPDATE) gelmediğinden gövde") from None
+            raise
         return rec
 
     def _read_frame(self) -> HTTP2Frame:
@@ -1549,13 +1565,8 @@ class Http2Connection:
                     # Yanıt bizden önce gelmeye başlamış olabilir; sonra işlenmek
                     # üzere sakla (yarı-kapalı stream'de bu tamamen geçerlidir).
                     self._pending_frames.append(frame)
-        except TimeoutError:
-            # Okuma da araya giren frame gönderimleri (PONG, SETTINGS ACK) de write ile sınırlı.
-            if self.deadline is not None and time.perf_counter() >= self.deadline:
-                raise TimeoutError(TOTAL_TIMEOUT_MESSAGE) from None
-            raise write_timeout_error(
-                self.write_timeout, "HTTP/2 akış kontrolü penceresi (WINDOW_UPDATE) gelmediğinden gövde"
-            ) from None
+        # Zaman aşımları nedeniyle birlikte yükselir: pencere beklemesi _recv_record'da,
+        # araya giren gönderimler (PONG, SETTINGS ACK) send_all'da total/write olarak işaretlenir.
         finally:
             self._send_wait = False
             if timed:

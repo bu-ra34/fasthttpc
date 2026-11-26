@@ -132,6 +132,12 @@
   arasında yarışabiliyordu.
 - Yeni HTTP/2 bağlantısının ön eki (preface + SETTINGS) isteğin zaman aşımı
   uygulandıktan sonra gönderiliyor.
+- Zaman aşımının nedeni (`total` mı `write`/`read` mi) artık süre kurulurken
+  belirleniyor; hata sonrası saati yeniden okumak kaba çözünürlüklü saatte
+  (Windows, ~15,6 ms) `total` aşımını `Timeout.write` diye raporlayabiliyordu.
+  Senkron okumalarda `total` kaynaklı zaman aşımı da `Timeout.total` mesajıyla
+  yükselir; `AsyncSession`'da içteki zaman aşımı dıştaki `total`'dan saatle değil
+  kaynağıyla ayırt edilir.
 - **aioquic 1.9 uyumluluğu:** aioquic 1.9, GOAWAY alındıktan ya da bağlantı
   kapanmaya başladıktan sonra yeni istek başlatmayı reddediyor (RFC 9114
   §5.2, `InvalidConnectionStateError`). İstek hiç gönderilmediği için bu artık
