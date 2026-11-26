@@ -210,6 +210,11 @@
   kullanır (`netutil.refused_port`); çift yığınlı (127.0.0.1 + ::1) dinleyiciler port
   kapılırsa yeni portla yeniden dener (`netutil.listen_dual`, `start_dual`).
   Dört tam takım aynı makinede eşzamanlı koşarak doğrulandı.
+- **Test başına zaman sınırı:** `pytest-timeout` geliştirme bağımlılığı oldu
+  (`.[dev]`); `pyproject.toml`'da `timeout = 120`, `timeout_method = "thread"`
+  (Windows'ta da çalışır, tüm iş parçacıklarının yığınını döker). CI test işine
+  `timeout-minutes: 20`. Takılan bir test (ör. PR #18'in Windows işi 4,5 saat asılı
+  kaldı) artık hızla ve yığın dökümüyle düşer. Yerelde en yavaş test ~3 sn.
 - **Windows'ta paylaşılan HTTP/3 test sunucusunun kilitlenmesi:** bir Windows
   koşusunda `test_request_rejected_repeatedly_fails_after_bound`'dan sonraki 11
   HTTP/3 testi (sync ve async) "el sıkışma zaman aşımı" ile düşüyordu. Modül boyunca
