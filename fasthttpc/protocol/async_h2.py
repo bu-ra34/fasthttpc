@@ -31,7 +31,7 @@ import collections
 import struct
 import time
 from dataclasses import dataclass, field
-from typing import Any, Callable, Optional
+from typing import Any, AsyncIterable, Callable, Optional, Union
 
 from .. import _backend as B
 from .._log import get_logger
@@ -58,6 +58,9 @@ from .http2_parser import (
 )
 
 logger = get_logger("async_h2")
+
+# İstek gövdesi: bellekte bayt ya da bayt parçaları üreten async iterable (akış).
+_Body = Union[bytes, bytearray, memoryview, AsyncIterable[bytes]]
 
 __all__ = ["AsyncHttp2Connection", "H2Response", "H2StreamHandle", "H2StreamRefused", "client_preface_bytes"]
 
@@ -703,27 +706,62 @@ class AsyncHttp2Connection:
         # Tek write: HEADERS+CONTINUATION arasına başka frame giremez.
         self._write(bytes(out))
 
-    async def _send_body(self, st: _Stream, body: bytes, write_timeout: Any = _CONN_DEFAULT) -> None:
+    async def _send_body(self, st: _Stream, body: "_Body", write_timeout: Any = _CONN_DEFAULT) -> None:
+        """Gövdeyi DATA frame'leriyle gönderir; END_STREAM SON frame'dedir.
+
+        ``body``: bayt ya da bayt parçaları üreten async iterable (akış gövdesi; belleğe
+        alınmaz). Frame'ler ``max_frame_size``'ı ve pencereleri aşmaz; her frame'den sonra
+        ``drain`` ``write_timeout`` ile sınırlıdır. Son frame ancak kaynak bitince
+        bilindiğinden bir parça geride tutulur. Yanıt erken gelirse gönderim kesilir."""
         wt = self.write_timeout if write_timeout is _CONN_DEFAULT else write_timeout
-        off = 0
-        total = len(body)
-        while off < total:
+        if isinstance(body, (bytes, bytearray, memoryview)):
+            mv = memoryview(body)
+            step = self._peer_max_frame
+            for off in range(0, len(mv), step):
+                if not await self._send_piece(st, mv[off:off + step], off + step >= len(mv), wt):
+                    return
+            return
+        pending: Optional[memoryview] = None
+        try:
+            async for chunk in body:
+                if not chunk:
+                    continue
+                mv = memoryview(chunk)
+                step = self._peer_max_frame
+                for off in range(0, len(mv), step):
+                    if pending is not None and not await self._send_piece(st, pending, False, wt):
+                        return
+                    pending = mv[off:off + step]
+            await self._send_piece(st, pending if pending is not None else memoryview(b""), True, wt)
+        finally:
+            aclose = getattr(body, "aclose", None)
+            if aclose is not None:
+                await aclose()
+
+    async def _send_piece(self, st: _Stream, data: memoryview, end_stream: bool, wt: Any) -> bool:
+        """En çok bir frame'lik veri (pencereye göre bölünerek). Yanıt/RST erken geldiyse False."""
+        off, n = 0, len(data)
+        while True:
             if st.fut.done():            # yanıt/RST erken geldi
-                return
+                return False
             if self._closed:
                 raise Http2ConnectionError("Gövde gönderilirken bağlantı kapandı.")
-            avail = min(self._conn_send, st.send_window, self._peer_max_frame)
-            if avail <= 0:
-                await self._wait_change(wt)
-                continue
-            n = min(avail, total - off)
-            last = off + n >= total
-            self._write(_frame(FrameType.DATA, FrameFlags.END_STREAM if last else 0,
-                               st.id, body[off:off + n]))
-            self._conn_send -= n
-            st.send_window -= n
-            off += n
+            take = n - off
+            if take:
+                avail = min(self._conn_send, st.send_window)
+                if avail <= 0:
+                    await self._wait_change(wt)
+                    continue
+                take = min(take, avail)
+            last = off + take >= n
+            self._write(_frame(FrameType.DATA, FrameFlags.END_STREAM if (end_stream and last) else 0,
+                               st.id, data[off:off + take].tobytes()))
+            self._conn_send -= take
+            st.send_window -= take
+            off += take
             await self._drain(wt)
+            if last:
+                return True
 
     def _timeouts(self, read_timeout: Any, write_timeout: Any) -> "tuple[Optional[float], Optional[float]]":
         return (self.read_timeout if read_timeout is _CONN_DEFAULT else read_timeout,
@@ -735,7 +773,7 @@ class AsyncHttp2Connection:
         authority: str,
         path: str,
         headers: "list[tuple[str, str]]",
-        body: bytes = b"",
+        body: "_Body" = b"",
         scheme: str = "https",
         *,
         read_timeout: Any = _CONN_DEFAULT,
@@ -761,14 +799,15 @@ class AsyncHttp2Connection:
         # (stream id'ler artan sırada gönderilmek zorunda; RFC 7540 §5.1.1).
         st = self._alloc_stream()
         self.last_used = time.perf_counter()
+        in_memory = isinstance(body, (bytes, bytearray, memoryview))
         try:
-            self._send_headers(st.id, full, end_stream=not body)
+            self._send_headers(st.id, full, end_stream=in_memory and not body)
         except BaseException:
             self._streams.pop(st.id, None)
             raise
         try:
             await self._drain(wt)
-            if body:
+            if not in_memory or body:
                 await self._send_body(st, body, wt)
             while True:
                 done = await B.wait_future(st.fut, rt)
@@ -795,7 +834,7 @@ class AsyncHttp2Connection:
         authority: str,
         path: str,
         headers: "list[tuple[str, str]]",
-        body: bytes = b"",
+        body: "_Body" = b"",
         scheme: str = "https",
         *,
         read_timeout: Any = _CONN_DEFAULT,
@@ -822,14 +861,15 @@ class AsyncHttp2Connection:
         st.hdr_fut = B.new_future()
         self.last_used = time.perf_counter()
         handle = H2StreamHandle(self, st, rt, wt)
+        in_memory = isinstance(body, (bytes, bytearray, memoryview))
         try:
-            self._send_headers(st.id, full, end_stream=not body)
+            self._send_headers(st.id, full, end_stream=in_memory and not body)
         except BaseException:
             self._streams.pop(st.id, None)
             raise
         try:
             await self._drain(wt)
-            if body:
+            if not in_memory or body:
                 await self._send_body(st, body, wt)
             while True:
                 done = await B.wait_future(st.hdr_fut, rt)

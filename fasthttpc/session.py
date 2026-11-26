@@ -15,6 +15,7 @@ from __future__ import annotations
 import copy
 import functools
 import os
+import select
 import threading
 import time
 from typing import (TYPE_CHECKING, Any, Generator, Iterable, Optional, TypedDict,
@@ -47,8 +48,9 @@ from .cookies    import CookieJar
 from .fingerprint import drop_h2_only_defaults, merge_default_headers, order_h1
 from ._log       import get_logger
 from . import _api
-from ._api       import (USE_CLIENT_DEFAULT, AuthArg, CookiesArg, HeaderDict, HeadersArg,
+from ._api       import (USE_CLIENT_DEFAULT, AuthArg, Body, CookiesArg, HeaderDict, HeadersArg,
                           ParamsArg, TimeoutArg)
+from ._body      import StreamingBody, UnrewindableBodyError
 from .auth       import resolve_auth, netrc_credentials, BasicAuth
 from .plugins    import Plugin, RetryPlugin, call_sync
 
@@ -291,6 +293,37 @@ def _no_await(out: Any) -> Any:
 class _H2Refused(ConnectionError):
     """HTTP/2 isteği sunucu tarafından İŞLENMEDİ (GOAWAY); güvenle yeniden denenebilir."""
 
+
+def _idle_conn_dead(conn: "HTTPConnection") -> bool:
+    """Havuzdan alınan boştaki HTTP/1.1 bağlantısında okunacak bir şey var mı (sunucu
+    kapatmış: EOF / beklenmeyen veri)? Başa sarılamayan akış gövdesi böyle bir bağlantıda
+    gönderilmeye başlanırsa bayat bağlantı yeniden denemesi yapılamazdı."""
+    try:
+        r, _, _ = select.select([conn.socket.raw_socket], [], [], 0)
+    except (OSError, ValueError):
+        return True
+    return bool(r)
+
+
+def _send_h1_stream(sock: Any, head: bytes, body: StreamingBody, chunked: bool) -> int:
+    """HTTP/1.1 istek başlığı + akış gövdesi; gönderilen bayt sayısını döner.
+
+    ``chunked``: her (boş olmayan) parça ``boyut CRLF veri CRLF`` olarak, sonunda
+    ``0 CRLF CRLF``; değilse parçalar olduğu gibi (``Content-Length``). Her gönderim
+    ``sock.send_record`` -> ``iotimeout.send_all`` ile ``Timeout.write`` (kalan ``total``
+    ile kısaltılmış) içinde tamamlanmalıdır; gövde belleğe alınmaz."""
+    sock.send_record(head)
+    sent = len(head)
+    for chunk in body:
+        if chunked:
+            chunk = b"".join((b"%x\r\n" % len(chunk), chunk, b"\r\n"))
+        sock.send_record(chunk)
+        sent += len(chunk)
+    if chunked:
+        sock.send_record(b"0\r\n\r\n")
+        sent += 5
+    return sent
+
 class Session:
     """
     fasthttpc senkron HTTP istemcisi.
@@ -489,6 +522,7 @@ class Session:
 
         if metrics:
             metrics.bytes_sent = len(req.body) + sum(len(k) + len(v) for k, v in h2_headers)
+        h2_body: "bytes | StreamingBody" = req.stream if req.stream is not None else req.body
 
         host = req.url.host
         if ":" in host:
@@ -504,7 +538,7 @@ class Session:
                 h2_stream = h2.request_stream(
                     method=req.method, authority=authority,
                     path=req.url.raw_path.decode("latin-1"),
-                    headers=h2_headers, body=req.body,
+                    headers=h2_headers, body=h2_body,
                 )
                 status_code, resp_header_pairs, body_raw = (
                     h2_stream.status, list(h2_stream.headers), b"")
@@ -514,7 +548,7 @@ class Session:
                     authority=authority,
                     path=req.url.raw_path.decode("latin-1"),
                     headers=h2_headers,
-                    body=req.body,
+                    body=h2_body,
                 )
         except Http2RefusedError as e:
             raise _H2Refused(f"HTTP/2 isteği işlenmedi: {e}") from e
@@ -522,6 +556,8 @@ class Session:
             raise ConnectionError(f"HTTP/2 isteği başarısız: {e}") from e
 
         if metrics:
+            if req.stream is not None:
+                metrics.bytes_sent += req.stream.sent
             metrics.first_byte_time = time.perf_counter()
             metrics.transfer_end    = time.perf_counter()
             metrics.bytes_received  = len(body_raw)
@@ -558,6 +594,12 @@ class Session:
             self._cache.store(str(url), method, resp)
 
         return resp
+
+    def _h3_may_try(self, u: URL) -> bool:
+        """Bu istek için HTTP/3 denenecek mi (h3 açık, https, proxy yok, hedef biliniyor)?"""
+        h3 = self._h3
+        return (h3 is not None and u.scheme == "https" and self._rotator is None
+                and self.pool.proxy_for(u) is None and h3.state.target_for(u.host, u.port) is not None)
 
     def _h3_attempt(self, req: Request, metrics: "RequestMetrics | None",
                     cache_entry: "CacheEntry | None", method: str,
@@ -854,6 +896,12 @@ class Session:
         """
                                          
         extra_headers: dict[str, str] = {}
+        # HTTP/3 denenecekse akış gövdesi belleğe alınır: aioquic gönderilen veriyi zaten
+        # tamponlar ve h3 denemesi h2/h1'e düşebilir ya da yeni bağlantıda yinelenebilir
+        # (gövde yeniden gönderilir). Sonraki adımlar (yönlendirme vb.) bu kopyayı kullanır.
+        if isinstance(data, StreamingBody) and self._h3_may_try(
+                url if isinstance(url, URL) else URL(url)):
+            data = data.read()
         if files is not None:
             mp_body, mp_ct = encode_multipart(
                 fields=data if isinstance(data, dict) else None,
@@ -899,7 +947,8 @@ class Session:
         for raw_k, raw_v in req.headers.raw:
             check_header_field(raw_k, raw_v)
 
-        if self._h3 is not None and req.url.scheme == "https":     # h3 yalnızca https
+        if (self._h3 is not None and req.url.scheme == "https"      # h3 yalnızca https
+                and req.stream is None):                            # akış: yukarıda belleğe alındı
             h3_resp = self._h3_attempt(req, metrics, cache_entry, method, url)
             if h3_resp is not None:
                 return h3_resp
@@ -936,6 +985,11 @@ class Session:
                 if metrics:
                     metrics.connection_reused = not is_new_conn
                     metrics.connect_end       = time.perf_counter()
+                if (not is_new_conn and conn.h2_conn is None and req.stream is not None
+                        and not req.stream.rewindable and _idle_conn_dead(conn)):
+                    # Başa sarılamayan gövde, sunucunun kapattığı bağlantıda harcanmasın:
+                    # gövdeye dokunmadan taze bağlantıyla yeniden dene (aşağıdaki dal).
+                    raise ConnectionResetError("Boştaki bağlantı sunucu tarafından kapatılmış.")
 
                      
                 if is_new_conn and req.url.scheme == "http":
@@ -1002,11 +1056,16 @@ class Session:
                     h1_pairs += forward_proxy_headers(fwd)
                 for k, v in h1_pairs:
                     req_lines.append(f"{k}: {v}")
-                raw_bytes = "\r\n".join(req_lines).encode("ascii") + b"\r\n\r\n" + req.body
-
-                if metrics: metrics.bytes_sent = len(raw_bytes)
-
-                conn.socket.send_record(raw_bytes)
+                head = "\r\n".join(req_lines).encode("ascii") + b"\r\n\r\n"
+                if req.stream is None:
+                    raw_bytes = head + req.body
+                    if metrics: metrics.bytes_sent = len(raw_bytes)
+                    conn.socket.send_record(raw_bytes)
+                else:
+                    # Akış gövdesi: parça parça (chunked ya da Content-Length), belleğe almadan.
+                    chunked = "chunked" in req.headers.get("transfer-encoding", "").lower()
+                    n_sent = _send_h1_stream(conn.socket, head, req.stream, chunked)
+                    if metrics: metrics.bytes_sent = n_sent
                 send_time = time.perf_counter()
 
                                                                             
@@ -1167,10 +1226,13 @@ class Session:
                         # isteği işliyor olabilir) ya da yarım yanıt YENİDEN
                         # DENENMEZ: POST çift gönderilir, bekleme süresi katlanır.
                         # GOAWAY ile işlenmediği bildirilen h2 isteği (yeni
-                        # bağlantıda bile) güvenle yeniden denenir.
-                        retry_count += 1
-                        logger.debug("Bayat bağlantı, yeniden deneniyor (%s)", e)
-                        continue
+                        # bağlantıda bile) güvenle yeniden denenir. Akış gövdesi
+                        # yalnızca başa sarılabiliyorsa (boş/yarım gövde gitmez).
+                        if _api.body_replayable(req.stream):
+                            retry_count += 1
+                            logger.debug("Bayat bağlantı, yeniden deneniyor (%s)", e)
+                            continue
+                        _api.not_replayed(e)
                 raise
             except BaseException:
                 # Beklenmeyen hata (encoding, parsing, KeyboardInterrupt vb.) — bağlantıyı havuzda
@@ -1200,7 +1262,7 @@ class Session:
         return self
 
     def _send(self, method: str, url: "str | URL", headers: "HeaderDict | None" = None,
-              body: bytes = b"",
+              body: Body = b"",
               metrics: RequestMetrics | None = None, stream: bool = False) -> Response:
         """Tek bir isteği gönderir: plugin kancaları + transport verilmişse ona, yoksa ağa."""
         try:
@@ -1245,17 +1307,25 @@ class Session:
         """``self.retries`` politikasına göre ``_send``'i tekrarlar."""
         retry = self.retries
         attempt = 0
+        body = kwargs.get("body")
         while True:
             try:
                 resp = self._send(method, url, **kwargs)
             except Exception as e:
                 if not retry.should_retry_error(method, e, attempt):
                     raise
+                if not _api.body_replayable(body):
+                    _api.not_replayed(e)      # akış gövdesi tükendi: boş/yarım gövde gitmez
+                    raise
                 attempt += 1
                 delay = retry.get_delay(attempt)
                 logger.debug("Ağ hatası (%s), %d. yeniden deneme %.2fs sonra", e, attempt, delay)
             else:
                 if not retry.should_retry_status(method, resp.status_code, attempt):
+                    return resp
+                if not _api.body_replayable(body):
+                    logger.debug("HTTP %s: akış gövdesi başa sarılamıyor, yeniden denenmiyor",
+                                 resp.status_code)
                     return resp
                 attempt += 1
                 delay = retry.get_delay(attempt, resp)
@@ -1296,7 +1366,7 @@ class Session:
                 arg = out
         return arg
 
-    def _hop(self, auth: "Auth | None", method: str, url: str, headers: HeaderDict, body: bytes,
+    def _hop(self, auth: "Auth | None", method: str, url: str, headers: HeaderDict, body: Body,
              metrics: RequestMetrics, req_hooks: "_api.HookMap", hkw: "dict[str, Any]",
              stream: bool = False) -> "tuple[Response, list[Response]]":
         """Tek yönlendirme adımı: auth akışı (401 yeniden denemesi dahil) + hook'lar.
@@ -1323,7 +1393,8 @@ class Session:
             h.update({k: None for k in removed if k.lower() not in lower})
             target = url if req.url is base.url else str(req.url)
             resp = self._send_with_retries(req.method, target, headers=h,
-                                           body=req.body or b"", metrics=metrics, stream=stream)
+                                           body=_api.request_body(req), metrics=metrics,
+                                           stream=stream)
             resp = self._call_hooks("response", resp, req_hooks, **hkw)
             if flow is None:
                 return resp, extras
@@ -1334,6 +1405,8 @@ class Session:
             if stream:
                 _discard_stream(resp)     # 401 ara yanıtı: bağlantı havuza dönsün
             extras.append(resp)
+            if not _api.body_replayable(_api.request_body(req)):
+                raise UnrewindableBodyError(_api.UNREWINDABLE_AUTH)
 
     def request(
         self,
@@ -1406,8 +1479,8 @@ class Session:
                         if plugin.should_retry(resp, attempt):
                             delay = plugin.delay_for(resp, attempt)
                             break
-                    if delay is None:
-                        break
+                    if delay is None or not _api.body_replayable(body):
+                        break         # akış gövdesi başa sarılamıyorsa yeniden denenmez
                     resp.close()      # tekrar denenecek yanıt (akışsa bağlantıyı bırak)
                     if delay:
                         time.sleep(delay)
@@ -1449,7 +1522,12 @@ class Session:
                     method = "GET"
                     body   = b""
                     merged = {k: v for k, v in merged.items()
-                              if k.lower() not in ("content-type", "content-length")}
+                              if k.lower() not in ("content-type", "content-length",
+                                                   "transfer-encoding")}
+                elif not _api.body_replayable(body):
+                    # 307/308: gövde AYNEN yeniden gönderilmeli; tükenmiş üreteç boş/yarım gider.
+                    raise UnrewindableBodyError(
+                        _api.UNREWINDABLE_REDIRECT.format(status=resp.status_code))
 
                 redirect_count += 1
                 logger.debug("Yönlendirme (%s) -> %s", resp.status_code, current_url)

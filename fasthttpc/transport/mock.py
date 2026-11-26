@@ -14,6 +14,10 @@ fasthttpc — ağsız test için sahte transport (``httpx.MockTransport`` benzer
     with Session(transport=MockTransport(handler)) as s:
         assert s.get("https://api.example.com/v1").json() == {"ok": True}
 
+Akış gövdesi (``data=`` dosya nesnesi / üreteç) handler çağrılmadan önce belleğe
+alınır (``request.content`` dolu; httpx ile aynı). Özel transport'lar gövdeyi
+``request.stream``'den parça parça okuyabilir ya da ``request.read()`` çağırabilir.
+
 Handler, :class:`~fasthttpc.models.request.Request` alır ve
 :class:`~fasthttpc.models.response.Response` döner. Handler'ın fırlattığı
 istisnalar (ör. ``ConnectionError``) çağırana aynen iletilir — bu sayede
@@ -67,6 +71,7 @@ class MockTransport(BaseTransport):
 
     def handle_request(self, request: Request) -> Response:
         self.requests.append(request)
+        request.read()          # akış gövdesi (data= dosya/üreteç) -> request.content
         resp = self.handler(request)
         if inspect.isawaitable(resp):
             close = getattr(resp, "close", None)
@@ -77,6 +82,7 @@ class MockTransport(BaseTransport):
 
     async def handle_async_request(self, request: Request) -> Response:
         self.requests.append(request)
+        await request.aread()   # akış gövdesi (data= dosya/(async) üreteç) -> request.content
         resp = self.handler(request)
         if inspect.isawaitable(resp):
             resp = await resp

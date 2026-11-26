@@ -63,6 +63,7 @@ from .async_session import ProxyRotator
 from .plugins import Plugin, RetryPlugin, LoggingPlugin, RateLimitPlugin
 from .auth import Auth, BasicAuth, BearerAuth, DigestAuth
 from ._api import USE_CLIENT_DEFAULT
+from ._body import UnrewindableBodyError
 
 __version__ = "0.7.0"
 __author__  = "Buğra"
@@ -106,4 +107,5 @@ __all__ = [
     "BearerAuth",
     "DigestAuth",
     "USE_CLIENT_DEFAULT",
+    "UnrewindableBodyError",
 ]

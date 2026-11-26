@@ -838,6 +838,34 @@ def test_trio_auto_altsvc_h1e_duser(pki, dual):
     assert dual.tcp_hits == 3
 
 
+def test_http3_akis_govdesi_bellege_alinip_gonderilir(pki, h3):
+    """HTTP/3'te akış gövdesi (dosya/üreteç) belleğe alınıp eksiksiz gönderilir (boş DEĞİL)."""
+    import io
+
+    def gen():
+        yield b""
+        yield b"uretec-"
+        yield "ç".encode()
+
+    with Session(http3="force", verify=pki["ca"]) as s:
+        r1 = s.post(url(h3, "/f"), data=io.BytesIO(b"dosya-icerigi"))
+        r2 = s.post(url(h3, "/g"), data=gen())
+    assert r1.http_version == r2.http_version == "HTTP/3"
+    assert json.loads(r1.body)["body"] == "dosya-icerigi"
+    assert json.loads(r2.body)["body"] == "uretec-ç".encode().decode("latin-1")
+
+    async def agen():
+        yield b"async-"
+        yield b"uretec"
+
+    async def go():
+        async with AsyncSession(http3="force", verify=pki["ca"]) as s:
+            r = await s.post(url(h3, "/a"), data=agen())
+            assert r.http_version == "HTTP/3"
+            assert json.loads(r.body)["body"] == "async-uretec"
+    asyncio.run(go())
+
+
 # --- FHC-07: açılmış gövde sınırı HTTP/3'te de (docs/security-audit.md) -----------------
 _LIMIT = 100 * 1024
 
@@ -869,3 +897,34 @@ def test_h3_sikistirma_bombasi_sinirlanir_async(pki, h3, enc):
             # gövde bir kez açılır (eskiden async h3 yolu iki kez açmaya çalışıyordu)
             assert r.http_version == "HTTP/3" and r.content == bytes(_LIMIT)
     asyncio.run(go())
+
+
+def test_request_rejected_akis_govdesi_ayni_baytlarla_yeniden(pki, h3):
+    """data= üreteci HTTP/3'ten önce belleğe alınır: REJECTED sonrası yeniden deneme AYNI
+    baytları gönderir; tamponlanmamış (akış) gövde HTTP/3 katmanında yeniden denenmez."""
+    from fasthttpc._body import StreamingBody
+    from fasthttpc.http3.manager import _replayable
+
+    def gen():
+        yield b"bir-"
+        yield b""
+        yield b"iki"
+
+    path = f"/reject-once-stream-sync-{id(pki)}"
+    with Session(http3="force", verify=pki["ca"]) as s:
+        r = s.post(url(h3, path), data=gen())
+    assert r.status_code == 200 and r.http_version == "HTTP/3"
+    assert json.loads(r.body)["body"] == "bir-iki" and HITS[path] == 2
+
+    async def agen():
+        yield b"async-"
+        yield b"govde"
+
+    apath = f"/reject-once-stream-async-{id(pki)}"
+
+    async def go():
+        async with AsyncSession(http3="force", verify=pki["ca"]) as s:
+            return await s.post(url(h3, apath), data=agen())
+    r = asyncio.run(go())
+    assert json.loads(r.body)["body"] == "async-govde" and HITS[apath] == 2
+    assert not _replayable(StreamingBody.from_iterable(gen()))
