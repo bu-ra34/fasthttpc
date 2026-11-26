@@ -169,6 +169,18 @@
   kullanır (`netutil.refused_port`); çift yığınlı (127.0.0.1 + ::1) dinleyiciler port
   kapılırsa yeni portla yeniden dener (`netutil.listen_dual`, `start_dual`).
   Dört tam takım aynı makinede eşzamanlı koşarak doğrulandı.
+- **Windows'ta paylaşılan HTTP/3 test sunucusunun kilitlenmesi:** bir Windows
+  koşusunda `test_request_rejected_repeatedly_fails_after_bound`'dan sonraki 11
+  HTTP/3 testi (sync ve async) "el sıkışma zaman aşımı" ile düşüyordu. Modül boyunca
+  paylaşılan aioquic sunucusu ProactorEventLoop'ta koşuyordu; CPython 3.12'nin
+  Proactor datagram taşıması alım hatasında (`_loop_reading`: `error_received` çağrılır,
+  yeni okuma başlatılmaz) okumayı kalıcı ve sessizce bırakır — kapanmış bir istemci
+  portuna giden yanıtın ICMP'si yeter. Test sunucusu Windows'ta artık
+  SelectorEventLoop'ta koşar (hatayı bildirip okumayı sürdürür). Regresyon testi:
+  sunucu kapalı porta datagram gönderdikten sonra yeni bağlantıları kabul etmeli.
+  İlk Initial datagram'ı düşürülen el sıkışmasının PTO ile ~0,2 sn'de tamamlandığı
+  (sync ve async sürücü) belirlenimli olarak sınanır; sürücülerin zamanlayıcı kullanımı
+  15,6 ms çözünürlüklü saatle (Windows'taki Python 3.12 `time.monotonic`) de denendi.
 
 ### Değişti
 - **Parmak izi DEĞİŞMEDİ:** her profilin supported_groups listesi ve ilk
@@ -250,6 +262,22 @@
   kalıyorlardı: trio altında "Async generator ... was garbage collected" ResourceWarning,
   asyncio'da sonlandırması olay döngüsü kapandıktan sonraya kalabiliyordu.
   `aiter_lines()` artık `async def` değil, üreteç döndüren normal metot (kullanım aynı).
+- **asyncio: iptal edilen istek bağlantıyı yarım kapalı bırakmıyor.** asyncio'nun
+  `StreamWriter.wait_closed()`'ı protokolün paylaşılan kapanış future'ını doğrudan
+  bekler; bekleyen iptal edilince (ör. anyio `move_on_after`/görev grubu iptali her
+  `await`'i yeniden iptal eder) future da iptal oluyor, sonraki her `wait_closed()`
+  TLS kapanışı bitmeden dönüyordu. `AsyncSession.close()` bu yüzden kapanışı süren
+  bağlantıyı beklemiyor, olay döngüsü kapanınca soket açık kalıyordu (ResourceWarning).
+  Artık kapanış ayrı görevde ve `shield` ile beklenir (`_backend.wait_closed`); iptal
+  yüzünden yarım kalan kapanışlar oturumda izlenir ve `close()` onları da (en fazla
+  1 sn, sonra TCP kesilir) bekler. `close_streams` iptal edilmiş kapanış future'ını
+  "kapanmadı" sayıp bağlantıyı keser.
+- **Async HTTP/3: kurulu bağlantıda UDP hatası bağlantıyı düşürür.** Önceden yalnızca
+  el sıkışması sırasında dikkate alınıyordu; sonradan gelen ICMP reddinde (ya da
+  Windows ProactorEventLoop'ta okumayı durduran herhangi bir alım hatasında) bağlantı
+  "kullanılabilir" kalıp sonraki istekleri zaman aşımına sokuyordu. Artık kapatılır,
+  sıradaki istek yeni bağlantı kurar. Geçici gönderim hataları (ENOBUFS, EMSGSIZE)
+  Selector döngülerinde QUIC kayıp kurtarmasına bırakılır.
 
 ### Performans
 - Huffman kodlama tablo güdümlü (bit bit Python döngüsü yok); kısa dizelerin
