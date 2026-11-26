@@ -101,7 +101,12 @@ def _cert_error(e: BaseException) -> "Optional[CertificateValidationError]":
 
 
 class SyncHttp3:
-    """Sync Session için: ``exchange`` -> (status, Headers, ham body) ya da None (h2'ye düş)."""
+    """Sync Session için: ``exchange`` -> (status, Headers, ham body) ya da None (h2'ye düş).
+
+    İş parçacığı güvenli: bağlantı sözlüğü ve her bağlantının kullanıcı sayısı
+    (``users``) ``_lock`` altında tutulur. Kullanılamaz hâle gelen ya da ``close()``
+    ile emekliye ayrılan (``retired``) bağlantı, onu kullanan son iş parçacığı
+    bitirince kapatılır; süren bir alışveriş yarıda kesilmez ve ``close()`` beklemez."""
 
     def __init__(self, opts: Http3Options, ca_path, impersonate):
         require_aioquic()
@@ -109,13 +114,20 @@ class SyncHttp3:
         self._ca_path, self._impersonate = ca_path, impersonate
         self._conns: dict[tuple, object] = {}
         self._lock = threading.Lock()
+        self._closed = False
 
     def _conn(self, origin, target):
+        """Bağlantıyı KİRALAR (``users`` +1); iş bitince :meth:`_done` çağrılmalı."""
         from .sync_client import SyncH3Connection
         with self._lock:
+            if self._closed:
+                raise RuntimeError("Session kapatıldı (close()); yeni istek gönderilemez.")
             c = self._conns.get(origin)
             if c is not None and not c.usable:
-                c.close()
+                del self._conns[origin]
+                c.retired = True
+                if c.users == 0:
+                    c.close()       # kimse kullanmıyor: kilidi boşta, beklemez
                 c = None
             if c is None:
                 c = SyncH3Connection(origin[0], origin[1], target[0], target[1],
@@ -123,7 +135,15 @@ class SyncHttp3:
                                      opts=self.state.opts)
                 c.connect()     # kilit altında: aynı kaynağa tek el sıkışma
                 self._conns[origin] = c
+            c.users += 1
             return c
+
+    def _done(self, c) -> None:
+        with self._lock:
+            c.users -= 1
+            close_now = c.retired and c.users == 0
+        if close_now:
+            c.close()
 
     def exchange(self, host: str, port: int, method: str, path: str,
                  headers: "list[tuple[str, str]]", body: bytes,
@@ -137,7 +157,10 @@ class SyncHttp3:
                 conn = self._conn(origin, target)
             except Http3ConnectError as e:
                 return self._connect_failed(host, port, e)
-            (res,) = conn.request_many([(method, path, headers, body)], timeout)
+            try:
+                (res,) = conn.request_many([(method, path, headers, body)], timeout)
+            finally:
+                self._done(conn)
             if isinstance(res, Exception):
                 if isinstance(res, Http3RequestRefused):
                     if attempt < MAX_REFUSED_RETRIES and _replayable(body):
@@ -154,9 +177,17 @@ class SyncHttp3:
         return None
 
     def close(self) -> None:
+        """Kalıcı kapanış: boştaki bağlantılar hemen, kullanılanlar son kullanıcı bitince
+        kapanır; sonraki istekler ``RuntimeError`` verir."""
         with self._lock:
+            self._closed = True
             conns, self._conns = list(self._conns.values()), {}
-        for c in conns:
+            idle = []
+            for c in conns:
+                c.retired = True
+                if c.users == 0:
+                    idle.append(c)
+        for c in idle:
             c.close()
 
 

@@ -7,6 +7,24 @@ Yenilikler:
   - Pipelining desteği için bağlantı kilitleme (item 13)
   - TCP_NODELAY zaten vardı; TCP Fast Open eklendi (Linux)
   - SO_KEEPALIVE eklendi
+
+İş parçacığı güvenliği (senkron ``Session`` birden çok iş parçacığından kullanılır):
+
+  - Bir bağlantı (HTTP/1.1 ya da HTTP/2) ``acquire()`` ile ÖZEL olarak kiralanır ve
+    ``release()`` edilene kadar başka hiçbir iş parçacığına verilmez. HTTP/2
+    bağlantısı da senkron tarafta tek isteğe aittir (stream çoğullama AsyncSession'da).
+  - Origin (ve proxy/mTLS kapsamı) başına ``max_connections`` slotluk bir semaphore,
+    kiralanmış + kurulmakta olan bağlantı sayısını sınırlar. Boş bağlantı yoksa ve
+    sınıra ulaşılmışsa iş parçacığı ``timeout`` (``Timeout.pool``) kadar bekler,
+    sonra ``TimeoutError``. Kilit sırası tek yönlüdür (önce semaphore, sonra kısa
+    süreli havuz kilidi; havuz kilidi tutulurken G/Ç yapılmaz ve başka kilit
+    beklenmez), bu yüzden kilitlenme (deadlock) olmaz.
+  - ``release()`` idempotenttir: aynı kiralama için ikinci çağrı semaphore'u bir daha
+    artırmaz (artırsaydı sınır sessizce aşılırdı).
+  - ``close()`` havuzu kalıcı kapatır: boştaki bağlantılar hemen kapanır, kiradaki
+    bağlantılar iade edildiklerinde kapatılır (havuza dönmez); sonraki ``acquire()``
+    ``RuntimeError`` verir. Kiradaki son bağlantı da iade edilince ``on_drained``
+    geri çağrısı (ör. mTLS özel anahtarını bırakma) BİR kez çalışır.
 """
 from __future__ import annotations
 import socket
@@ -26,6 +44,7 @@ from .._log import get_logger
 
 if TYPE_CHECKING:
     from ..protocol.http2_parser import Http2Connection
+    from .iotimeout import IOTimeouts
 
 logger = get_logger("pool")
 
@@ -39,6 +58,8 @@ _TCP_FASTOPEN_CONNECT = getattr(socket, "TCP_FASTOPEN_CONNECT", 30)
 # isteğin kesin başarısız olması demektir.
 DEFAULT_IDLE_TIMEOUT = 30.0
 
+POOL_CLOSED_MESSAGE = "Session kapatıldı (close()); yeni istek gönderilemez."
+
 
 # Opsiyonel DNS-over-HTTPS çözücü. ConnectionPool(resolver=...) ile verilir;
 # None ise işletim sisteminin çözücüsü kullanılır.
@@ -51,6 +72,7 @@ class HTTPConnection:
     __slots__ = (
         "origin", "socket", "is_closed", "tls_established",
         "conn_data", "ttfb_ms", "_lock", "in_use", "h2_conn", "idle_since", "pool_key",
+        "leased",
     )
 
     def __init__(self, origin: tuple[str, str, int]):
@@ -67,9 +89,12 @@ class HTTPConnection:
         self.h2_conn: "Http2Connection | None" = None   # ALPN "h2" ise Http2Connection nesnesi
         self.idle_since: float      = 0.0
         self.pool_key               = origin     # rotasyonda proxy'yi de içerir
+        # Havuzda boşta DEĞİLSE True: yeni oluşturulan bağlantı yaratanındır; havuza
+        # dönünce False olur. release() yalnızca True iken iş yapar (çift iade koruması).
+        self.leased: bool           = True
 
     def connect(self, timeout: float = 30.0, resolver=None,
-                proxy: "ProxyConfig | None" = None) -> None:
+                proxy: "ProxyConfig | None" = None, io: "IOTimeouts | None" = None) -> None:
         """Hedef sunucuya ham TCP bağlantısı kurar (IPv4 + IPv6).
 
         Args:
@@ -81,6 +106,8 @@ class HTTPConnection:
                 çözülür (resolver kullanılmaz). Düz ``http://`` hedef + HTTP
                 proxy'sinde tünel kurulmaz: soket proxy'nin kendisine açılır ve
                 ``conn_data["forward_proxy"]`` işaretlenir (mutlak biçimli istek).
+            io: Opsiyonel ``IOTimeouts``; proxy tüneli (CONNECT/SOCKS5) gönderimleri
+                ``io.write`` (kalan ``total`` ile kısaltılmış) ile sınırlanır.
         """
         scheme, host, port = self.origin
 
@@ -89,7 +116,7 @@ class HTTPConnection:
                 self.socket = connect_to_proxy(proxy, timeout=timeout)
                 self.conn_data["forward_proxy"] = proxy
             else:
-                self.socket = connect_via_proxy(proxy, host, port, timeout=timeout)
+                self.socket = connect_via_proxy(proxy, host, port, timeout=timeout, io=io)
             self.is_closed = False
             return
 
@@ -200,9 +227,13 @@ class ConnectionPool:
         self.resolver        = resolver
         self._pools: dict[tuple, list[HTTPConnection]] = collections.defaultdict(list)
         self._semaphores: dict[tuple, threading.Semaphore] = {}
+        # Kısa süreli kilit: _pools/_semaphores/_in_use/_closed. Tutulurken G/Ç yapılmaz.
         self._lock = threading.Lock()
+        self._in_use: set[HTTPConnection] = set()      # acquire() ile verilmiş, iade edilmemiş
+        self._closed = False
+        self._on_drained: list = []                     # close() sonrası, son iadede çalışır
 
-                                                                               
+
 
     def _key(self, origin: tuple, proxy=None) -> tuple:
         key = origin if proxy is None else origin + (proxy,)
@@ -210,64 +241,96 @@ class ConnectionPool:
             key += (("mtls", self.tls_scope),)
         return key
 
+    def _semaphore_locked(self, key: tuple) -> threading.Semaphore:
+        sem = self._semaphores.get(key)
+        if sem is None:
+            sem = self._semaphores[key] = threading.Semaphore(self.max_connections)
+        return sem
+
     def _get_semaphore(self, origin: tuple) -> threading.Semaphore:
         with self._lock:
-            if origin not in self._semaphores:
-                self._semaphores[origin] = threading.Semaphore(self.max_connections)
-            return self._semaphores[origin]
+            return self._semaphore_locked(origin)
 
-                                                                              
+    @property
+    def closed(self) -> bool:
+        return self._closed
+
+
 
     def acquire(self, url: URL, block: bool = True, timeout: Optional[float] = None,
                 proxy: Optional[str] = None,
-                connect_timeout: Optional[float] = None) -> HTTPConnection:
+                connect_timeout: Optional[float] = None,
+                io: "IOTimeouts | None" = None) -> HTTPConnection:
         """
         URL için en hızlı canlı bağlantıyı döner.
         Yoksa yeni bağlantı kurar. Concurrency limiti Semaphore ile korunur.
 
+        Dönen bağlantı çağırana ÖZELDİR (``release()`` edilene kadar başka iş
+        parçacığına verilmez). Havuz kapatılmışsa ``RuntimeError``.
+
         ``proxy``: proxy rotasyonu için istek başına proxy URL'i (``self.proxy``'yi
-        geçersiz kılar; bağlantılar proxy başına ayrı havuzlanır).
+        geçersiz kılar; bağlantılar proxy başına ayrı havuzlanır). ``io``: proxy
+        tüneli gönderimlerinin süresi (bkz. :meth:`HTTPConnection.connect`).
         """
+        if self._closed:
+            raise RuntimeError(POOL_CLOSED_MESSAGE)
         origin = (url.scheme, url.host, url.port)
         key = self._key(origin, proxy)
         sem = self._get_semaphore(key)
 
-                                                                
-        acquired = sem.acquire(blocking=block, timeout=timeout or self.timeout)
+        if block:
+            acquired = sem.acquire(timeout=timeout or self.timeout)
+        else:
+            acquired = sem.acquire(blocking=False)
         if not acquired:
             raise TimeoutError(f"Bağlantı havuzu dolu ({self.max_connections}), zaman aşımı.")
 
         now = time.monotonic()
+        stale: list[HTTPConnection] = []
+        conn: Optional[HTTPConnection] = None
         with self._lock:
+            if self._closed:
+                # close() semaphore beklenirken geldi: slotu geri ver, istek başlamaz.
+                sem.release()
+                raise RuntimeError(POOL_CLOSED_MESSAGE)
             pool = self._pools[key]
             pool.sort()  # en düşük TTFB önce
             while pool:
-                conn = pool.pop(0)
-                if conn.is_closed or conn.in_use:
+                c = pool.pop(0)
+                if c.is_closed or c.in_use:
                     continue
-                if self.idle_timeout and (now - conn.idle_since) > self.idle_timeout:
+                if self.idle_timeout and (now - c.idle_since) > self.idle_timeout:
                     # Sunucu bunu çoktan kapatmış olabilir; kullanıcıya kesin
                     # başarısız olacak bir bağlantı vermektense yenisini kur.
-                    logger.debug("Boşta kalma süresi aşıldı, bağlantı atılıyor: %s", origin)
-                    conn.close()
+                    stale.append(c)
                     continue
-                conn.in_use = True
-                return conn
+                conn = c
+                break
+            fresh = conn is None
+            if conn is None:
+                conn = HTTPConnection(origin)
+                conn.pool_key = key
+            conn.in_use = True
+            conn.leased = True
+            self._in_use.add(conn)
+        for c in stale:
+            logger.debug("Boşta kalma süresi aşıldı, bağlantı atılıyor: %s", origin)
+            c.close()
+        if not fresh:
+            return conn
 
-                                              
-        conn = HTTPConnection(origin)
-        conn.pool_key = key
         try:
             conn.connect(timeout=connect_timeout or self.timeout, resolver=self.resolver,
                          proxy=(self.proxy_for(url) if proxy is None
-                                else resolve_proxy(proxy, url.scheme)))
-        except Exception:
+                                else resolve_proxy(proxy, url.scheme)),
+                         **({"io": io} if io is not None else {}))
+        except BaseException:
             # Bağlantı kurulamadı: bu slot için hiç bağlantı verilmeyecek,
             # semaphore'u serbest bırakmazsak kalıcı olarak sızar (havuz asla
             # dolmaz gibi görünüp aslında hep dolu kalır).
-            sem.release()
+            conn.close()
+            self.release(conn)
             raise
-        conn.in_use = True
         return conn
 
     def proxy_for(self, url: URL) -> "ProxyConfig | None":
@@ -275,29 +338,41 @@ class ConnectionPool:
         return select_proxy(url.scheme, url.host, url.port, self.proxy, self.env_proxies)
 
     def release(self, conn: HTTPConnection) -> None:
-        """Bağlantıyı Keep-Alive amacıyla havuza geri koy."""
-        conn.in_use = False
-        origin = conn.pool_key
-        sem    = self._get_semaphore(origin)
+        """Bağlantıyı Keep-Alive amacıyla havuza geri koy (kapalıysa yalnızca slotu iade et).
 
-        if not conn.is_closed:
-            conn.idle_since = time.monotonic()
-            with self._lock:
-                pool = self._pools[origin]
+        İdempotent: zaten iade edilmiş bağlantı için hiçbir şey yapmaz. Havuz
+        kapatılmışsa bağlantı havuza konmaz, kapatılır."""
+        to_close: Optional[HTTPConnection] = None
+        drained: list = []
+        with self._lock:
+            if not conn.leased:
+                return
+            conn.leased = False
+            conn.in_use = False
+            self._in_use.discard(conn)
+            origin = conn.pool_key
+            sem = self._semaphore_locked(origin)
+            if not conn.is_closed:
                 keep = getattr(self, "max_keepalive_connections", None)
                 if keep is None:
                     keep = self.max_connections
                 # keepalive_expiry=0: keep-alive KAPALI (AsyncSession/httpx ile aynı);
                 # None: süre sınırı yok.
                 no_keepalive = self.idle_timeout is not None and self.idle_timeout <= 0
-                if len(pool) < keep and not no_keepalive:
-                    pool.append(conn)
+                if self._closed or no_keepalive or len(self._pools.get(origin, ())) >= keep:
+                    to_close = conn
                 else:
-                    conn.close()
-
+                    conn.idle_since = time.monotonic()
+                    self._pools[origin].append(conn)
+            if self._closed and not self._in_use and self._on_drained:
+                drained, self._on_drained = self._on_drained, []
+        if to_close is not None:
+            to_close.close()
         sem.release()
+        for cb in drained:
+            cb()
 
-                                                                              
+
 
     def prewarm(
         self,
@@ -311,6 +386,8 @@ class ConnectionPool:
         tls_negotiate_fn: TLSAdapter.negotiate uyumlu callable (opsiyonel)
         Döner: {host: başarılı_bağlantı_sayısı}
         """
+        if self._closed:
+            raise RuntimeError(POOL_CLOSED_MESSAGE)
         results: dict[str, int] = {}
 
         def _make_conn(host: str, idx: int) -> tuple[str, bool]:
@@ -326,14 +403,17 @@ class ConnectionPool:
                 conn.idle_since = time.monotonic()
                 with self._lock:
                     # Havuz sınırını prewarm de aşamamalı; aksi hâlde
-                    # max_connections sessizce anlamsızlaşır.
+                    # max_connections sessizce anlamsızlaşır. Bu arada close()
+                    # çağrıldıysa bağlantı havuza konmaz.
                     pkey = self._key(origin)
                     conn.pool_key = pkey
-                    if len(self._pools[pkey]) < self.max_connections:
+                    added = not self._closed and len(self._pools[pkey]) < self.max_connections
+                    if added:
+                        conn.leased = False
                         self._pools[pkey].append(conn)
-                    else:
-                        conn.close()
-                        return host, False
+                if not added:
+                    conn.close()
+                    return host, False
                 return host, True
             except Exception as e:
                 logger.debug("Ön ısıtma başarısız (%s): %s", host, e)
@@ -357,21 +437,49 @@ class ConnectionPool:
                                                                               
 
     def close_all(self) -> None:
+        """Boştaki bağlantıları kapatır; havuz kullanılabilir kalır (bkz. :meth:`close`)."""
         with self._lock:
-            for conns in self._pools.values():
-                for c in conns:
-                    c.close()
+            idle = [c for conns in self._pools.values() for c in conns]
             self._pools.clear()
+        for c in idle:
+            c.close()
+
+    def close(self, on_drained=None) -> None:
+        """Havuzu KALICI olarak kapatır (``Session.close``).
+
+        Boştaki bağlantılar hemen kapanır; başka iş parçacıklarının kullandığı
+        bağlantılar kesilmez, iade edildiklerinde kapatılır. Sonraki ``acquire()``
+        (semaphore bekleyen iş parçacıkları dahil) ``RuntimeError`` verir.
+        ``on_drained``: kirada bağlantı kalmayınca bir kez çağrılır (hemen ya da son
+        ``release()`` içinde)."""
+        with self._lock:
+            self._closed = True
+            idle = [c for conns in self._pools.values() for c in conns]
+            self._pools.clear()
+            run_now = not self._in_use
+            if on_drained is not None and not run_now:
+                self._on_drained.append(on_drained)
+        for c in idle:
+            c.close()
+        if on_drained is not None and run_now:
+            on_drained()
 
     def stats(self) -> dict:
-        """Her origin için havuz istatistiği döner."""
+        """Her origin için havuz istatistiği döner (``idle``: boşta, ``in_use``: kirada)."""
         with self._lock:
             grouped: dict = {}
             for (s, h, p, *_proxy), conns in self._pools.items():
                 grouped.setdefault(f"{s}://{h}:{p}", []).extend(conns)
+            busy: dict[str, int] = {}
+            for c in self._in_use:
+                s, h, p = c.pool_key[:3]
+                name = f"{s}://{h}:{p}"
+                busy[name] = busy.get(name, 0) + 1
+                grouped.setdefault(name, [])
             return {
                 name: {
                     "idle": len(conns),
+                    "in_use": busy.get(name, 0),
                     "avg_ttfb_ms": round(
                         sum(c.ttfb_ms for c in conns if c.ttfb_ms != float("inf"))
                         / max(len([c for c in conns if c.ttfb_ms != float("inf")]), 1),

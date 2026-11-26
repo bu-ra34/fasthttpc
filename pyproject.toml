@@ -137,5 +137,6 @@ files = [
     "fasthttpc/timeout.py",
     "fasthttpc/_log.py",
     "fasthttpc/transport/mock.py",
+    "fasthttpc/transport/iotimeout.py",
     "fasthttpc/multipart.py",
 ]
