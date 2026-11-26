@@ -36,10 +36,24 @@ def _asession(srv, **kw) -> AsyncSession:
     return AsyncSession(verify=srv.ca_path, **kw)
 
 
+def _same_bytes(got: bytes, want: bytes, what: str = "gövde") -> None:
+    """Bayt eşitliği; uyuşmazlıkta yalnızca uzunluk, SHA-256 ve ilk farkın çevresinden kısa
+    bir alıntı gösterilir (pytest'in dev bayt dizileri için difflib çıktısı saatler sürebilir)."""
+    if len(got) == len(want) and hashlib.sha256(got).digest() == hashlib.sha256(want).digest():
+        return
+    i = next((k for k, (a, b) in enumerate(zip(got, want)) if a != b), min(len(got), len(want)))
+    lo = max(0, i - 16)
+    pytest.fail(
+        f"{what} farklı: alınan {len(got)} bayt (sha256 {hashlib.sha256(got).hexdigest()[:16]}), "
+        f"beklenen {len(want)} bayt (sha256 {hashlib.sha256(want).hexdigest()[:16]}); "
+        f"ilk fark {i}. baytta: alınan {got[lo:i + 32]!r}, beklenen {want[lo:i + 32]!r}",
+        pytrace=False)
+
+
 def _check(kind: str, got: Got, body: bytes, *, known: bool) -> None:
     """Sunucunun aldığı gövde ``body`` ile bayt bayt aynı ve çerçeve doğru mu?"""
-    assert got.body == body
-    assert got.length == len(body)
+    assert got.length == len(body), (got.length, len(body))
+    _same_bytes(got.body, body)
     _check_framing(kind, got, len(body), known=known)
 
 
@@ -50,7 +64,8 @@ def _check_framing(kind: str, got: Got, n: int, *, known: bool) -> None:
         assert h.get("content-length") == (str(n) if known else None)
         assert got.frames, "DATA frame'i yok"
         assert all(size <= MAX_FRAME for size, _ in got.frames)
-        assert [end for _, end in got.frames] == [False] * (len(got.frames) - 1) + [True]
+        ends = [i for i, (_, end) in enumerate(got.frames) if end]
+        assert ends == [len(got.frames) - 1], f"END_STREAM frame'leri {ends[:5]}, toplam {len(got.frames)}"
         if n:
             assert got.frames[-1][0] > 0, "END_STREAM son VERİ frame'inde olmalı"
         assert sum(size for size, _ in got.frames) == n
@@ -114,15 +129,30 @@ def test_dosya_sifirdan_farkli_konumda(srv, tmp_path):
 
 
 def test_metin_kipi_dosya_utf8(srv, tmp_path):
+    """Metin kipi dosya: ``read()``'in döndürdüğü metin UTF-8 kodlanıp gönderilir. Dosya
+    içeriği platformdan bağımsız yazılır (``write_text`` Windows'ta varsayılan olarak LF'yi
+    CRLF yapar); okuma tarafındaki satır sonu çevirisi Python'un ``newline`` kuralıdır."""
     text = "ğüşiöç €\n" * 5000
-    p = tmp_path / "t.txt"
-    p.write_text(text, encoding="utf-8")
-    with _session(srv) as s, open(p, encoding="utf-8", newline="") as f:
-        s.post(f"{srv.base}/echo", data=f)
-        s.post(f"{srv.base}/echo", data=io.StringIO("şç"))
+    lf = tmp_path / "lf.txt"
+    lf.write_text(text, encoding="utf-8", newline="\n")      # dosyada LF, her platformda
+    crlf = tmp_path / "crlf.txt"
+    crlf.write_bytes("satır-ç\r\n".encode() * 3000)          # dosyada CRLF, her platformda
+    with _session(srv) as s:
+        with open(lf, encoding="utf-8", newline="") as f:
+            s.post(f"{srv.base}/echo", data=f)
+        with open(crlf, encoding="utf-8") as f:                # newline=None: CRLF -> LF
+            want_universal = f.read()
+            f.seek(0)
+            s.post(f"{srv.base}/echo", data=f)
+        with open(crlf, encoding="utf-8", newline="") as f:    # çeviri yok: CRLF korunur
+            s.post(f"{srv.base}/echo", data=f)
+        s.post(f"{srv.base}/echo", data=io.StringIO("şç\n"))
+    _same_bytes(want_universal.encode(), ("satır-ç\n" * 3000).encode(), "f.read()")
     # Metin: bayt uzunluğu önceden bilinemez -> chunked (h2: content-length yok).
     _check(srv.kind, srv.requests[0], text.encode("utf-8"), known=False)
-    _check(srv.kind, srv.requests[1], "şç".encode(), known=False)
+    _check(srv.kind, srv.requests[1], want_universal.encode("utf-8"), known=False)
+    _check(srv.kind, srv.requests[2], "satır-ç\r\n".encode() * 3000, known=False)
+    _check(srv.kind, srv.requests[3], "şç\n".encode(), known=False)
 
 
 def test_uretec_chunked(srv):
@@ -312,7 +342,7 @@ def test_bayt_listesi_form_degil_acik_hata(srv):
 
 def test_multipart_dosyalar_eksiksiz(srv, tmp_path):
     p = tmp_path / "notlar.txt"
-    p.write_text("çğü metin\n", encoding="utf-8")
+    p.write_text("çğü metin\n", encoding="utf-8", newline="\n")   # her platformda LF
     with _session(srv) as s, open(p, encoding="utf-8") as tf, open(p, "rb") as bf:
         s.post(f"{srv.base}/echo", data=[("alan", "1"), ("alan", 2)],
                files={"metin": tf, "ikili": bf, "bio": ("b.bin", io.BytesIO(b"\x00\x01")),
