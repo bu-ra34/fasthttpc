@@ -16,7 +16,8 @@ stream yönetimi vardır:
     yeniden denenebilir).
   * Parmak izi tutarlılığı: ön ek + SETTINGS baytları, senkron
     ``Http2Connection.send_preface_and_settings`` çalıştırılarak ELDE EDİLİR
-    (kopya sabit yok), pseudo-header sırası ve HPACK kodlaması aynıdır.
+    (kopya sabit yok), pseudo-header sırası ve HPACK kodlaması (profilin
+    HpackPolicy'si; bağlantı başına dinamik tablo) aynıdır.
 
 Akış (``stream``) arayüzü: ``read(n)`` (await), ``write(b)``, ``drain()``
 (await), ``close()``, ``wait_closed()`` (await). Hem
@@ -278,7 +279,10 @@ class AsyncHttp2Connection:
         self._decoder = HpackDecoder(
             max_table_size=h2_setting(self._h2, 0x1, HPACK_DEFAULT_TABLE_SIZE),
             max_header_list_size=HPACK_MAX_HEADER_LIST_SIZE)
-        self._encoder = HpackEncoder()
+        # Bağlantı başına HPACK kodlayıcı (profilin tarayıcısının politikası).
+        # Dinamik tablo eşin çözücüsüyle senkron kalmalı: bloklar telde gidecekleri
+        # sırayla kodlanır (bkz. _send_headers).
+        self._encoder = HpackEncoder(self._h2.get("hpack"))
         self._buf = bytearray()
         self._streams: dict[int, _Stream] = {}
         self._next_stream_id = 1
@@ -624,7 +628,11 @@ class AsyncHttp2Connection:
                 if not 16384 <= value <= 16777215:
                     raise self._conn_error(1, "MAX_FRAME_SIZE geçersiz")
                 self._peer_max_frame = value
-            # 0x1 HEADER_TABLE_SIZE: encoder dinamik tablo kullanmıyor (literal), 0x2/0x6 bilgi
+            elif ident == 0x1:
+                # Sunucu çözücüsünün tablo sınırı: kodlayıcı hemen uygular, size
+                # update'i sonraki HEADERS bloğunun başına yazar (RFC 7541 §4.2).
+                self._encoder.set_peer_table_size(value)
+            # 0x2/0x6 bilgi
         self._write(_frame(FrameType.SETTINGS, 0x1, 0))
         self._wake()
 
@@ -672,6 +680,8 @@ class AsyncHttp2Connection:
         return st
 
     def _send_headers(self, sid: int, headers: "list[tuple[str, str]]", end_stream: bool) -> None:
+        # HPACK durumu bağlantı geneli: kodlama ile yazım arasında await YOK, yani
+        # eşzamanlı stream'lerin blokları telde kodlandıkları sırayla gider.
         block = self._encoder.encode(headers)
         max_frame = self._peer_max_frame
         prio = h2_headers_priority_field(self._h2)

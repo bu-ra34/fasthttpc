@@ -65,6 +65,47 @@ and expire after `keepalive_expiry` seconds (`0` disables keep-alive). Without
 `limits=`, `Session` allows 10 connections per origin and `AsyncSession` 100 in
 total (the `max_connections=` argument).
 
+### Decompressed body size
+
+```python
+from fasthttpc import Session, Limits, DecompressedSizeError
+
+Session(limits=Limits(max_decompressed_size=2 * 1024**3))   # allow up to 2 GiB
+Session(limits=Limits(max_decompressed_size=None))          # no limit (opt-out)
+```
+
+`max_decompressed_size` (bytes, default **256 MiB**) caps the size of a response
+body after decompression: `Content-Encoding` (`gzip`, `deflate`, `br`, `zstd`,
+including chains such as `gzip, br`) and the transfer codings `gzip`/`deflate`
+of HTTP/1.1. It protects against decompression bombs: a few kilobytes of gzip,
+or a few hundred bytes of brotli or zstd, can expand to gigabytes. Exceeding the
+limit raises `fasthttpc.DecompressedSizeError` (a `DecodeError`, so also a
+`ValueError`; attributes `limit` and `encoding`). The body is never silently
+truncated.
+
+- Decompression is incremental. The output of each decoder step is bounded
+  (zlib `max_length`, brotli `output_buffer_limit`, zstd in small input slices),
+  so memory does not grow past the limit before the check fires.
+- It applies to HTTP/1.1, HTTP/2 and HTTP/3, to `Session` and `AsyncSession`,
+  buffered and `stream=True`. When streaming, every decoded chunk is at most
+  about 64 KiB, and the limit applies to the total number of decoded bytes, so
+  `iter_bytes()`/`aiter_bytes()` raise once that total passes the limit. Every
+  step of a chain is limited.
+- Bodies without a `Content-Encoding` are not limited (they cost the server the
+  same bandwidth as the client), and `iter_raw()` still returns raw
+  `Content-Encoding` bytes.
+- At most 5 content codings are decoded per response (as in urllib3); a longer
+  `Content-Encoding` chain raises `DecodeError`.
+
+Why 256 MiB: that is over a thousand times a typical HTML page or JSON API
+response, so legitimate traffic does not reach it. A buffered body is held in
+memory as a single `bytes` object (plus a temporary copy while it is joined), so
+a default in the gigabyte range would still let one small compressed response
+use up the memory of a typical container or CI runner, which is the attack the
+limit exists to stop. If you expect larger compressed bodies (for example big
+exports or downloads that the server sends with `Content-Encoding`), raise the
+limit or pass `None`.
+
 ## `Retry`
 
 ```python

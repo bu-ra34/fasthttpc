@@ -36,9 +36,13 @@ with Session() as s:
 Decoding (gzip, deflate, br, zstd and chains such as `gzip, br`) behaves the
 same as for non-streamed responses: if the decoder for a `Content-Encoding` is
 not installed, the decoded iterators raise `fasthttpc.MissingDecoderError`
-instead of yielding compressed bytes; `iter_raw()` is unaffected. Each read of a
-streamed body is bounded by the request's own `read` timeout (also on a reused
-keep-alive or HTTP/2 connection).
+instead of yielding compressed bytes; `iter_raw()` is unaffected. Each decoded
+chunk is at most about 64 KiB, and once the total decoded size passes
+`Limits.max_decompressed_size` (256 MiB by default) the iterators raise
+`fasthttpc.DecompressedSizeError` (see
+[Decompressed body size](../timeouts-limits-retries.md#decompressed-body-size)).
+Each read of a streamed body is bounded by the request's own `read` timeout
+(also on a reused keep-alive or HTTP/2 connection).
 
 ## Async
 

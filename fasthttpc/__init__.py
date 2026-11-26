@@ -39,7 +39,7 @@ from .retry         import Retry
 from .transport.mock import MockTransport, BaseTransport
 from .multipart     import encode_multipart
 from .models.response import Response, HTTPStatusError
-from .streaming     import DecodeError, MissingDecoderError
+from .streaming     import DecodeError, DecompressedSizeError, MissingDecoderError
 from .models.request  import Request
 from .models.headers  import Headers
 from .models.urls     import URL
@@ -80,6 +80,7 @@ __all__ = [
     "HTTPStatusError",
     "DecodeError",
     "MissingDecoderError",
+    "DecompressedSizeError",
     "Request",
     "Headers",
     "URL",

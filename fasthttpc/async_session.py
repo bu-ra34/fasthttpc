@@ -31,8 +31,9 @@ from .metrics         import RequestMetrics
 from .cache           import ResponseCache
 from .cookies         import CookieJar
 from .multipart       import encode_multipart
-from .protocol.http1_parser import MAX_RESPONSE_HEADER_BYTES, parse_chunk_size
-from .streaming import decode_body
+from .protocol.http1_parser import (MAX_RESPONSE_HEADER_BYTES, BodyFraming, parse_chunk_size,
+                                    response_framing)
+from .streaming import DEFAULT_MAX_DECOMPRESSED_SIZE, IncrementalDecoder, decode_body
 from .models.request  import Request
 from .config          import Limits, Timeout, environ_ca_bundle, resolve_verify
 from .retry           import Retry
@@ -79,6 +80,15 @@ async def _maybe(out: Any) -> Any:
     """Hook düz değer ya da coroutine döndürebilir."""
     import inspect
     return await out if inspect.isawaitable(out) else out
+
+
+class _InnerTimeout(Exception):
+    """``_timed_exchange``: içteki (read/write) zaman aşımını dıştaki total'dan ayırt etmek
+    için taşıyıcı; bilerek ``TimeoutError`` alt sınıfı DEĞİL."""
+
+    def __init__(self, err: BaseException) -> None:
+        super().__init__(err)
+        self.err = err
 
 
 class ProxyRotator:
@@ -864,14 +874,23 @@ class AsyncSession:
         total = self._tmo().total
         if total is None:
             return await self._exchange(method, u, proxy, req_headers, raw_body, metrics, stream=stream)
-        t0 = time.perf_counter()
+        # Nedeni saati yeniden okuyarak değil, hatanın NEREDEN geldiğine bakarak belirle:
+        # içteki read/write zaman aşımı _InnerTimeout ile taşınır (TimeoutError değildir),
+        # dıştaki wait_for'un kendi zaman aşımı ise total'dır. Eskiden "geçen süre < total"
+        # karşılaştırması kaba saatli platformlarda (Windows) total'ı içteki hataya bağlıyordu.
+        async def inner() -> _ExchangeResult:
+            try:
+                return await self._exchange(method, u, proxy, req_headers, raw_body, metrics,
+                                            stream=stream)
+            except (TimeoutError, asyncio.TimeoutError) as e:
+                raise _InnerTimeout(e) from None
+
         try:
-            r: _ExchangeResult = await B.wait_for(
-                self._exchange(method, u, proxy, req_headers, raw_body, metrics, stream=stream), total)
+            r: _ExchangeResult = await B.wait_for(inner(), total)
             return r
+        except _InnerTimeout as e:
+            raise e.err from None        # içteki read/write zaman aşımı: mesajı korunur
         except asyncio.TimeoutError:
-            if time.perf_counter() - t0 < total:
-                raise                    # içteki read/write zaman aşımı: mesajı korunur
             raise asyncio.TimeoutError(
                 f"İstek toplam süre sınırını (Timeout.total={total} sn) aştı.") from None
 
@@ -1006,18 +1025,15 @@ class AsyncSession:
 
     @staticmethod
     def _h1_framing(method: str, status: int, headers: Headers) -> str:
-        """"none" | "chunked" | "length" | "eof" (RFC 9112 §6.3)."""
-        if method.upper() == "HEAD" or status in (204, 304) or 100 <= status < 200:
-            return "none"
-        if "chunked" in headers.get("transfer-encoding", "").lower():
-            return "chunked"
-        if headers.get("content-length", "").strip().isdigit():
-            return "length"
-        return "eof"
+        """"none" | "chunked" | "length" | "eof" (RFC 9112 §6.3; bkz.
+        :func:`~fasthttpc.protocol.http1_parser.response_framing`)."""
+        return response_framing(method, status, headers).kind
 
     @staticmethod
-    async def _h1_read_body(reader: Any, method: str, status: int, headers: Headers,
-                            first: bytes, read_to: Optional[float]) -> "tuple[bytes, int]":
+    async def _h1_read_body(reader: Any, framing: BodyFraming, first: bytes,
+                            read_to: Optional[float],
+                            max_size: Optional[int] = DEFAULT_MAX_DECOMPRESSED_SIZE,
+                            ) -> "tuple[bytes, int]":
         """HTTP/1.1 gövdesi (RFC 9112 §6.3): ``(gövde, artakalan_bayt)``.
 
         Eksik gövde ConnectionResetError'dır. ``artakalan_bayt`` > 0 ise bağlantıda
@@ -1025,13 +1041,39 @@ class AsyncSession:
         """
         state = _BodyState()
         parts = [c async for c in AsyncSession._h1_iter_body(
-            reader, method, status, headers, first, read_to, state)]
+            reader, framing, first, read_to, state, max_size=max_size)]
         return b"".join(parts), state.extra
 
     @staticmethod
-    async def _h1_iter_body(reader: Any, method: str, status: int, headers: Headers,
-                            first: bytes, read_to: Optional[float], state: "_BodyState",
-                            stream: bool = False) -> "AsyncGenerator[bytes, None]":
+    def _h1_iter_body(reader: Any, framing: BodyFraming, first: bytes,
+                      read_to: Optional[float], state: "_BodyState", stream: bool = False,
+                      max_size: Optional[int] = DEFAULT_MAX_DECOMPRESSED_SIZE,
+                      ) -> "AsyncGenerator[bytes, None]":
+        """:meth:`_h1_iter_framed` + ``chunked`` dışındaki aktarım kodlamalarının
+        (``Transfer-Encoding: gzip, chunked``) açılması (Content-Encoding ile aynı
+        ``max_size`` sınırı)."""
+        raw = AsyncSession._h1_iter_framed(reader, framing, first, read_to, state, stream)
+        if not framing.codings:
+            return raw
+        return AsyncSession._h1_transfer_decode(raw, framing.codings, max_size)
+
+    @staticmethod
+    async def _h1_transfer_decode(raw: "AsyncGenerator[bytes, None]", codings: "tuple[str, ...]",
+                                  max_size: Optional[int]) -> "AsyncGenerator[bytes, None]":
+        dec = IncrementalDecoder(", ".join(codings), max_size, strict=True)
+        try:
+            async for c in raw:
+                for out in dec.decode_iter(c):
+                    yield out
+            for out in dec.flush_iter():
+                yield out
+        finally:
+            await raw.aclose()
+
+    @staticmethod
+    async def _h1_iter_framed(reader: Any, framing: BodyFraming, first: bytes,
+                              read_to: Optional[float], state: "_BodyState",
+                              stream: bool = False) -> "AsyncGenerator[bytes, None]":
         """HTTP/1.1 gövdesini PARÇA PARÇA üretir (boş parça yok); sonunda
         ``state.extra`` artakalan bayt sayısıdır. ``stream=False`` iken
         bağlantı-kapanışlı (eof) gövdede 2 sn sessizlik gövdenin sonu sayılır
@@ -1040,13 +1082,12 @@ class AsyncSession:
             data: bytes = await B.wait_for(reader.read(65536), timeout=read_to)
             return data
 
-        framing = AsyncSession._h1_framing(method, status, headers)
-        if framing == "none":
+        if framing.kind == "none":
             state.extra = len(first)    # gövde YOK: bağlantıdan veri beklenmez
             return
 
         buf = bytearray(first)
-        if framing == "chunked":
+        if framing.kind == "chunked":
             async def need_line() -> int:
                 nl = buf.find(b"\r\n")
                 while nl == -1:
@@ -1093,8 +1134,8 @@ class AsyncSession:
                     raise ConnectionError("Chunked gövde bozuk: chunk verisinden sonra CRLF yok.")
                 del buf[:2]
 
-        if framing == "length":
-            n = int(headers.get("content-length", "").strip())
+        if framing.kind == "length":
+            n = framing.length
             got = 0
             while True:
                 if buf:
@@ -1229,37 +1270,40 @@ class AsyncSession:
                 hk, _, hv = line.partition(b":")
                 resp_headers._list.append((hk.strip(), hk.strip().lower(), hv.strip()))
 
-            framing = self._h1_framing(method, status_code, resp_headers)
-            streamable = stream and framing != "none" and not (
-                framing == "length" and int(resp_headers.get("content-length", "0").strip()) == 0)
+            http10 = lines[0].upper().startswith(b"HTTP/1.0")
+            # RFC 9112 §6.3; çelişkili/geçersiz çerçeveleme -> ConnectionError (bağlantı kapanır)
+            framing = response_framing(method, status_code, resp_headers, http10)
+            # TE+CL ya da kapanışla biten gövde: bağlantı bir daha kullanılmaz.
+            no_reuse = framing.close or framing.kind == "eof"
+            max_size = self.limits.max_decompressed_size
+            streamable = stream and framing.kind != "none" and not (
+                framing.kind == "length" and framing.length == 0)
             if streamable:
                 conn_tokens = {t.strip() for t in resp_headers.get("connection", "").lower().split(",")}
-                http10 = lines[0].upper().startswith(b"HTTP/1.0")
                 req_close = any(k.lower() == "connection" and "close" in str(v).lower()
                                 for k, v in req_headers.items())
                 reusable = (
                     status_code != 101 and not req_close and "close" not in conn_tokens
-                    and (not http10 or "keep-alive" in conn_tokens) and framing != "eof")
+                    and (not http10 or "keep-alive" in conn_tokens) and not no_reuse)
                 state = _BodyState()
-                agen = self._h1_iter_body(reader, method, status_code, resp_headers,
-                                          first_body_chunk, read_to, state, stream=True)
+                agen = self._h1_iter_body(reader, framing, first_body_chunk, read_to, state,
+                                          stream=True, max_size=max_size)
                 finished = True          # bağlantıyı akış yönetir
                 return (status_code, resp_headers,
                         _AsyncH1Stream(self, opened, agen, state, reusable),
                         send_time, "HTTP/1.1")
 
             body_raw, extra = await self._h1_read_body(
-                reader, method, status_code, resp_headers, first_body_chunk, read_to)
+                reader, framing, first_body_chunk, read_to, max_size)
 
             conn_tokens = {t.strip() for t in resp_headers.get("connection", "").lower().split(",")}
-            http10 = lines[0].upper().startswith(b"HTTP/1.0")
             req_close = any(k.lower() == "connection" and "close" in str(v).lower()
                             for k, v in req_headers.items())
             reusable = (
                 status_code != 101 and extra == 0 and not req_close
                 and "close" not in conn_tokens
                 and (not http10 or "keep-alive" in conn_tokens)
-                and self._h1_framing(method, status_code, resp_headers) != "eof"
+                and not no_reuse
             )
             return status_code, resp_headers, bytes(body_raw), send_time, "HTTP/1.1"
         except BaseException as e:
@@ -1345,7 +1389,7 @@ class AsyncSession:
 
             if isinstance(body_raw, (bytes, bytearray)):
                 ce  = resp_headers.get("content-encoding", "").lower()
-                body_final = decode_body(bytes(body_raw), ce)
+                body_final = decode_body(bytes(body_raw), ce, self.limits.max_decompressed_size)
             else:
                 body_final = b""
 
@@ -1355,6 +1399,7 @@ class AsyncSession:
                 resp = Response(status_code=status_code, headers=resp_headers, body=body_final)
             else:
                 resp = Response(status_code=status_code, headers=resp_headers, astream=body_raw)
+                resp._max_decompressed_size = self.limits.max_decompressed_size
             resp.http_version = http_version
             resp.tls_info = (None if u.scheme == "http"
                              else self._tls_infos.get((u.host, u.port, proxy_cfg)))

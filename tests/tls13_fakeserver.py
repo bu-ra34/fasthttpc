@@ -182,7 +182,11 @@ class FakeTLS13Server:
       tls12 (supported_versions göndermeme), wrong_session_id, oversize_record,
       cert_request, early_app_data, psk_with_cert (PSK kabulünden sonra yine de
       Certificate/CertificateVerify gönder), force_psk (ClientHello'da PSK
-      olmasa/HRR sonrası bile ServerHello'da pre_shared_key seç)
+      olmasa/HRR sonrası bile ServerHello'da pre_shared_key seç), double_hrr
+      (2. ClientHello'ya da HelloRetryRequest ile yanıt ver — RFC 8446 §4.1.4 ihlali),
+      double_ccs (ServerHello'dan sonra İKİ uyumluluk CCS'i), bad_ccs (CCS içeriği 0x02),
+      ccs_mid_message (split_records + no_ccs ile: CCS, bölünmüş bir handshake mesajının
+      iki şifreli parçası arasına), ccs_after_finished (CCS, sunucu Finished'ından sonra)
 
     psk_store: dict verilirse sunucu PSK resumption destekler: tam handshake
     sonrası gerçek (benzersiz) biletler verir ve ticket->PSK kaydını bu sözlükte
@@ -193,7 +197,9 @@ class FakeTLS13Server:
     def __init__(self, pki: PKI, *, suite: int = 0x1301, alpn: str | None = "http/1.1",
                  hrr_group: int | None = None, hrr_cookie: bytes | None = None,
                  tamper: set | None = None, tickets: int = 1,
-                 psk_store: dict | None = None):
+                 psk_store: dict | None = None, compress_cert=None):
+        # compress_cert(cert_msg) -> CompressedCertificate (hs 25) mesajı (RFC 8879) ya da None
+        self.compress_cert = compress_cert
         self.psk_store = psk_store
         self.resumed = False
         self.pki = pki
@@ -253,7 +259,8 @@ class FakeTLS13Server:
         ch = parse_client_hello(msg)
         self.client_hellos.append(ch)
         sid = ch["session_id"]
-        if self.state == "WAIT_CH" and self.hrr_group is not None:
+        if self.hrr_group is not None and (
+                self.state == "WAIT_CH" or (self.state == "WAIT_CH2" and "double_hrr" in self.tamper)):
             # HelloRetryRequest
             exts = ext(43, b"\x03\x04") + ext(51, struct.pack("!H", self.hrr_group))
             if self.hrr_cookie:
@@ -280,12 +287,16 @@ class FakeTLS13Server:
             shared = priv.exchange(x25519.X25519PublicKey.from_public_bytes(peer))
             pub = priv.public_key().public_bytes(serialization.Encoding.Raw,
                                                  serialization.PublicFormat.Raw)
-        else:
+        elif group in (0x0017, 0x0018):
             curve = {0x0017: ec.SECP256R1(), 0x0018: ec.SECP384R1()}[group]
             priv = ec.generate_private_key(curve)
             shared = priv.exchange(ec.ECDH(), ec.EllipticCurvePublicKey.from_encoded_point(curve, peer))
             pub = priv.public_key().public_bytes(serialization.Encoding.X962,
                                                  serialization.PublicFormat.UncompressedPoint)
+        else:   # secp521r1 / x448 / ffdhe: HRR ile istenen grup için sunucu payı
+            from fasthttpc.security.keyshare import compute_shared_secret, generate_key_share
+            priv, pub = generate_key_share(group)
+            shared = compute_shared_secret(group, priv, peer)
 
         psk = None
         if "force_psk" in self.tamper:           # teklif edilmemiş PSK'yı seçen kötü niyetli sunucu
@@ -306,6 +317,8 @@ class FakeTLS13Server:
         self.transcript += sh
         out = struct.pack("!BHH", 22, 0x0303, len(sh)) + sh
         if "no_ccs" not in self.tamper:
+            out += b"\x14\x03\x03\x00\x01" + (b"\x02" if "bad_ccs" in self.tamper else b"\x01")
+        if "double_ccs" in self.tamper:
             out += b"\x14\x03\x03\x00\x01\x01"
 
         # key schedule
@@ -348,6 +361,8 @@ class FakeTLS13Server:
                              + struct.pack("!H", len(entry_ext)) + entry_ext
                              for d in self.pki.chain_der())
             cert_msg = hs(11, b"\x00" + len(certs).to_bytes(3, "big") + certs)
+            if self.compress_cert is not None:
+                cert_msg = self.compress_cert(cert_msg)
             self.transcript += cert_msg
             msgs.append(cert_msg)
         if "skip_cv" not in self.tamper and send_cert:
@@ -380,6 +395,9 @@ class FakeTLS13Server:
         elif "split_records" in self.tamper:
             for i in range(0, len(flight), 50):
                 out += self.write.seal(flight[i:i + 50], 22)
+                if i == 0 and "ccs_mid_message" in self.tamper:
+                    assert len(flight) > 50 and len(msgs[0]) < 50, "ilk 50 bayt bir mesajı bölmeli"
+                    out += b"\x14\x03\x03\x00\x01\x01"
         else:
             for i, m in enumerate(msgs):
                 out += self.write.seal(m, 22)
@@ -395,6 +413,8 @@ class FakeTLS13Server:
         self.s_ats = expand_label(self.h, master, "s ap traffic", th_sf, hl)
         self.app_write = self._traffic(self.s_ats)
         self.state = "WAIT_FINISHED"
+        if "ccs_after_finished" in self.tamper:
+            out += b"\x14\x03\x03\x00\x01\x01"
         return out
 
     def _select_psk(self, ch: dict, msg: bytes):
@@ -428,6 +448,9 @@ class FakeTLS13Server:
         return None
 
     def _on_encrypted(self, content: bytes, ctype: int) -> bytes:
+        if ctype == 21:                  # istemcinin (şifreli) alert'i: kaydet
+            self.alerts.append(content)
+            return b""
         alps = "alps" in self.tamper or "alps_new" in self.tamper
         if self.state == "WAIT_FINISHED" and alps and content[:1] == b"\x08":
             # ALPS: istemci EncryptedExtensions'ı Finished'tan ÖNCE gelir ve transcript'e girer.

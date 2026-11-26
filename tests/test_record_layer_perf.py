@@ -5,7 +5,7 @@ import struct
 import pytest
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM, ChaCha20Poly1305
 
-from fasthttpc.security.tls_adapter import EncryptedSocket
+from fasthttpc.security.tls_adapter import EncryptedSocket, TLSProtocolError
 
 
 class FakeSock:
@@ -54,14 +54,50 @@ def test_recv_many_records_chunked(name, klen, cls, chunk):
     aead = cls(st["app_server_write_key"])
     msgs = [os.urandom(n) for n in (0 + 1, 100, 16000, 3, 777)]
     wire = b"".join(_seal(aead, st["app_server_write_iv"], i, m, pad=i) for i, m in enumerate(msgs))
-    # Araya change_cipher_spec record'u (yok sayılmalı)
-    wire = b"\x14\x03\x03\x00\x01\x01" + wire
+    # (Uyumluluk CCS'i el sıkışma SONRASI artık reddedilir — RFC 8446 §5; parça parça gelen
+    # CCS'in atlanması test_uyumluluk_ccs_el_sikisma_sirasinda_bir_kez_atlanir'da.)
     es = EncryptedSocket(FakeSock(wire, chunk), st)
     for m in msgs:
         data, t = es.recv_record()
         assert t == 0x17 and data == m
     assert st["app_server_seq_num"] == len(msgs)
     assert len(es.read_buffer) == 0 and es._rbuf_off == 0
+
+
+def _hs_state():
+    """El sıkışma (handshake anahtarları) aşamasındaki EncryptedSocket durumu."""
+    st = _state("AES", 16)
+    st.update(using_app_keys=False, server_write_key=os.urandom(16), server_write_iv=os.urandom(12))
+    return st
+
+
+@pytest.mark.parametrize("chunk", [1, 5, 13, 16384])
+def test_uyumluluk_ccs_el_sikisma_sirasinda_bir_kez_atlanir(chunk):
+    st = _hs_state()
+    aead = AESGCM(st["server_write_key"])
+    wire = CCS_REC + _seal(aead, st["server_write_iv"], 0, b"\x08\x00\x00\x02\x00\x00", ctype=22)
+    es = EncryptedSocket(FakeSock(wire, chunk), st)
+    assert es.recv_record() == (b"\x08\x00\x00\x02\x00\x00", 22)
+    assert st["ccs_seen"] and st["server_seq_num"] == 1
+
+
+CCS_REC = b"\x14\x03\x03\x00\x01\x01"
+
+
+@pytest.mark.parametrize("extra,payload,match", [
+    ({"ccs_seen": True}, b"\x01", "ikinci change_cipher_spec"),
+    ({"using_app_keys": True}, b"\x01", "el sıkışma bittikten sonra"),
+    ({"hs_buffered": True}, b"\x01", "change_cipher_spec, bölünmüş bir handshake"),
+    ({}, b"\x02", "geçersiz change_cipher_spec içeriği"),
+    ({}, b"\x01\x01", "geçersiz change_cipher_spec içeriği"),
+])
+def test_uyumluluk_ccs_kurallari(extra, payload, match):
+    st = _hs_state()
+    st.update(extra)
+    wire = struct.pack("!BHH", 20, 0x0303, len(payload)) + payload
+    es = EncryptedSocket(FakeSock(wire, 16384), st)
+    with pytest.raises(TLSProtocolError, match="unexpected_message: " + match):
+        es.recv_record()
 
 
 def test_post_handshake_skipped_and_buffer_offset():

@@ -12,7 +12,8 @@ yardımcı fonksiyonlar içerir. İki yol da aynı mantığı kullanır:
 
 KAPSAM — yalnızca modern ve güvenli alt küme; gerisi AÇIK HATAYLA reddedilir:
 
-  Anahtar değişimi : yalnızca ECDHE (x25519, secp256r1, secp384r1).
+  Anahtar değişimi : yalnızca ECDHE (x25519, x448, secp256r1, secp384r1,
+                     secp521r1; RFC 8422 — ClientHello'da ilan edilmiş olmalı).
                      Statik RSA, DHE, PSK, anonim, export: YOK.
   Suite'ler        : ECDHE-{ECDSA,RSA}-AES128-GCM-SHA256 (0xC02B/0xC02F),
                      ECDHE-{ECDSA,RSA}-AES256-GCM-SHA384 (0xC02C/0xC030),
@@ -40,6 +41,11 @@ GÜVENLİK — sunucu kimliği ve bütünlüğü şu kontrollerle sağlanır (he
                           ServerKeyExchange -> ServerHelloDone; sonra
                           (NewSessionTicket) -> ChangeCipherSpec -> Finished.
                           Sıra dışı/tekrar mesaj ``unexpected_message`` ile reddedilir.
+  6. Record tipi        : her record'un içerik tipi, GÖVDESİ okunmadan/çözülmeden önce
+                          duruma göre denetlenir (``_check_record_type``). Örn. sunucu
+                          CCS'i beklenirken gelen handshake/application_data record'u
+                          ayrıştırılmadan ``unexpected_message`` ile reddedilir; alert
+                          kodu şifreli metnin rastgele baytlarına bağlı OLAMAZ.
 """
 from __future__ import annotations
 
@@ -56,7 +62,7 @@ from ..transport.lingering import shutdown_and_drain
 from .alerts import describe_alert
 from .cert_validator import CertificateValidationError
 from .keyshare import (
-    SUPPORTED_GROUPS,
+    ECDHE_GROUPS,
     compute_shared_secret,
     generate_key_share,
     group_name,
@@ -757,9 +763,10 @@ def verify_server_key_exchange(ske: ServerKeyExchange, client_random: bytes, ser
     from cryptography.hazmat.primitives import hashes as _h
     from cryptography.hazmat.primitives.asymmetric import ec, padding, rsa
 
-    if ske.group not in SUPPORTED_GROUPS:
+    # RFC 8422 §5.4: named_curve yalnızca eliptik eğri olabilir (ffdhe/hibrit gruplar değil).
+    if ske.group not in ECDHE_GROUPS:
         raise _illegal(f"Sunucu desteklenmeyen eğri seçti: {group_name(ske.group)} "
-                       f"(desteklenenler: x25519, secp256r1, secp384r1).")
+                       f"(desteklenenler: {', '.join(group_name(g) for g in sorted(ECDHE_GROUPS))}).")
     if ske.group not in offered_groups:
         raise _illegal(f"Sunucu supported_groups'ta ilan etmediğimiz eğriyi ({group_name(ske.group)}) seçti.")
 
@@ -823,6 +830,10 @@ class HandshakeOrder12:
       WAIT_SHD -> ServerHelloDone -> WAIT_TAIL      (istemci uçuşu gönderilir)
       WAIT_TAIL -> [NewSessionTicket] -> ChangeCipherSpec(kayıt katmanı) -> WAIT_FIN
       WAIT_FIN  -> Finished -> CONNECTED
+
+    WAIT_TAIL'de sunucu session_ticket uzantısını kabul ettiyse NewSessionTicket ZORUNLUDUR
+    ve CCS'ten önce gelir (RFC 5077 §3.3); kabul etmediyse ya da bilet alındıysa yalnızca
+    CCS geçerlidir (``awaiting_ccs``). Bu pencerede HelloRequest de yok sayılmaz.
 
     mTLS (RFC 5246 §7.3): CertificateRequest YALNIZCA ServerKeyExchange'ten sonra, ServerHelloDone'dan
     önce ve en fazla bir kez geçerlidir (durum WAIT_SHD'de kalır); başka konumda/tekrar -> unexpected_message.
@@ -895,6 +906,16 @@ class HandshakeOrder12:
         self.state = nxt
         return nxt
 
+    @property
+    def nst_pending(self) -> bool:
+        """WAIT_TAIL'de zorunlu NewSessionTicket henüz gelmedi (RFC 5077 §3.3)."""
+        return self.state == "WAIT_TAIL" and self.ticket_ok and not self.ticket_seen
+
+    @property
+    def awaiting_ccs(self) -> bool:
+        """Sunucudan bir sonraki geçerli şey YALNIZCA ChangeCipherSpec (ya da alert)."""
+        return self.state == "WAIT_TAIL" and not self.nst_pending
+
     def check(self, hs_type: int) -> None:
         """``expect`` ile aynı denetim, ama durumu DEĞİŞTİRMEDEN."""
         probe = HandshakeOrder12(self.ticket_ok, self.status_ok, self.static_rsa)
@@ -902,9 +923,17 @@ class HandshakeOrder12:
         probe.cert_request_seen = self.cert_request_seen
         probe.expect(hs_type)
 
-    def on_ccs(self) -> None:
+    def check_ccs(self) -> None:
+        """CCS bu durumda geçerli mi? (durumu DEĞİŞTİRMEZ)"""
         if self.state != "WAIT_TAIL":
             raise _unexpected(f"{self.state} durumunda beklenmeyen ChangeCipherSpec.")
+        if self.nst_pending:
+            raise _unexpected(
+                "NewSessionTicket beklenirken ChangeCipherSpec alındı — session_ticket uzantısını "
+                "kabul eden sunucu NewSessionTicket'ı CCS'ten önce göndermelidir (RFC 5077 §3.3).")
+
+    def on_ccs(self) -> None:
+        self.check_ccs()
         self.state = "WAIT_FIN"
 
 
@@ -1055,6 +1084,8 @@ class TLS12ClientConnection:
                 if ver[0] != 3 or ver[1] not in (1, 2, 3):
                     raise _err(AL_PROTOCOL_VERSION, "protocol_version",
                                f"record sürümü geçersiz: 0x{ver.hex()}.")
+                # İçerik tipi, gövde beklenmeden/okunmadan durumla karşılaştırılır.
+                self._check_record_type(rtype)
                 limit = MAX_CIPHERTEXT if self._read is not None else MAX_PLAINTEXT
                 if rlen > limit:
                     raise _err(AL_RECORD_OVERFLOW, "record_overflow",
@@ -1118,22 +1149,44 @@ class TLS12ClientConnection:
         self.state = ST_CLOSED
         self._master = None
 
-    def _handle_record(self, rtype: int, ver: bytes, payload: bytes, events: list) -> None:
+    def _check_record_type(self, rtype: int) -> None:
+        """Record'un İÇERİK TİPİNİ, gövdesine bakmadan mevcut duruma göre denetler.
+
+        Böylece sıra dışı bir record'un alert'i (``unexpected_message``) gövdedeki —
+        ör. CCS'siz gönderilmiş şifreli bir Finished'ın rastgele — baytlara bağlı olmaz
+        (RFC 5246 §7.1: Finished'tan önce CCS gelmelidir; §7.4: sıra dışı handshake).
+        """
+        order = self._order
+        st = order.state if order is not None else self.state
         if rtype == CT_CHANGE_CIPHER_SPEC:
-            if self._read is not None:
-                raise _unexpected("ikinci ChangeCipherSpec alındı.")
-            if payload != b"\x01":
-                raise _illegal("ChangeCipherSpec içeriği 0x01 değil.")
+            if order is None or self._read is not None:
+                raise _unexpected(f"{st} durumunda beklenmeyen (ya da ikinci) ChangeCipherSpec.")
+            order.check_ccs()
             if self._hsbuf:
                 raise _unexpected("handshake mesajı tamamlanmadan ChangeCipherSpec geldi.")
-            if self._order is None:
-                raise _unexpected("ChangeCipherSpec ServerHello'dan önce geldi.")
+        elif rtype == CT_HANDSHAKE:
+            if order is not None and order.awaiting_ccs:
+                raise _unexpected(
+                    "ChangeCipherSpec beklenirken handshake record'u alındı — sunucu "
+                    "ChangeCipherSpec olmadan Finished (ya da başka bir handshake mesajı) "
+                    "gönderdi; record içeriği ayrıştırılmadan reddedildi (RFC 5246 §7.1).")
+        elif rtype == CT_APPLICATION_DATA:
+            if self.state != ST_CONNECTED:
+                raise _unexpected(f"handshake bitmeden ({st} durumunda) application data alındı.")
+            if self._hsbuf:
+                raise _unexpected("yarım handshake mesajı arasında application data.")
+        elif rtype != CT_ALERT:
+            raise _unexpected(f"beklenmeyen record tipi {rtype}.")
+
+    def _handle_record(self, rtype: int, ver: bytes, payload: bytes, events: list) -> None:
+        # İçerik tipi/durum uyumu receive_data'da (_check_record_type) zaten denetlendi.
+        if rtype == CT_CHANGE_CIPHER_SPEC:
+            if payload != b"\x01":
+                raise _illegal("ChangeCipherSpec içeriği 0x01 değil.")
             self._order.on_ccs()
             self._read = self._pending_read
             self._pending_read = None
             return
-        if rtype not in (CT_ALERT, CT_HANDSHAKE, CT_APPLICATION_DATA):
-            raise _unexpected(f"beklenmeyen record tipi {rtype}.")
 
         if self._read is not None:
             pt = self._read.open(rtype, ver, payload)
@@ -1143,10 +1196,6 @@ class TLS12ClientConnection:
             pt = payload
 
         if rtype == CT_APPLICATION_DATA:
-            if self.state != ST_CONNECTED:
-                raise _unexpected("handshake bitmeden application data alındı.")
-            if self._hsbuf:
-                raise _unexpected("yarım handshake mesajı arasında application data.")
             if pt:
                 events.append(ApplicationData(pt))
             return
@@ -1183,8 +1232,13 @@ class TLS12ClientConnection:
     def _feed_handshake(self, data: bytes, events: list) -> None:
         self._hsbuf += data
         while len(self._hsbuf) >= 4 and self.state != ST_CLOSED:
-            if self._order is not None and self._hsbuf[0] != HS_HELLO_REQUEST:
-                self._order.check(self._hsbuf[0])      # tip, sıraya uymuyorsa gövdeyi beklemeden reddet
+            # Tip, sıraya uymuyorsa gövdeyi (ve uzunluk alanını) beklemeden reddet. HelloRequest
+            # el sıkışma sırasında yok sayılır (RFC 5246 §7.4.1.1) — ama istemci uçuşundan sonra
+            # (WAIT_TAIL) değil: orada yalnızca NewSessionTicket/CCS gelebilir ve AES-GCM'nin
+            # sıfır explicit nonce'u "boş HelloRequest" gibi görünürdü.
+            if self._order is not None and (self._hsbuf[0] != HS_HELLO_REQUEST
+                                            or self._order.state == "WAIT_TAIL"):
+                self._order.check(self._hsbuf[0])
             hs_len = int.from_bytes(self._hsbuf[1:4], "big")
             if hs_len > MAX_HANDSHAKE_MESSAGE:
                 raise _illegal(f"handshake mesajı çok büyük ({hs_len} bayt).")

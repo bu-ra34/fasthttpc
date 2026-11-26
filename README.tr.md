@@ -51,7 +51,7 @@ pytest        # ağ gerektirmez (canlı testler FASTHTTPC_LIVE=1 olmadan atlanı
 | Alan | Destek |
 |---|---|
 | Protokoller | HTTP/1.1 (keep-alive, chunked; düz `http://` dahil), HTTP/2 (akış kontrolü, GOAWAY; eşzamanlı akışlar `AsyncSession`'da), WebSocket (`ws://`, `wss://`), HTTP/3 (**deneysel**, isteğe bağlı, aşağıya bakın) |
-| TLS | Kendi TLS 1.3'ümüz (HelloRetryRequest; key_share x25519, secp256r1, secp384r1 ve `cryptography` ML-KEM sunuyorsa hibrit post-kuantum X25519MLKEM768) ve TLS 1.2'nin güvenli bir alt kümesi (ECDHE + AEAD, EMS zorunlu). TLS 1.3 PSK oturum devamı var ama varsayılan kapalı; 0-RTT yok |
+| TLS | Kendi TLS 1.3'ümüz (HelloRetryRequest; key_share x25519, x448, secp256r1, secp384r1, secp521r1, ffdhe2048, ffdhe3072 ve `cryptography` ML-KEM sunuyorsa hibrit post-kuantum X25519MLKEM768) ve TLS 1.2'nin güvenli bir alt kümesi (ECDHE + AEAD, EMS zorunlu). TLS 1.3 PSK oturum devamı var ama varsayılan kapalı; 0-RTT yok |
 | Sunucu doğrulaması | Zincir + hostname, CertificateVerify, Finished, hepsi zorunlu; `verify=` ile özel CA bundle |
 | İstemci sertifikası | `cert=` (mTLS): PEM, şifreli PKCS#8 veya PKCS#12; RSA >= 2048, P-256, P-384, Ed25519; TLS 1.3 ve TLS 1.2 |
 | Parmak izi | `chrome_158`, `firefox_160`, `safari_27` (2026-11 itibarıyla güncel kararlı sürümler; eski `chrome_131`, `firefox_133`, `safari_18` korunur): ClientHello (JA3/JA4; Chrome'un ALPS 17613, trust anchor ID ve ML-DSA imza şemaları dahil), HTTP/2 SETTINGS, pseudo-header sırası, başlık sırası. Kaynaklar ve bilinen sapmalar: [profiller](https://bu-ra34.github.io/fasthttpc/profiles/) |
@@ -71,9 +71,15 @@ HTTP/3 (`http3=True`: Alt-Svc keşfi ve sessizce HTTP/2'ye düşüş, ya da
 `http3="force"`) **deneyseldir** ve varsayılan kapalıdır. `fasthttpc[http3]`
 (aioquic) gerektirir. QUIC içindeki TLS el sıkışmasını aioquic yapar; bu yüzden
 tarayıcı ClientHello parmak izi HTTP/3'te **taşınmaz**, yalnızca QUIC transport
-parametreleri ve HTTP/3 SETTINGS Chrome benzeri bir profili izler. Yalnızca yerel
-bir aioquic sunucusuna karşı test edildi: gerçek sunuculara karşı isteğe bağlı
-canlı testler var (`tests/live/`), ama CI'da çalışmıyor.
+parametreleri ve HTTP/3 SETTINGS Chrome benzeri bir profili izler. Ağsız test
+paketi HTTP/3'ü yerel bir aioquic sunucusuna karşı sınar. Ayrıca canlı HTTP/3
+testleri (`tests/live/`) ayrı bir "Live tests" GitHub Actions iş akışında,
+haftalık ve elle tetiklenerek, GitHub'ın Ubuntu, macOS ve Windows makinelerinde
+Cloudflare (`cloudflare-quic.com`), nginx (`quic.nginx.org`) ve Google
+(`www.google.com`) sunucularına karşı çalışır: zorunlu HTTP/3 istekleri (sync ve
+async), Alt-Svc keşfi, HTTP/2'ye düşüş ve QUIC üzerinde sertifika reddi. Bu iş
+akışı push/PR CI'ının parçası değildir; canlı bir hata birleştirmeyi engellemez
+([ayrıntılar](https://bu-ra34.github.io/fasthttpc/testing/#live-http3-tests)).
 
 ## Karşılaştırma
 
@@ -86,7 +92,7 @@ Dürüst karşılaştırma; burada "olgunluk" özellikler kadar önemlidir.
 | Tarayıcı TLS/JA3/JA4 taklidi | Evet (3 aile) | Hayır | Hayır | Evet (çok sürüm, en geniş kapsam) |
 | HTTP/2 parmak izi | Evet | Hayır | Hayır | Evet |
 | HTTP/2 | Evet | Hayır | Evet | Evet |
-| HTTP/3 | **Deneysel**, isteğe bağlı (aioquic); QUIC'te tarayıcı TLS parmak izi yok; yalnızca yerel testler | Hayır | Hayır | Evet |
+| HTTP/3 | **Deneysel**, isteğe bağlı (aioquic); QUIC'te tarayıcı TLS parmak izi yok; ağsız testler + haftalık canlı testler (Cloudflare, nginx, Google) | Hayır | Hayır | Evet |
 | Async | Evet (asyncio, anyio üzerinden trio) | Hayır | Evet (asyncio, anyio üzerinden trio) | Evet |
 | `verify=False` | **Bilinçli olarak desteklenmez** | Evet | Evet | Evet |
 | Oturum devamı / 0-RTT | TLS 1.3 PSK oturum devamı, **varsayılan kapalı**; 0-RTT yok | Evet (OpenSSL) | Evet (OpenSSL) | Evet |
@@ -244,6 +250,7 @@ eskisi gibi çalışır; `from fasthttpc.timeout import Timeout` aynı sınıft�
 | `max_connections` | 10 | `Session`'da origin başına, `AsyncSession`'da toplam eşzamanlı bağlantı (`AsyncSession`'ın `max_connections` varsayılanı 100) |
 | `max_keepalive_connections` | `None` (= `max_connections`) | Havuzda boşta tutulan bağlantı |
 | `keepalive_expiry` | 30.0 | Boştaki bağlantının ömrü (sn); `None` → sınırsız, `0` → keep-alive kapalı |
+| `max_decompressed_size` | 256 MiB | Content-Encoding (gzip/deflate/br/zstd) ya da aktarım kodlaması açıldıktan sonra gövde için üst sınır (bayt); aşılınca `DecompressedSizeError` (sıkıştırma bombası koruması, akışta da toplam üzerinden; gövde asla sessizce kısaltılmaz). `None` → sınırsız |
 
 ### Yeniden deneme (`retries`)
 
@@ -446,7 +453,8 @@ verir veya belgelenmiştir:
 - **TLS 1.2: varsayılan olarak yalnızca güvenli bir alt küme desteklenir**
   (`fasthttpc/security/tls12.py`, hem senkron hem async yolda). TLS 1.3 tercih
   edilir; sunucu TLS 1.2 seçerse:
-  - *Desteklenen:* ECDHE (x25519, secp256r1, secp384r1) + ECDSA/RSA sertifika;
+  - *Desteklenen:* ECDHE (x25519, x448, secp256r1, secp384r1, secp521r1; profilin
+    ilan ettiği bir eğri olmalı) + ECDSA/RSA sertifika;
     AES-128-GCM, AES-256-GCM, ChaCha20-Poly1305 (0xC02B, 0xC02F, 0xC02C, 0xC030,
     0xCCA9, 0xCCA8); ServerKeyExchange imza algoritmaları ecdsa, rsa_pss_rsae ve
     rsa_pkcs1 (SHA-256/384/512; ClientHello'da ilan edilenlerden biri olmalı).
@@ -471,28 +479,35 @@ verir veya belgelenmiştir:
   `FASTHTTPC_TLS_RESUMPTION=1` ile açılır (yalnızca `psk_dhe_ke`, biletler tek
   kullanımlık). Kapalıyken her bağlantı tam handshake yapar. 0-RTT hiç yoktur;
   HTTP/3'te oturum devamı kullanılmaz.
-- **HPACK huffman ENCODE yok** (decode var). Protokolde geçerli, ama h2 parmak
-  izinde küçük bir sapma yaratır.
-- **key_share grupları:** x25519, secp256r1, secp384r1 ve hibrit post-kuantum
-  X25519MLKEM768. X25519MLKEM768 Chrome ve Firefox profillerinde ve `safari_27`'de,
-  yalnızca kurulu `cryptography` ML-KEM sunuyorsa (47 ve üstü) gönderilir; aksi
-  halde supported_groups'tan da çıkarılır ve ClientHello gerçek tarayıcıdan
-  ayrışır. `chrome_158`'in ML-DSA imza şemaları da `cryptography` 48+ ister. secp521r1/x448/ffdhe implemente edilmedi: bunlar için
-  key_share *gönderilmez*; profil supported_groups'ta ilan ediyorsa (Firefox,
-  Safari) ve sunucu HRR ile bunları isterse açık hata verilir.
+- **HPACK kodlama tarayıcıya göre:** Huffman, dinamik tablo, cookie parçalama ve
+  tablo boyutu güncellemesi profilin tarayıcısı gibi (Chrome: QUICHE, Firefox:
+  `Http2Compression.cpp`). Safari'nin kodlayıcısı kapalı kaynak; yalnızca kısmen
+  doğrulandı (bkz. [HTTP/2](docs/http2.md#hpack-header-compression)).
+- **key_share grupları:** x25519, x448, secp256r1, secp384r1, secp521r1,
+  ffdhe2048, ffdhe3072 ve hibrit post-kuantum X25519MLKEM768. X25519MLKEM768
+  Chrome ve Firefox profillerinde ve `safari_27`'de, yalnızca kurulu
+  `cryptography` ML-KEM sunuyorsa (47 ve üstü) gönderilir; aksi halde
+  supported_groups'tan da çıkarılır ve ClientHello gerçek tarayıcıdan ayrışır.
+  `chrome_158`'in ML-DSA imza şemaları da `cryptography` 48+ ister.
+  secp521r1/x448/ffdhe için ilk ClientHello'da key_share *gönderilmez* (gerçek
+  tarayıcılar gibi); sunucu profilin ilan ettiği birini HRR ile isterse 2.
+  ClientHello'da gönderilir. ffdhe yalnızca TLS 1.3'tedir; x448'i hiçbir profil
+  ilan etmez.
 - **HTTP/3 deneyseldir:** proxy üzerinden ve `cert=` ile kullanılmaz, trio
   altında kullanılmaz (`http3=True` HTTP/2'ye ya da 1.1'e düşer, `"force"` açık
   `Http3ConnectError` verir), yanıt gövdesini tamamen okur (`stream=True` ile de), QUIC
-  içindeki ClientHello aioquic'indir (tarayıcı parmak izi yok). Yalnızca yerel
-  aioquic sunucusuyla test edildi.
+  içindeki ClientHello aioquic'indir (tarayıcı parmak izi yok). Gerçek
+  sunuculara (Cloudflare, nginx, Google) karşı canlı testler her push/PR'da değil,
+  yalnızca haftalık ve elle tetiklenen ayrı bir iş akışında çalışır.
 - Senkron tarafta bir HTTP/2 bağlantısı aynı anda tek isteği taşır (`Session`
   thread-safe'tir; eşzamanlı iş parçacıkları origin başına `max_connections`'a kadar
   ayrı havuz bağlantıları kullanır).
 - **`verify=False` yok** (bilinçli; yukarıya bakın).
 - `Timeout.total`, başlıklar geldikten sonra akış (`stream=True`) gövdesinin
   okunmasını sınırlamaz (oradaki her okuma `read` ile sınırlıdır).
-- İç güvenlik incelemesinin açık bulguları (ör. açılmış gövde boyutuna sınır
-  yok, çerezlerde Public Suffix List yok) [docs/security-audit.md](docs/security-audit.md)'de.
+- İç güvenlik incelemesinin açık bulguları (ör. çerezlerde Public Suffix List
+  yok, TLS 1.3 şifre takımı ve ALPN teklifle karşılaştırılmıyor)
+  [docs/security-audit.md](docs/security-audit.md)'de.
 
 ## Modül yapısı
 

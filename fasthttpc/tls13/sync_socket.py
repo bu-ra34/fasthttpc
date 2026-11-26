@@ -44,7 +44,19 @@ class SyncTLSSocket:
             data = raw_socket.recv(65536)
             if not data:
                 raise ConnectionResetError("TLS handshake sırasında sunucu bağlantıyı kapattı.")
-            events = conn.receive_data(data)
+            try:
+                events = conn.receive_data(data)
+            except Exception:
+                # Async yolla aynı: çekirdeğin kuyruğa aldığı fatal alert (ör. RFC 8879
+                # bad_certificate) best-effort gönderilir; gönderim hatası asıl hatayı örtmez.
+                try:
+                    out = conn.data_to_send()
+                    if out:
+                        raw_socket.sendall(out)
+                        shutdown_and_drain(raw_socket)
+                except OSError:
+                    pass
+                raise
             out = conn.data_to_send()
             if out:
                 raw_socket.sendall(out)
