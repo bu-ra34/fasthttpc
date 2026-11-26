@@ -25,17 +25,18 @@ No Critical or High findings were identified.
 | FHC-04 | Low | Lenient chunk-size parsing; chunk terminator not checked | Fixed |
 | FHC-05 | Low | Unbounded HTTP/1.1 response header accumulation | Fixed |
 | FHC-06 | Low | Loose parsing of the TLS 1.3 `Certificate` message | Fixed |
-| FHC-07 | Low | No limit on decompressed response size | Open |
-| FHC-08 | Low | No Public Suffix List for multi-label suffixes | Open |
-| FHC-09 | Low | Conflicting `Transfer-Encoding` / `Content-Length` responses are not treated as errors | Open |
+| FHC-07 | Low | No limit on decompressed response size | Fixed |
+| FHC-08 | Low | No Public Suffix List for multi-label suffixes | Fixed |
+| FHC-09 | Low | Conflicting `Transfer-Encoding` / `Content-Length` responses are not handled per RFC 9112 | Fixed |
 | FHC-10 | Info | TLS 1.3 cipher suite and ALPN not checked against what was offered | Open |
-| FHC-11 | Info | Sync TLS 1.3 record layer accepts compatibility CCS after the handshake | Open |
-| FHC-12 | Info | Unbounded count of TLS 1.2 warning alerts / TLS 1.3 handshake CCS records | Open |
+| FHC-11 | Info | Sync TLS 1.3 record layer accepts compatibility CCS after the handshake | Fixed |
+| FHC-12 | Info | Unbounded count of TLS 1.2 warning alerts / TLS 1.3 handshake CCS records | Partially fixed (CCS) |
 | FHC-13 | Info | `rsa_pss_pss_*` CertificateVerify schemes accepted with rsaEncryption keys | Open |
 | FHC-14 | Info | Low-level `TLSClientConnection(cert_validator=...)` hook can replace validation | Open |
 | FHC-15 | Info | Legacy CBC (MAC-then-encrypt) Lucky13 mitigation is best effort | Open (by design) |
 | FHC-16 | Info | DoH query string is built without URL-encoding the host name | Open |
 | FHC-17 | Info | PSK resumption reuses the ticket's peer certificate without re-checking validity | Open |
+| FHC-18 | Low | TLS 1.3 `CompressedCertificate` decompressed without a size limit, before authentication | Fixed |
 | — | — | Async TLS handshake failure sends no alert to the server | Fixed separately in 0.6.1 |
 
 ## Findings
@@ -94,8 +95,8 @@ control characters. Violations raise `ValueError` and nothing is sent.
 
 ### FHC-03 — Cookie `Domain=` scoped to a TLD or IP suffix (Medium, Fixed)
 
-**Location:** `fasthttpc/cookies.py:63` (`_domain_attr_allowed`), used by
-`parse_set_cookie` at line 131.
+**Location:** `fasthttpc/cookies.py:72` (`_domain_attr_allowed`), used through
+`_domain_attr_verdict` (line 85) by `parse_set_cookie` at line 187.
 
 **Description.** The `Domain` attribute was accepted whenever the request host
 ended with it. A response from `attacker.com` with `Set-Cookie: sid=x; Domain=com`
@@ -112,8 +113,22 @@ other site under the same TLD.
 **Fix.** On an IP host the `Domain` attribute is ignored (host-only cookie).
 Single-label values (`com`, `.com`, `local`) are not accepted as a cookie
 domain; the cookie stays host-only. Normal registrable domains
-(`Domain=example.com` from `a.example.com`) work as before. Multi-label public
-suffixes are still open, see FHC-08.
+(`Domain=example.com` from `a.example.com`) work as before.
+
+*Update (with FHC-08, after 0.7.0):* an invalid `Domain` no longer falls back to
+a host-only cookie; the cookie is ignored entirely, as in browsers:
+
+* a public suffix, multi-label ones included (`com`, `co.uk`), unless it equals
+  the request host, which gives a host-only cookie (RFC 6265 section 5.3
+  step 5, see FHC-08);
+* a value the request host does not domain-match, such as `Domain=bank.com`
+  from `evil.com` (step 6);
+* on an IP host, any value other than the IP itself (IPv6 in brackets, as in
+  the URL). `Domain=0.0.1` from `10.0.0.1` used to give a host-only cookie and
+  is now ignored; `Domain=10.0.0.1` gives a host-only cookie. This follows
+  Chromium (`net/cookies/cookie_util.cc`, `GetCookieDomainWithString`) and
+  Firefox (`netwerk/cookie/CookieValidation.cpp`,
+  `CookieValidation::CheckDomain`), checked in their sources on 2026-11-24.
 
 ### FHC-04 — Lenient chunked-encoding parsing (Low, Fixed)
 
@@ -164,37 +179,148 @@ issue, not an authentication bypass.
 
 **Fix.** These cases now raise `CertificateValidationError`.
 
-### FHC-07 — No limit on decompressed body size (Low, Open)
+### FHC-07 — No limit on decompressed body size (Low, Fixed)
 
-**Location:** `fasthttpc/protocol/http1_parser.py:122` (`_decompress`),
-`fasthttpc/streaming.py`.
+**Location:** `fasthttpc/streaming.py:159` (`_OneDecoder`), `:321`
+(`IncrementalDecoder`) and `:391` (`decode_body`). This single decoder is now used
+by every path: buffered HTTP/1.1, HTTP/2 and HTTP/3 in `fasthttpc/session.py:523`,
+`:566`, `:1069` and `fasthttpc/async_session.py:1304`, HTTP/1.1 transfer codings
+(`session.py:687`, `async_session.py:1024`), `stream=True`
+(`fasthttpc/models/response.py:259`) and the older helpers
+`HTTP1Parser._decompress` (`fasthttpc/protocol/http1_parser.py:214`) and
+`http2_parser.StreamingDecompressor`. The setting is
+`Limits.max_decompressed_size` (`fasthttpc/config.py:164`).
 
-A small gzip/brotli/zstd body can expand to gigabytes when the body is buffered
-(the default when `stream=False`). requests and httpx behave the same way.
-**Recommendation:** add a `max_decompressed_size` (or reuse a response-size limit)
-and use incremental decompressors with `max_length` in the buffered path too.
+**Description.** Each decoder was called once on its whole input
+(`zlib.decompress`, `brotli.decompress`, zstd `decompressobj().decompress()`),
+with no limit on the output. In the buffered path the input is the whole body,
+and with `stream=True` it is one received chunk. 1 MiB of gzip expands to about
+1 GiB, and a ~100-byte brotli or ~2 KiB zstd body expands to 64 MiB or more, so
+the memory was used up before any code could look at the size. Chains such as
+`Content-Encoding: gzip, br` multiplied the ratios. requests and httpx behaved
+the same way.
 
-### FHC-08 — No Public Suffix List (Low, Open)
+**Exploit scenario.** Any server the client contacts, including one reached
+through a redirect, answers with a few kilobytes of compressed data. The client
+process runs out of memory and is killed, which is a cheap remote denial of
+service against crawlers and API clients.
 
-**Location:** `fasthttpc/cookies.py:63`.
+**Fix.** `Limits(max_decompressed_size=...)` limits the decompressed size of a
+response body. The default is 256 MiB (finite, but over a thousand times a
+typical page or API response), and `None` disables the limit explicitly.
+Decompression is incremental and every step has a bounded output: zlib
+`decompressobj().decompress(data, max_length)`, brotli
+`process(data, output_buffer_limit=...)` (brotli/brotlicffi 1.2 is now the
+minimum; with an older version the input is fed in 32-byte slices), and zstd
+through `stream_writer` with an output callback that counts bytes, fed small
+input slices. Exceeding the limit raises `DecompressedSizeError` (a
+`DecodeError`) as soon as it happens. The body is never truncated silently.
+Every step of a chain is limited, at most 5 content codings are decoded (as in
+urllib3), streamed chunks are at most about 64 KiB, and the limit applies to the
+total streamed size. The async HTTP/3 path also stopped decoding bodies twice.
+Regression tests: the F7 section of `tests/test_security_audit.py` (bombs
+generated in the test for every coding and for chains, HTTP/1.1 and HTTP/2, sync
+and async, buffered and streamed, peak memory, a body just under the limit,
+`None`) and `test_h3_sikistirma_bombasi_*` in `tests/test_http3.py`.
 
-After FHC-03, `Domain=co.uk` or `Domain=github.io` is still accepted from
-`a.co.uk` / `x.github.io`. **Recommendation:** check the attribute against the
-Public Suffix List (an optional dependency, or a vendored snapshot), as
-browsers do.
+### FHC-08 — No Public Suffix List (Low, Fixed)
 
-### FHC-09 — Conflicting message framing not treated as an error (Low, Open)
+**Location:** `fasthttpc/cookies.py:85` (`_domain_attr_verdict`), used by
+`parse_set_cookie` at line 187; the list lookup is `fasthttpc/_psl.py`.
 
-**Location:** `fasthttpc/session.py:529` (`_body_framing`),
-`fasthttpc/async_session.py:901` (`_h1_framing`).
+**Description.** After FHC-03, only single-label `Domain` values were refused.
+`Domain=co.uk` from `example.co.uk`, or `Domain=github.io` from `x.github.io`,
+was still accepted and created a cookie for the whole suffix. The same held for
+the PRIVATE section of the Public Suffix List (`herokuapp.com` and similar
+hosting domains) and for IDN suffixes (`Domain=рф`).
 
-A response with both `Transfer-Encoding: chunked` and `Content-Length` is decoded
-as chunked (correct) but the connection is kept for reuse. A `Transfer-Encoding`
-in which `chunked` is not the final coding is still treated as chunked (substring
-match). RFC 9112 section 6.1/6.3 says such messages should be treated as framing
-errors and the connection closed. **Recommendation:** parse the coding list,
-require `chunked` to be last, and close the connection when both headers are
-present.
+**Exploit scenario.** As in FHC-03, one level down: a long-lived `Session`
+visits `attacker.github.io` (anyone can publish there) and later
+`victim.github.io`; or `evil.co.uk` and later a bank under `.co.uk`. The
+attacker's cookie is sent to the other site (session fixation / cookie
+tossing). A cookie set on an intermediate redirect response is enough.
+
+**Fix.** The `Domain` attribute is checked against a snapshot of the Public
+Suffix List that ships inside the package (`fasthttpc/public_suffix_list.dat.gz`,
+ICANN and PRIVATE sections, version `2026-11-23_15-54-01_UTC`, upstream commit
+`faf981a2`; MPL-2.0, see `LICENSE-PSL`). Nothing is downloaded at runtime. The
+lookup follows the official algorithm: normal rules, wildcards (`*.ck`),
+exceptions (`!www.ck`) and the default rule `*`. Names are compared
+case-insensitively, without a trailing dot, and with IDN labels converted to
+A-labels by the same function on the list and on the host side. Following
+RFC 6265 section 5.3 step 5, a cookie whose `Domain` is a public suffix is
+ignored entirely, unless the attribute equals the request host, in which case
+the cookie is host-only. The last `Domain` attribute counts (step 4). `Session`
+and `AsyncSession` share the `CookieJar`, and cookies set on redirect hops go
+through the same check. The list is parsed on first use, once per process
+(about 8 ms). The regression tests are in `tests/test_security_audit.py`
+(section F8); the lookup is also tested against the official PSL test vectors
+in `tests/test_psl.py`. `scripts/update_psl.py` refreshes the snapshot.
+
+### FHC-09 — Conflicting message framing not handled per RFC 9112 (Low, Fixed)
+
+**Location:** `fasthttpc/protocol/http1_parser.py:88` (`response_framing`), used
+by the sync reader (`fasthttpc/session.py:1030`), the async reader
+(`fasthttpc/async_session.py:1200`) and `HTTP1Parser.parse`. Before the fix,
+`Session._body_framing` and `AsyncSession._h1_framing` decided the framing on
+their own.
+
+**Description.** The framing was chosen by looking for the substring `chunked`
+in `Transfer-Encoding`. A response with both `Transfer-Encoding: chunked` and
+`Content-Length` was decoded as chunked, but the connection went back to the
+pool. A coding list in which `chunked` was not last was still read as chunked.
+Other transfer codings were ignored, so `Transfer-Encoding: gzip, chunked`
+returned the compressed bytes as the body. Several different `Content-Length`
+values, or an invalid one, made the client read until the connection closed, and
+an HTTP/1.0 response with `Transfer-Encoding` was parsed as chunked.
+
+**Exploit scenario.** Through an intermediary that frames the response
+differently, or from a compromised origin, the client and the other side
+disagree about where the response ends. The bytes left over on a reused
+keep-alive connection are then read as the next response (response splitting or
+queue poisoning).
+
+**Fix.** The framing follows RFC 9112 sections 6.1-6.3:
+
+* Both `Transfer-Encoding` and `Content-Length`: `Transfer-Encoding` overrides
+  `Content-Length` (section 6.3 item 3). The response is processed, then the
+  connection is closed and never returned to the pool. This is not treated as an
+  error. Section 6.3 says such a message "ought to be handled as an error", which
+  is not a MUST. Section 6.1 explains that early implementations sent both
+  headers legitimately (`Content-Length` as a progress estimate), which is why
+  `Transfer-Encoding` overrides instead of making the two incompatible. The risk
+  for a client is reusing a connection that may be out of sync, and closing it
+  removes that risk, the same way section 6.1 requires a server to close the
+  connection after a request with both headers. curl (`http_size()` in
+  `lib/http.c` ignores `Content-Length` when the body is chunked) and Chromium
+  (`HttpStreamParser::CalculateResponseBodySize`: "chunked trumps
+  Content-Length") both accept these responses, so an error would break servers
+  that work with them. Unlike them, fasthttpc does not reuse the connection
+  afterwards, which costs only a new connection.
+* `Content-Length` without `Transfer-Encoding`: repeated or comma-separated
+  values are accepted when they are all the same valid number (`5, 5`). Values
+  that differ, or any value that is not 1*DIGIT, are an unrecoverable framing
+  error (section 6.3 item 5) and raise `ConnectionError`. The connection is
+  closed and the response discarded. curl rejects these as well ("Invalid
+  Content-Length"), and Chromium rejects differing copies
+  (`ERR_RESPONSE_HEADERS_MULTIPLE_CONTENT_LENGTH`).
+* `Transfer-Encoding` whose final coding is not `chunked`: the body is read until
+  the connection closes (section 6.3 item 4). The transfer codings `gzip`,
+  `x-gzip` and `deflate` are decoded, with the same `max_decompressed_size` limit
+  as FHC-07. Any other coding (`compress`, `br`, unregistered names), or
+  `chunked` followed by another coding, raises `ConnectionError`. curl also
+  rejects `chunked` in a position other than last. Repeated `chunked` entries (the
+  header sent twice) count once, and the obsolete `identity` is ignored.
+* HTTP/1.0 response with `Transfer-Encoding`: the framing is treated as faulty
+  (section 6.1). Neither `Transfer-Encoding` nor `Content-Length` is trusted, the
+  body is read until close, and the connection is closed.
+* HEAD, 1xx, 204 and 304 responses have no body, so their framing headers are
+  ignored.
+
+Regression tests: the F9 section of `tests/test_security_audit.py` (every case
+above, sync and async, buffered and streamed, including that the connection is
+not reused after `Transfer-Encoding` + `Content-Length` and is reused after
+`Content-Length: 5, 5`).
 
 ### FHC-10 — Negotiated suite / ALPN not checked against the offer (Info, Open)
 
@@ -208,24 +334,33 @@ cannot change these values. Only the authenticated server itself can pick
 something unexpected. (The TLS 1.2 path already checks both.)
 **Recommendation:** compare against the parsed ClientHello, as `tls12.py` does.
 
-### FHC-11 — CCS tolerated after the TLS 1.3 handshake (Info, Open)
+### FHC-11 — CCS tolerated after the TLS 1.3 handshake (Info, Fixed)
 
-**Location:** `fasthttpc/security/tls_adapter.py:466` (`EncryptedSocket.recv_record`).
+**Location:** `fasthttpc/security/tls_adapter.py` (`EncryptedSocket.recv_record`).
 
 RFC 8446 section 5 requires an `unexpected_message` abort when a CCS arrives
-after the peer's Finished. The sync path drops it silently (a code comment says
-this is intentional for a performance test). The sans-IO path already rejects it.
-There is no known impact because the record carries no data.
+after the peer's Finished. The sync path dropped it silently (a code comment said
+this was intentional for a performance test). The sans-IO path already rejected it.
+There was no known impact because the record carries no data.
 
-### FHC-12 — Unbounded warning alerts / compatibility CCS (Info, Open)
+**Fix:** both paths now share `check_compat_ccs`: a CCS after the handshake is
+`unexpected_message`.
 
-**Location:** `fasthttpc/security/tls12.py:1175`,
-`fasthttpc/tls13/connection.py:388`.
+### FHC-12 — Unbounded warning alerts / compatibility CCS (Info, Partially fixed)
+
+**Location:** `fasthttpc/security/tls12.py` (`_on_alert`),
+`fasthttpc/tls13/connection.py` (`_handle_record`).
 
 Before the handshake is authenticated, an on-path attacker can inject any number
 of TLS 1.2 warning alerts or TLS 1.3 compatibility CCS records, and each one is
 silently dropped. The cost is bounded by bandwidth. **Recommendation:** cap the
 count, as is already done for `HelloRequest`.
+
+**Partial fix:** the TLS 1.3 compatibility CCS is now dropped at most once per
+handshake, on both paths (RFC 8446 appendix D.4: the server sends it once, right
+after its first handshake message). A second CCS, a CCS between the fragments of
+a handshake message (section 5.1) and a CCS before a TLS 1.2 ServerHello are
+`unexpected_message`. TLS 1.2 warning alerts are still not counted.
 
 ### FHC-13 — `rsa_pss_pss_*` accepted with rsaEncryption keys (Info, Open)
 
@@ -276,6 +411,53 @@ PSK resumption is **off by default**. When it is on, a resumed connection report
 the certificate validated on the original handshake (tickets live at most 7
 days), and the certificate's expiry is not checked again. **Recommendation:**
 drop tickets whose `peer_certificate.not_valid_after_utc` has passed.
+
+### FHC-18 — Unbounded CompressedCertificate decompression (Low, Fixed)
+
+**Location:** `fasthttpc/security/cert_validator.py:108`
+(`decompress_certificate_message`), `:78` (`_decompress_bounded`) and `:68`
+(`MAX_UNCOMPRESSED_CERTIFICATE`). Callers: the async/sans-IO TLS 1.3 core
+(`fasthttpc/tls13/connection.py:670`, also used by `SyncTLSSocket`) and the sync
+`TLSAdapter` (`fasthttpc/security/tls_adapter.py:1029`). This finding came up
+while fixing FHC-07 and was not part of the original review.
+
+**Description.** fasthttpc offers certificate compression (RFC 8879) in the
+ClientHello, as the browsers it imitates do. A `CompressedCertificate` message
+was decompressed with `zlib.decompress()` and `brotli.decompress()`, with no
+limit on the output. The 3-byte `uncompressed_length` was only compared after
+decompression. The zstd branch passed `max_output_size`, but `zstandard` ignores
+it when the frame header carries a content size, so a frame that declares
+64 MiB allocated 64 MiB for a 4 KiB certificate. The message is processed before
+the certificate chain is verified.
+
+**Exploit scenario.** Anyone on the network path, or any server, needs no
+certificate at all: they answer the ClientHello with a `CompressedCertificate`
+whose payload is a compression bomb (about 100 bytes of brotli expand to 64 MiB,
+and the compressed data field allows up to 16 MiB). The client
+process runs out of memory during the handshake. That takes down every
+connection of the process, not just the one under attack.
+
+**Fix.** `uncompressed_length` is checked before anything is decompressed. It
+must not exceed 100 KiB (`MAX_UNCOMPRESSED_CERTIFICATE`), the same limit
+BoringSSL, and therefore Chrome, applies (`tls13_both.cc` rejects
+`uncompressed_len > max_cert_list`, whose default is `SSL_MAX_CERT_LIST_DEFAULT`
+= 100 KiB; Chrome's brotli callback decompresses into a buffer of exactly
+`uncompressed_len` bytes). Decompression is incremental and stops after
+`uncompressed_length + 1` bytes: zlib uses `decompressobj().decompress(data,
+max_length)`, and brotli and zstd use the bounded decoder from FHC-07. The output
+must be exactly `uncompressed_length` bytes, and a truncated stream or data after
+the end is rejected. Failures raise `CertificateDecompressionError` (a
+`CertificateValidationError`) and the client terminates the handshake with an
+alert encrypted under its handshake key. A message that cannot be decompressed,
+or whose length does not match, gets `bad_certificate`, as RFC 8879 section 4
+requires. A malformed message gets `decode_error`. An unknown algorithm, or a
+length above the limit, gets `illegal_parameter`, as in BoringSSL. The sync
+`TLSAdapter`, the async stream and `SyncTLSSocket` all send that alert.
+Regression tests: the F18 section of `tests/test_security_audit.py` (zlib, brotli
+and zstd bombs are rejected quickly with less than 2 MiB peak memory,
+exact-length messages still work, one byte short or long is rejected, the
+limit is enforced before decompression, and full handshakes on the sync, async
+and sans-IO paths send the alert).
 
 ## Checked and found OK
 

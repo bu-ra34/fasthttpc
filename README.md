@@ -91,9 +91,9 @@ with Session(transport=transport) as s:
 | Streaming | `stream=True` / `s.stream(...)`; `iter_bytes`, `iter_text`, `iter_lines`, `iter_raw` and the async `aiter_*` versions, over HTTP/1.1 and HTTP/2 |
 | Auth and hooks | Basic, Digest (RFC 7616), Bearer, `.netrc`, custom auth (requests or httpx style); requests-style `hooks=`, httpx-style `event_hooks=`; plugins on `Session` and `AsyncSession` |
 | Proxies | HTTP CONNECT (+Basic), SOCKS5 (RFC 1929), rotation; `HTTP_PROXY`/`HTTPS_PROXY`/`ALL_PROXY`/`NO_PROXY` with `trust_env=True`; TLS always terminates inside the tunnel |
-| Timeouts / limits / retries | `Timeout` (including a `total` budget), applied per request also on reused keep-alive / HTTP/2 connections; `Limits`, urllib3-style `Retry` with `Retry-After` |
+| Timeouts / limits / retries | `Timeout` (including a `total` budget), applied per request also on reused keep-alive / HTTP/2 connections; `Limits` (including a decompressed body size limit against compression bombs, 256 MiB by default), urllib3-style `Retry` with `Retry-After` |
 | Content decoding | gzip, deflate, brotli, zstd (chained encodings too), identical for streaming and non-streaming, sync and async |
-| Cookies, cache, redirects | RFC 6265 cookie jar, response cache, redirect history |
+| Cookies, cache, redirects | RFC 6265 cookie jar (with Public Suffix List checks), response cache, redirect history |
 | DNS | Optional DNS-over-HTTPS resolver; Happy Eyeballs (RFC 8305) for hosts with several addresses |
 | Old servers | `legacy_tls=True` (off by default): TLS 1.2 CBC and static-RSA suites. TLS 1.0/1.1 are never supported |
 | Testing | `MockTransport` (sync and async handlers) |
@@ -104,8 +104,14 @@ HTTP/3 (`http3=True`: Alt-Svc discovery with silent fallback to HTTP/2, or
 `fasthttpc[http3]` extra (aioquic). The TLS handshake inside QUIC is done by
 aioquic, so it does **not** carry the browser ClientHello fingerprint; only the
 QUIC transport parameters and HTTP/3 SETTINGS follow a Chrome-like profile.
-It has been tested against a local aioquic server only: opt-in live tests
-against public servers exist (`tests/live/`), but they do not run in CI.
+The offline test suite exercises it against a local aioquic server. In addition,
+the live HTTP/3 tests (`tests/live/`) run in a separate "Live tests" GitHub
+Actions workflow, weekly and on demand, on GitHub-hosted Ubuntu, macOS and
+Windows runners, against Cloudflare (`cloudflare-quic.com`), nginx
+(`quic.nginx.org`) and Google (`www.google.com`): forced HTTP/3 requests (sync
+and async), Alt-Svc discovery, fallback to HTTP/2 and certificate rejection over
+QUIC. That workflow is not part of push/PR CI, so a live failure does not block
+a merge ([details](https://bu-ra34.github.io/fasthttpc/testing/#live-http3-tests)).
 
 ## How it compares
 
@@ -118,7 +124,7 @@ Honest comparison; "maturity" matters as much as features here.
 | Browser TLS/JA3/JA4 impersonation | Yes (3 families) | No | No | Yes (many versions, best coverage) |
 | HTTP/2 fingerprint | Yes | No | No | Yes |
 | HTTP/2 | Yes | No | Yes | Yes |
-| HTTP/3 | **Experimental**, opt-in (aioquic); no browser TLS fingerprint over QUIC; tested locally only | No | No | Yes |
+| HTTP/3 | **Experimental**, opt-in (aioquic); no browser TLS fingerprint over QUIC; offline tests plus weekly live tests (Cloudflare, nginx, Google) | No | No | Yes |
 | Async | Yes (asyncio, trio via anyio) | No | Yes (asyncio, trio via anyio) | Yes |
 | `verify=False` | **Not supported by design** | Yes | Yes | Yes |
 | Session resumption / 0-RTT | TLS 1.3 PSK resumption, **off by default**; no 0-RTT | Yes (OpenSSL) | Yes (OpenSSL) | Yes |
@@ -218,8 +224,8 @@ privately via GitHub security advisories.
   an estimated Firefox ECH GREASE length) are listed in
   [limits](https://bu-ra34.github.io/fasthttpc/limits/).
 - Pure-Python crypto framing is slower than OpenSSL for large bulk transfers.
-- Open findings of the internal review (for example no limit on the
-  decompressed body size, no Public Suffix List for cookies) are listed in the
+- Open findings of the internal review (for example TLS 1.3 cipher suite and
+  ALPN not checked against the offer) are listed in the
   [security review](https://bu-ra34.github.io/fasthttpc/security-audit/).
 
 The full list is in the [documentation](https://bu-ra34.github.io/fasthttpc/limits/)
@@ -241,8 +247,13 @@ pytest            # offline tests; live tests are skipped unless FASTHTTPC_LIVE=
 ruff check .
 mypy
 mkdocs serve      # needs: pip install -e ".[docs]"
+python scripts/update_psl.py   # refresh the bundled Public Suffix List (network)
 ```
 
 ## License
 
 MIT. See [LICENSE](LICENSE).
+
+The bundled Public Suffix List snapshot (`fasthttpc/public_suffix_list.dat.gz`,
+used for cookie domains) comes from <https://publicsuffix.org/> and is under the
+Mozilla Public License 2.0. See [LICENSE-PSL](LICENSE-PSL).

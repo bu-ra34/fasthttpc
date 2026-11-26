@@ -20,6 +20,8 @@ import datetime
 import ipaddress
 import warnings
 
+from ..streaming import DecodeError, DecompressedSizeError, MissingDecoderError, decode_body
+
 # cryptography import'undan ÖNCE (bkz. __init__.py'deki açıklama).
 os.environ.setdefault("CRYPTOGRAPHY_OPENSSL_NO_LEGACY", "1")
 
@@ -38,6 +40,71 @@ class CertificateValidationError(Exception):
     pass
 
 
+#: TLS alert kodları (RFC 8446 §6).
+ALERT_BAD_CERTIFICATE = 42
+ALERT_ILLEGAL_PARAMETER = 47
+ALERT_DECODE_ERROR = 50
+
+
+class CertificateDecompressionError(CertificateValidationError):
+    """CompressedCertificate (RFC 8879) açılamadı ya da reddedildi.
+
+    ``alert``: istemcinin bağlantıyı sonlandırırken göndereceği TLS alert kodu.
+    RFC 8879 §4: açılamayan mesaj ve ``uncompressed_length`` uyuşmazlığı
+    ``bad_certificate`` (42); bozuk mesaj yapısı ``decode_error`` (50); sınırı aşan
+    ``uncompressed_length`` ve desteklenmeyen algoritma ``illegal_parameter`` (47,
+    BoringSSL ile aynı).
+    """
+
+    def __init__(self, msg: str, alert: int = ALERT_BAD_CERTIFICATE):
+        super().__init__(msg)
+        self.alert = alert
+
+
+#: ``uncompressed_length`` için üst sınır. Alan 3 bayttır (2^24-1 = 16 MiB); açmadan
+#: ÖNCE bununla reddedilir. BoringSSL (Chrome) aynı denetimi ``max_cert_list`` ile
+#: yapar (``tls13_both.cc``: ``uncompressed_len > ssl->max_cert_list`` ->
+#: illegal_parameter); varsayılanı ``SSL_MAX_CERT_LIST_DEFAULT`` = 100 KiB.
+MAX_UNCOMPRESSED_CERTIFICATE = 100 * 1024
+
+
+def _length_mismatch(expected: int, got: str) -> CertificateDecompressionError:
+    # RFC 8879 §4: uyuşmazlık -> bad_certificate.
+    return CertificateDecompressionError(
+        f"Açılan sertifika boyutu beklenenle uyuşmuyor (beklenen={expected}, alınan={got}) — "
+        f"veri bozulmuş veya değiştirilmiş olabilir.")
+
+
+def _decompress_bounded(algorithm: int, data: bytes, limit: int) -> bytes:
+    """``data``'yı ARTIMLI açar; ``limit`` baytı aşan çıktı üretilmeden (en çok
+    ``limit + 1`` bayt) uzunluk uyuşmazlığı olarak reddedilir."""
+    if algorithm == 1:  # zlib (RFC 1950)
+        import zlib
+        d = zlib.decompressobj()
+        try:
+            out = d.decompress(data, limit + 1)
+        except zlib.error as e:
+            raise CertificateDecompressionError(f"zlib ile sertifika açılamadı: {e}") from e
+        if len(out) > limit:
+            raise _length_mismatch(limit, f"> {limit}")
+        if not d.eof or d.unused_data:
+            raise CertificateDecompressionError(
+                "zlib ile sertifika açılamadı: akış eksik ya da sonunda fazladan veri var.")
+        return out
+    # brotli / zstd: Content-Encoding ile aynı, çıktısı sınırlı artımlı açıcı (FHC-07).
+    enc = "br" if algorithm == 2 else "zstd"
+    try:
+        return decode_body(data, enc, limit, strict=True)
+    except DecompressedSizeError as e:
+        raise _length_mismatch(limit, f"> {limit}") from e
+    except MissingDecoderError as e:
+        raise CertificateDecompressionError(
+            f"Sunucu {enc}-sıkıştırılmış sertifika gönderdi ancak '{e.package}' paketi "
+            f"kurulu değil. Kurmak için: pip install {e.package}") from e
+    except DecodeError as e:
+        raise CertificateDecompressionError(f"{enc} ile sertifika açılamadı: {e}") from e
+
+
 def decompress_certificate_message(hs_payload: bytes) -> bytes:
     """
     TLS 1.3 CompressedCertificate handshake mesajını (RFC 8879, hs_type=25) açar
@@ -47,10 +114,17 @@ def decompress_certificate_message(hs_payload: bytes) -> bytes:
         algorithm                      (2 byte)  — 1=zlib, 2=brotli, 3=zstd
         uncompressed_length             (3 byte)
         compressed_certificate_message  (3 byte uzunluk prefix'i + o kadar byte veri)
+
+    Bu mesaj sertifika doğrulanmadan ÖNCE işlenir: herhangi bir ara düğüm sıkıştırma
+    bombası gönderebilir. Bu yüzden ``uncompressed_length`` önce
+    :data:`MAX_UNCOMPRESSED_CERTIFICATE` ile sınırlanır, açma artımlıdır ve en çok
+    ``uncompressed_length + 1`` bayt üretir; çıktı tam olarak ``uncompressed_length``
+    olmalıdır. Hata: :class:`CertificateDecompressionError` (``alert`` alanıyla).
     """
     body = hs_payload[4:]
     if len(body) < 8:
-        raise CertificateValidationError("CompressedCertificate mesajı çok kısa.")
+        raise CertificateDecompressionError("CompressedCertificate mesajı çok kısa.",
+                                            ALERT_DECODE_ERROR)
 
     algorithm = struct.unpack("!H", body[0:2])[0]
     uncompressed_length = struct.unpack("!I", b"\x00" + body[2:5])[0]
@@ -61,56 +135,23 @@ def decompress_certificate_message(hs_payload: bytes) -> bytes:
     comp_len = struct.unpack("!I", b"\x00" + body[5:8])[0]
     compressed_data = body[8:8 + comp_len]
 
-    if len(compressed_data) != comp_len:
-        raise CertificateValidationError(
-            f"CompressedCertificate mesajı kesilmiş (beklenen={comp_len} byte, "
-            f"alınan={len(compressed_data)} byte)."
-        )
-
-    if algorithm == 1:  # zlib
-        import zlib
-        try:
-            decompressed = zlib.decompress(compressed_data)
-        except zlib.error as e:
-            raise CertificateValidationError(f"zlib ile sertifika açılamadı: {e}") from e
-    elif algorithm == 2:  # brotli
-        try:
-            import brotli
-        except ImportError as e:
-            raise CertificateValidationError(
-                "Sunucu brotli-sıkıştırılmış sertifika gönderdi ancak 'brotli' paketi "
-                "kurulu değil. Kurmak için: pip install brotli"
-            ) from e
-        try:
-            decompressed = brotli.decompress(compressed_data)
-        except Exception as e:
-            raise CertificateValidationError(f"brotli ile sertifika açılamadı: {e}") from e
-    elif algorithm == 3:  # zstd (RFC 8879) — yalnızca 'zstandard' kuruluysa İLAN edilir
-        try:
-            import zstandard
-        except ImportError as e:
-            raise CertificateValidationError(
-                "Sunucu zstd-sıkıştırılmış sertifika gönderdi ancak 'zstandard' paketi "
-                "kurulu değil. Kurmak için: pip install zstandard"
-            ) from e
-        try:
-            # Çıktı, ilan edilen uncompressed_length ile sınırlı (sıkıştırma bombası koruması).
-            decompressed = zstandard.ZstdDecompressor().decompress(
-                compressed_data, max_output_size=max(uncompressed_length, 1))
-        except Exception as e:
-            raise CertificateValidationError(f"zstd ile sertifika açılamadı: {e}") from e
-    else:
-        raise CertificateValidationError(
+    if len(compressed_data) != comp_len or len(body) != 8 + comp_len or comp_len == 0:
+        raise CertificateDecompressionError(
+            f"CompressedCertificate mesajı kesilmiş ya da uzunluğu tutarsız (beklenen={comp_len} "
+            f"byte, alınan={len(body) - 8} byte).", ALERT_DECODE_ERROR)
+    if algorithm not in (1, 2, 3):
+        raise CertificateDecompressionError(
             f"Desteklenmeyen sertifika sıkıştırma algoritması: {algorithm} "
-            f"(sadece zlib=1, brotli=2 ve zstd=3 destekleniyor)."
-        )
+            f"(sadece zlib=1, brotli=2 ve zstd=3 destekleniyor).", ALERT_ILLEGAL_PARAMETER)
+    if uncompressed_length > MAX_UNCOMPRESSED_CERTIFICATE:
+        raise CertificateDecompressionError(
+            f"CompressedCertificate uncompressed_length={uncompressed_length} sınırı "
+            f"({MAX_UNCOMPRESSED_CERTIFICATE} bayt) aşıyor; açılmadı.", ALERT_ILLEGAL_PARAMETER)
+
+    decompressed = _decompress_bounded(algorithm, compressed_data, uncompressed_length)
 
     if len(decompressed) != uncompressed_length:
-        raise CertificateValidationError(
-            f"Açılan sertifika boyutu beklenenle uyuşmuyor "
-            f"(beklenen={uncompressed_length}, alınan={len(decompressed)}) — "
-            f"veri bozulmuş veya değiştirilmiş olabilir."
-        )
+        raise _length_mismatch(uncompressed_length, str(len(decompressed)))
 
     # Normal bir Certificate handshake mesajı gibi paketle: hs_type=11 + 3-byte uzunluk + body
     return b"\x0b" + struct.pack("!I", len(decompressed))[1:] + decompressed

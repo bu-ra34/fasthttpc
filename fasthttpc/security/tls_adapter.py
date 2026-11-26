@@ -47,6 +47,7 @@ from .cert_validator import (
     validate_server_certificate,
     verify_certificate_verify,
     decompress_certificate_message,
+    CertificateDecompressionError,
     CertificateValidationError,
 )
 
@@ -84,6 +85,27 @@ class TLSProtocolError(ConnectionError):
 
 def _unexpected(detail: str) -> TLSProtocolError:
     return TLSProtocolError(f"unexpected_message: {detail}")
+
+
+def check_compat_ccs(payload: bytes, *, seen: bool, handshake_done: bool, buffered: bool) -> None:
+    """TLS 1.3 uyumluluk ChangeCipherSpec'i yok sayılabilir mi? Değilse ``unexpected_message``.
+
+    RFC 8446 §5: şifresiz, tek bayt 0x01'lik bir CCS ilk ClientHello'dan sonra ve sunucunun
+    Finished'ı alınmadan ÖNCE gelirse atılır; başka içerik ya da el sıkışmadan sonra gelen CCS
+    unexpected_message'dır. §5.1: handshake mesajı parçalarının arasına başka record tipi
+    giremez. §D.4: sunucu sahte CCS'i ilk handshake mesajından (ServerHello ya da HRR) hemen
+    sonra YALNIZCA BİR KEZ gönderir — ikincisi reddedilir. Senkron ve async yol ortak kullanır.
+    """
+    if handshake_done:
+        raise _unexpected("el sıkışma bittikten sonra change_cipher_spec record'u (RFC 8446 §5).")
+    if seen:
+        raise _unexpected("ikinci change_cipher_spec record'u — uyumluluk CCS'i yalnızca bir kez "
+                          "yok sayılır (RFC 8446 §D.4).")
+    if buffered:
+        raise _unexpected("change_cipher_spec, bölünmüş bir handshake mesajının parçaları arasına "
+                          "girdi (RFC 8446 §5.1).")
+    if payload != b"\x01":
+        raise _unexpected("geçersiz change_cipher_spec içeriği (yalnızca tek bayt 0x01 yok sayılır).")
 
 
 def _recv_all(sock: socket.socket, length: int) -> bytes:
@@ -474,11 +496,13 @@ class EncryptedSocket:
         while True:
             rec_type, record_header, payload = self._read_raw_record()
 
-            if rec_type == 20:  # change_cipher_spec — TLS 1.3'te uyumluluk için, yok say
-                # RFC 8446 §5: yalnızca tek byte 0x01 geçerli (el sıkışma sonrası CCS'in tolere edilmesi
-                # test_record_layer_perf tarafından bilinçli olarak korunuyor).
-                if payload != b"\x01":
-                    raise _unexpected("beklenmeyen/geçersiz change_cipher_spec record'u.")
+            if rec_type == 20:  # change_cipher_spec — TLS 1.3 uyumluluk CCS'i (RFC 8446 §5, §D.4)
+                # Yalnızca el sıkışma sırasında, bir kez, handshake parçaları arasında değilken.
+                st = self.state
+                check_compat_ccs(payload, seen=bool(st.get("ccs_seen")),
+                                 handshake_done=bool(st.get("using_app_keys")),
+                                 buffered=bool(st.get("hs_buffered")))
+                st["ccs_seen"] = True
                 continue
             if rec_type == 21:  # açık (şifresiz) alert
                 raise ConnectionError(f"Açık (şifresiz) TLS alert alındı: {describe_alert(payload)}")
@@ -654,19 +678,21 @@ def _parse_alpn_from_encrypted_extensions(hs_payload: bytes) -> str:
     return ""
 
 
-def _read_server_hello(raw_socket: socket.socket, allow_ccs: bool = True) -> bytes:
+def _read_server_hello(raw_socket: socket.socket, allow_ccs: bool = True,
+                       state: dict | None = None) -> bytes:
     """Düz (şifresiz) handshake record'larından tam ServerHello mesajını toplar.
 
     TLS 1.3'te ServerHello sonrasında aynı düz record'da veri kalması protokol
     ihlalidir; bu sarmalayıcı onu reddeder (TLS 1.2 için bkz. ``_read_server_hello_ex``).
     """
-    msg, trailing = _read_server_hello_ex(raw_socket, allow_ccs)
+    msg, trailing = _read_server_hello_ex(raw_socket, allow_ccs, state)
     if trailing:
         raise _unexpected("ServerHello sonrasında şifresiz handshake verisi.")
     return msg
 
 
-def _read_server_hello_ex(raw_socket: socket.socket, allow_ccs: bool = True) -> tuple[bytes, bytes]:
+def _read_server_hello_ex(raw_socket: socket.socket, allow_ccs: bool = True,
+                          state: dict | None = None) -> tuple[bytes, bytes]:
     """(ServerHello, aynı record'da onu izleyen handshake baytları). Ayrıntı: ``_read_server_hello``.
 
     TLS 1.2 sunucuları ServerHello'yu Certificate/ServerKeyExchange ile AYNI record'a
@@ -675,10 +701,12 @@ def _read_server_hello_ex(raw_socket: socket.socket, allow_ccs: bool = True) -> 
     ServerHello birden fazla record'a bölünebilir (RFC 8446 §5.1). Mesajdan
     sonra aynı düz record'da artık veri kalırsa (şifresiz EE vb.) reddedilir.
     allow_ccs: mesaj başlamadan önce gelen TEK bir uyumluluk CCS'si (0x01)
-    yok sayılır — HRR -> CCS -> ServerHello2 akışı için (RFC 8446 §D.4).
+    yok sayılır (``check_compat_ccs``). ``state`` verilirse CCS görüldüğü
+    ``state["ccs_seen"]``'e yazılır: el sıkışmanın geri kalanı ikinci bir CCS'i
+    reddeder, TLS 1.2 seçilirse bu erken CCS de reddedilir.
     """
     buf = b""
-    ccs_seen = False
+    st: dict = state if state is not None else {}
     while True:
         header = _recv_all(raw_socket, 5)
         rec_type, _ver, rec_len = struct.unpack("!BHH", header)
@@ -689,8 +717,10 @@ def _read_server_hello_ex(raw_socket: socket.socket, allow_ccs: bool = True) -> 
                 f"record_overflow: düz record uzunluğu {rec_len} > {MAX_PLAINTEXT}."
             )
         payload = _recv_all(raw_socket, rec_len)
-        if rec_type == 20 and allow_ccs and not ccs_seen and not buf and payload == b"\x01":
-            ccs_seen = True
+        if rec_type == 20 and allow_ccs:
+            check_compat_ccs(payload, seen=bool(st.get("ccs_seen")), handshake_done=False,
+                             buffered=bool(buf))
+            st["ccs_seen"] = True
             continue
         if rec_type == 21:
             raise ConnectionError(f"Sunucu el sıkışmayı reddetti: {describe_alert(payload)}")
@@ -714,14 +744,17 @@ def _read_server_hello_ex(raw_socket: socket.socket, allow_ccs: bool = True) -> 
 _SUITE_HASH = {0x1301: hashlib.sha256, 0x1302: hashlib.sha384, 0x1303: hashlib.sha256}
 
 
-def _recv_handshake_message(raw_socket: socket.socket, what: str) -> bytes:
+def _recv_handshake_message(raw_socket: socket.socket, what: str, state: dict | None = None,
+                            expect_type: int | None = None) -> bytes:
     """Şifresiz handshake record'larından TEK bir handshake mesajı okur.
 
-    CCS record'larını (TLS 1.3 uyumluluk) atlar, alert'te hata verir ve
-    birden çok record'a bölünmüş mesajı birleştirir.
+    Uyumluluk CCS'ini (TLS 1.3) ``check_compat_ccs`` kurallarıyla — el sıkışma boyunca
+    bir kez, ``state["ccs_seen"]`` paylaşılarak — atlar, alert'te hata verir ve birden
+    çok record'a bölünmüş mesajı birleştirir. ``expect_type`` verilirse mesaj tipi,
+    uzunluk alanına/gövdeye bakılmadan önce denetlenir.
     """
     buf = b""
-    ccs_seen = False
+    st: dict = state if state is not None else {}
     while True:
         header = _recv_all(raw_socket, 5)
         rec_type, _ver, rec_len = struct.unpack("!BHH", header)
@@ -730,9 +763,9 @@ def _recv_handshake_message(raw_socket: socket.socket, what: str) -> bytes:
         payload = _recv_all(raw_socket, rec_len)
         if rec_type == 20:
             # HRR'den sonra sunucu sahte CCS gönderebilir (RFC 8446 §D.4).
-            if payload != b"\x01" or ccs_seen:
-                raise ConnectionError("unexpected_message: geçersiz/tekrarlanan change_cipher_spec.")
-            ccs_seen = True
+            check_compat_ccs(payload, seen=bool(st.get("ccs_seen")), handshake_done=False,
+                             buffered=bool(buf))
+            st["ccs_seen"] = True
             continue
         if rec_type == 21:
             raise ConnectionError(f"Sunucu el sıkışmayı reddetti: {describe_alert(payload)}")
@@ -742,7 +775,11 @@ def _recv_handshake_message(raw_socket: socket.socket, what: str) -> bytes:
             raise ConnectionError("decode_error: boş handshake record'u.")
         buf += payload
         if len(buf) >= 4:
+            if expect_type is not None and buf[0] != expect_type:
+                raise _unexpected(f"{what} ({expect_type}) beklenirken handshake tipi {buf[0]} geldi.")
             hs_len = struct.unpack("!I", b"\x00" + buf[1:4])[0]
+            if hs_len > _MAX_SERVER_HELLO:
+                raise TLSProtocolError(f"decode_error: {what} makul boyutu aşıyor ({hs_len} bayt).")
             if len(buf) >= 4 + hs_len:
                 if len(buf) > 4 + hs_len:
                     raise ConnectionError(f"{what} ile aynı record'da beklenmeyen ek veri.")
@@ -750,7 +787,7 @@ def _recv_handshake_message(raw_socket: socket.socket, what: str) -> bytes:
 
 
 def _handle_hrr(raw_socket: socket.socket, impersonator: TLSImpersonator,
-                client_hello1: bytes, hrr_msg: bytes):
+                client_hello1: bytes, hrr_msg: bytes, state: dict | None = None):
     """HelloRetryRequest'i işler (RFC 8446 §4.1.4) ve 2. ServerHello'yu döner.
 
     Args:
@@ -807,7 +844,7 @@ def _handle_hrr(raw_socket: socket.socket, impersonator: TLSImpersonator,
     # önce sahte bir change_cipher_spec gönderir.
     raw_socket.sendall(b"\x14\x03\x03\x00\x01\x01" + ch2_record)
 
-    sh2 = _recv_handshake_message(raw_socket, "2. ServerHello")
+    sh2 = _recv_handshake_message(raw_socket, "2. ServerHello", state, expect_type=_HS_SERVER_HELLO)
     if sh2[0] != 2 or len(sh2) < 4 + 35:
         raise ConnectionError("HRR sonrası ServerHello bekleniyordu.")
     if is_hello_retry_request(sh2[6:38]):
@@ -878,12 +915,16 @@ class TLSAdapter:
         order = HandshakeOrderValidator()
 
         # ---- ServerHello ---------------------------------------------------
-        server_hello_payload, sh_trailing = _read_server_hello_ex(raw_socket)
+        server_hello_payload, sh_trailing = _read_server_hello_ex(raw_socket, state=state)
 
         # TLS 1.2 seçildiyse (legacy_version 0x0303, supported_versions ≠ 0x0304)
         # güvenli TLS 1.2 alt kümesine dallan (bkz. security/tls12.py).
         from . import tls12
         if tls12.is_tls12_server_hello(server_hello_payload):
+            if state.get("ccs_seen"):
+                # Uyumluluk CCS'i yalnızca TLS 1.3'e özgü (RFC 8446 §D.4); TLS 1.2'de CCS ancak
+                # istemci uçuşundan sonra geçerlidir (RFC 5246 §7.1).
+                raise _unexpected("TLS 1.2 ServerHello'dan önce ChangeCipherSpec alındı.")
             return tls12.negotiate_tls12(
                 raw_socket, host, record_bytes, server_hello_payload, sh_trailing, ca_path=ca_path,
                 legacy_tls=legacy_tls,
@@ -897,7 +938,7 @@ class TLSAdapter:
         if sh["is_hrr"]:
             order.expect(_HS_SERVER_HELLO, is_hrr=True)
             server_hello_payload, transcript, hrr = _handle_hrr(
-                raw_socket, impersonator, record_bytes[5:], server_hello_payload
+                raw_socket, impersonator, record_bytes[5:], server_hello_payload, state
             )
             sh = parse_server_hello(server_hello_payload, sent_session_id)
             order.expect(_HS_SERVER_HELLO)
@@ -970,6 +1011,8 @@ class TLSAdapter:
         cert_req = None
 
         while not order.done:
+            # recv_record, yarım bir handshake mesajı tamponlanmışken araya giren CCS'i reddeder.
+            state["hs_buffered"] = bool(handshake_buffer)
             msg, m_type = esock.recv_record()
             if m_type == 21:
                 raise ConnectionError(f"Sunucudan Şifreli TLS Alert: {msg.hex()}")
@@ -1026,7 +1069,13 @@ class TLSAdapter:
                     if hs_type == _HS_COMPRESSED_CERTIFICATE:
                         try:
                             effective_payload = decompress_certificate_message(hs_payload)
-                        except CertificateValidationError as e:
+                        except CertificateDecompressionError as e:
+                            # RFC 8879 §4: fatal alert (istemci handshake anahtarıyla), sonra kapat.
+                            try:
+                                esock.send_record(bytes((2, e.alert)), content_type=0x15,
+                                                  use_app_keys=False)
+                            except OSError as se:     # best-effort; asıl hata maskelenmez
+                                logger.debug("Sertifika açma alert'i gönderilemedi: %s", se)
                             raise ConnectionError(f"Sıkıştırılmış sertifika açılamadı: {e}") from e
                     else:
                         effective_payload = hs_payload

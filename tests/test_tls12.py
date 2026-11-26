@@ -536,7 +536,10 @@ REJECT = [
     ("close_after_hello", "aniden bağlantıyı kesti", {}, True),
     # istemci uçuşu gönderildikten SONRA yakalananlar
     ("bad_finished", "decrypt_error.*Finished", {}, False),
-    ("no_ccs", "unexpected_message", {}, False),
+    # CCS'siz şifreli Finished: hem AES-GCM (8 bayt sıfır explicit nonce) hem ChaCha20-Poly1305
+    # (açık nonce yok) her koşuda denenir — alert şifreli metnin baytlarına bağlı olmamalı.
+    ("no_ccs", "unexpected_message", {"suite": 0xC02F}, False),
+    ("no_ccs", "unexpected_message", {"suite": 0xCCA8}, False),
     ("plain_finished", "bad_record_mac", {}, False),
     ("trailing_after_finished", "unexpected_message", {}, False),
 ]
@@ -560,6 +563,102 @@ def test_fake_ccs_olmadan_sifresiz_finished_reddedilir(pki, files):
     with pytest.raises(ConnectionError, match="ChangeCipherSpec olmadan"):
         _connect(port, files[0])
     t.join(5)
+
+
+# CCS'siz şifreli Finished; her iki AEAD türü. ``ct_hello_request``: sunucu nonce seçerek
+# şifreli gövdeyi düz metin olarak "HelloRequest, uzunluk > 2^18" gibi gösterir — düzeltmeden
+# önce CI'da 1/256 olasılıkla görülen ``illegal_parameter: handshake mesajı çok büyük`` hatasını
+# DETERMİNİSTİK üretir. ticket=False: NewSessionTicket hiç yok, record doğrudan CCS yerine gelir.
+NO_CCS_SUITES = [pytest.param(0xC02F, id="aes128gcm"), pytest.param(0xCCA8, id="chacha20")]
+NO_CCS_VARIANTS = [
+    pytest.param(True, (), id="nst"),
+    pytest.param(True, ("ct_hello_request",), id="nst-ct_hello_request"),
+    pytest.param(False, (), id="bilet_yok"),
+]
+
+
+@pytest.mark.parametrize("ticket,extra", NO_CCS_VARIANTS)
+@pytest.mark.parametrize("suite", NO_CCS_SUITES)
+def test_fake_ccs_atlanirsa_alert_sifreli_metne_bagli_degil(pki, files, suite, ticket, extra):
+    srv = Fake12Server(pki, suite=suite, ticket=ticket, tamper={"no_ccs", *extra})
+    port, t, ls = serve_fake_in_thread(srv)
+    with pytest.raises(ConnectionError, match=r"unexpected_message: ChangeCipherSpec beklenirken handshake"):
+        _connect(port, files[0])
+    t.join(5)
+    ls.close()
+    assert srv.finished_ok
+    assert srv.alerts == [bytes([2, tls12.AL_UNEXPECTED_MESSAGE])]
+
+
+@pytest.mark.parametrize("tamper,match,alert", [
+    # session_ticket kabul edildi ama NST yok: CCS erken (RFC 5077 §3.3)
+    ("no_nst", r"unexpected_message: NewSessionTicket beklenirken ChangeCipherSpec",
+     tls12.AL_UNEXPECTED_MESSAGE),
+    # NST'den sonra CCS yerine HelloRequest: bu pencerede yok SAYILMAZ
+    ("hello_request_tail", r"unexpected_message: ChangeCipherSpec beklenirken handshake",
+     tls12.AL_UNEXPECTED_MESSAGE),
+    # CCS'ten sonra, Finished'tan önce application_data: ŞİFRESİ ÇÖZÜLMEDEN reddedilir
+    # (önceden rastgele gövde bad_record_mac'e düşüyordu)
+    ("garbage_appdata_before_fin", r"unexpected_message: handshake bitmeden",
+     tls12.AL_UNEXPECTED_MESSAGE),
+    # doğru pencerede ama içeriği 0x01 olmayan CCS
+    ("ccs_payload_02", r"illegal_parameter: ChangeCipherSpec içeriği", tls12.AL_ILLEGAL_PARAMETER),
+])
+def test_fake_sunucu_ucusu_kayit_tipi_durum_makinesi(pki, files, tamper, match, alert):
+    srv = Fake12Server(pki, tamper={tamper})
+    port, t, ls = serve_fake_in_thread(srv)
+    with pytest.raises(ConnectionError, match=match):
+        _connect(port, files[0])
+    t.join(5)
+    ls.close()
+    assert srv.alerts == [bytes([2, alert])]
+
+
+def test_fake_erken_ccs_icerigi_bozuk_olsa_da_unexpected_message(pki, files):
+    """Yanlış durumda gelen CCS, içeriği (0x02) ne olursa olsun önce DURUM yüzünden reddedilir."""
+    srv = Fake12Server(pki, tamper={"early_ccs", "ccs_payload_02"})
+    port, t, ls = serve_fake_in_thread(srv)
+    with pytest.raises(ConnectionError, match=r"unexpected_message: WAIT_CERT durumunda beklenmeyen"):
+        _connect(port, files[0])
+    t.join(5)
+    ls.close()
+    assert not srv.cke_seen
+
+
+def test_tls12_server_hello_oncesi_ccs_reddedilir(pki, files):
+    """TLS 1.3 uyumluluk CCS'i ServerHello'dan önce atlanabilir; ama sunucu TLS 1.2 seçerse
+    bu CCS TLS 1.2'de geçersizdir (CCS yalnızca istemci uçuşundan sonra) — reddedilir."""
+    for use_async in (False, True):
+        srv = Fake12Server(pki, tamper={"ccs_before_sh"})
+        port, t, ls = serve_fake_in_thread(srv)
+        with pytest.raises(ConnectionError, match="unexpected_message: TLS 1.2 ServerHello'dan önce"):
+            if use_async:
+                async def main():
+                    await _async_negotiate(port, files[0])
+                asyncio.run(asyncio.wait_for(main(), 15))
+            else:
+                _connect(port, files[0])
+        t.join(5)
+        ls.close()
+        assert not srv.cke_seen
+
+
+def test_wait_tail_kayit_tipi_birim():
+    """İstemci uçuşundan sonraki pencere (WAIT_TAIL): NST zorunlu, sonra YALNIZCA CCS."""
+    order = tls12.HandshakeOrder12(ticket_ok=True)
+    order.state = "WAIT_TAIL"
+    assert order.nst_pending and not order.awaiting_ccs
+    with pytest.raises(tls12.TLS12Error, match="NewSessionTicket beklenirken ChangeCipherSpec"):
+        order.check_ccs()
+    with pytest.raises(tls12.TLS12Error, match="HelloRequest"):
+        order.check(tls12.HS_HELLO_REQUEST)
+    order.expect(tls12.HS_NEW_SESSION_TICKET)
+    assert order.awaiting_ccs
+    order.check_ccs()
+    order.on_ccs()
+    assert order.state == "WAIT_FIN"
+    with pytest.raises(tls12.TLS12Error, match="WAIT_FIN durumunda beklenmeyen ChangeCipherSpec"):
+        order.check_ccs()
 
 
 def test_fake_wrong_key_type_rsa_suite_ec_cert(pki, files):
@@ -731,6 +830,9 @@ def test_async_session_http11_ve_h2(files):
     ("cert_request", "CertificateRequest"),
     ("sha1_sig", "SHA-1"),
     ("no_ccs", "unexpected_message"),
+    ("no_nst", "unexpected_message"),
+    ("hello_request_tail", "unexpected_message"),
+    ("garbage_appdata_before_fin", "unexpected_message"),
 ])
 def test_async_sahte_sunucu_reddedilir(pki, files, tamper, match):
     srv = Fake12Server(pki, tamper={tamper})
@@ -742,6 +844,23 @@ def test_async_sahte_sunucu_reddedilir(pki, files, tamper, match):
     with pytest.raises(TLSError, match=match):
         asyncio.run(asyncio.wait_for(main(), 15))
     t.join(5)
+
+
+@pytest.mark.parametrize("ticket,extra", NO_CCS_VARIANTS)
+@pytest.mark.parametrize("suite", NO_CCS_SUITES)
+def test_async_ccs_atlanirsa_alert_sifreli_metne_bagli_degil(pki, files, suite, ticket, extra):
+    """Senkron test_fake_ccs_atlanirsa_alert_sifreli_metne_bagli_degil'in async karşılığı."""
+    srv = Fake12Server(pki, suite=suite, ticket=ticket, tamper={"no_ccs", *extra})
+    port, t, ls = serve_fake_in_thread(srv)
+
+    async def main():
+        await _async_negotiate(port, files[0])
+
+    with pytest.raises(TLSError, match=r"unexpected_message: ChangeCipherSpec beklenirken handshake"):
+        asyncio.run(asyncio.wait_for(main(), 15))
+    t.join(5)
+    ls.close()
+    assert srv.alerts == [bytes([2, tls12.AL_UNEXPECTED_MESSAGE])]
 
 
 def _run_async_backend(backend, coro_fn, timeout=15):

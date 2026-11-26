@@ -8,11 +8,24 @@ from typing import Any, Optional
 
 from .._backend import current_backend
 from ..models.headers import Headers
-from ..streaming import decode_body
 from ..security.cert_validator import CertificateValidationError
 from .altsvc import AltSvcCache
-from .core import Http3ConnectError, Http3Error
+from .core import Http3ConnectError, Http3Error, Http3RequestRefused
 from .options import Http3Options
+
+# Sunucunun işlemediği istek (GOAWAY, H3_REQUEST_REJECTED) en fazla bu kadar kez YENİ bağlantıda
+# tekrarlanır; her bağlantı reddederse sonsuz döngü yok, açık bir Http3RequestRefused verilir.
+MAX_REFUSED_RETRIES = 1
+
+
+def _replayable(body: object) -> bool:
+    """Reddedilen istek aynen yeniden gönderilebilir mi? HTTP/3 gövdeleri bugün HER ZAMAN
+    tamponlanmış bytes'tır (Request.body); tek seferlik (akışlı) bir gövde yeniden denenmez."""
+    return isinstance(body, (bytes, bytearray, memoryview))
+
+
+def _refused_after(e: BaseException, attempts: int) -> Http3RequestRefused:
+    return Http3RequestRefused(f"HTTP/3 isteği {attempts} denemede de sunucu tarafından işlenmedi: {e}")
 
 _TRIO_UNSUPPORTED = ("HTTP/3 trio altında desteklenmiyor (aioquic yalnızca asyncio ile çalışır); "
                      "http3='force' yerine http3=True (h2/h1'e düşer) ya da asyncio kullanın.")
@@ -27,7 +40,10 @@ def require_aioquic() -> None:
 
 
 def convert_response(raw_headers, body: bytes):
-    """aioquic başlık listesi -> (status, Headers, çözülmüş gövde)."""
+    """aioquic başlık listesi -> (status, Headers, HAM gövde).
+
+    Content-Encoding burada AÇILMAZ: oturum, kendi ``Limits.max_decompressed_size``
+    sınırıyla açar (async yol eskiden gövdeyi burada ve oturumda iki kez açmaya çalışıyordu)."""
     status = 0
     headers = Headers()
     for k, v in raw_headers or []:
@@ -37,8 +53,7 @@ def convert_response(raw_headers, body: bytes):
                 status = int(v)
             continue
         headers.add(ks, v.decode("latin-1"))
-    body = decode_body(bytes(body), headers.get("content-encoding", "").lower())
-    return status, headers, body
+    return status, headers, bytes(body)
 
 
 class Http3State:
@@ -86,7 +101,7 @@ def _cert_error(e: BaseException) -> "Optional[CertificateValidationError]":
 
 
 class SyncHttp3:
-    """Sync Session için: ``exchange`` -> (status, Headers, body) ya da None (h2'ye düş)."""
+    """Sync Session için: ``exchange`` -> (status, Headers, ham body) ya da None (h2'ye düş)."""
 
     def __init__(self, opts: Http3Options, ca_path, impersonate):
         require_aioquic()
@@ -117,16 +132,17 @@ class SyncHttp3:
         target = self.state.target_for(host, port)
         if target is None:
             return None
-        for attempt in (0, 1):
+        for attempt in range(MAX_REFUSED_RETRIES + 1):
             try:
                 conn = self._conn(origin, target)
             except Http3ConnectError as e:
                 return self._connect_failed(host, port, e)
             (res,) = conn.request_many([(method, path, headers, body)], timeout)
             if isinstance(res, Exception):
-                from .core import Http3RequestRefused
-                if isinstance(res, Http3RequestRefused) and attempt == 0:
-                    continue     # GOAWAY: işlenmedi, yeni bağlantıda yeniden dene
+                if isinstance(res, Http3RequestRefused):
+                    if attempt < MAX_REFUSED_RETRIES and _replayable(body):
+                        continue     # işlenmedi: yeni bağlantıda yeniden dene
+                    raise _refused_after(res, attempt + 1) from res
                 raise (res if isinstance(res, Http3Error) else ConnectionError(f"HTTP/3: {res}")) from None
             return convert_response(*res)
         return None  # pragma: no cover
@@ -150,6 +166,7 @@ class AsyncHttp3:
         self.state = Http3State(opts)
         self._ca_path, self._impersonate = ca_path, impersonate
         self._conns: dict[tuple, object] = {}
+        self._retired: set = set()      # havuzdan çıkarılmış, süren istekleri biten bağlantılar
         self._locks: dict[tuple, asyncio.Lock] = {}
 
     async def _conn(self, origin, target):
@@ -159,7 +176,14 @@ class AsyncHttp3:
         async with lock:
             c = self._conns.get(origin)
             if c is not None and (not c.usable or c.loop is not loop):
-                await c.close()
+                if c.loop is loop:
+                    # GOAWAY/REJECTED: süren (işlenecek) istekler kesilmesin; bağlantı son akış
+                    # bitince kendini kapatır.
+                    self._retired = {r for r in self._retired if not r.finished}
+                    self._retired.add(c)
+                    c.retire()
+                else:
+                    await c.close()
                 c = None
             if c is None:
                 c = AsyncH3Connection(origin[0], origin[1], target[0], target[1],
@@ -183,8 +207,7 @@ class AsyncHttp3:
             if self.state.force:
                 raise Http3ConnectError(_TRIO_UNSUPPORTED)
             return None
-        from .core import Http3RequestRefused
-        for attempt in (0, 1):
+        for attempt in range(MAX_REFUSED_RETRIES + 1):
             try:
                 conn = await self._conn(origin, target)
             except Http3ConnectError as e:
@@ -198,10 +221,10 @@ class AsyncHttp3:
                     status, hdrs, _ = convert_response(raw_headers, b"")
                     return status, hdrs, it
                 raw_headers, data = await conn.request(method, path, headers, body, timeout)
-            except Http3RequestRefused:
-                if attempt == 0:
-                    continue
-                raise
+            except Http3RequestRefused as e:
+                if attempt < MAX_REFUSED_RETRIES and _replayable(body):
+                    continue     # işlenmedi: yeni bağlantıda yeniden dene
+                raise _refused_after(e, attempt + 1) from e
             except asyncio.TimeoutError as e:
                 raise TimeoutError("HTTP/3 istek zaman aşımı") from e
             return convert_response(raw_headers, data)
@@ -209,5 +232,7 @@ class AsyncHttp3:
 
     async def close(self) -> None:
         conns, self._conns = list(self._conns.values()), {}
+        conns += list(self._retired)
+        self._retired = set()
         for c in conns:
             await c.close()

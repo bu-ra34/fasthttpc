@@ -7,8 +7,9 @@ name = "fasthttpc"
 version = "0.7.0"
 description = "Pure-Python HTTP client with its own TLS 1.3/1.2 stack, browser TLS/HTTP2 fingerprint impersonation, HTTP/2, asyncio/trio and experimental HTTP/3"
 readme = "README.md"
-license = "MIT"
-license-files = ["LICENSE"]
+# MPL-2.0: the bundled Public Suffix List snapshot only (see LICENSE-PSL).
+license = "MIT AND MPL-2.0"
+license-files = ["LICENSE", "LICENSE-PSL"]
 requires-python = ">=3.10"
 authors = [{ name = "Buğra" }]
 keywords = [
@@ -38,26 +39,28 @@ classifiers = [
 # the decoders are regular dependencies (both ship wheels for CPython 3.10-3.13 on
 # Linux/macOS/Windows). PyPy: brotlicffi (has PyPy wheels); zstandard has no PyPy
 # wheels, so there it stays opt-in via the "zstd" extra.
+# brotli/brotlicffi >= 1.2: Decompressor.process(output_buffer_limit=...) lets the
+# decompressed-size limit (Limits.max_decompressed_size) bound every output chunk.
 dependencies = [
     "cryptography>=41.0",
     "certifi>=2023.7.22",
-    "brotli>=1.1; platform_python_implementation == 'CPython'",
-    "brotlicffi>=1.1; platform_python_implementation != 'CPython'",
+    "brotli>=1.2; platform_python_implementation == 'CPython'",
+    "brotlicffi>=1.2; platform_python_implementation != 'CPython'",
     "zstandard>=0.23; platform_python_implementation == 'CPython'",
 ]
 
 [project.optional-dependencies]
 # Kept for compatibility (decoders are now installed by default on CPython).
-brotli = ["brotli>=1.1; platform_python_implementation == 'CPython'",
-          "brotlicffi>=1.1; platform_python_implementation != 'CPython'"]
+brotli = ["brotli>=1.2; platform_python_implementation == 'CPython'",
+          "brotlicffi>=1.2; platform_python_implementation != 'CPython'"]
 zstd   = ["zstandard>=0.23"]
 # http3: experimental HTTP/3 backend (aioquic). trio: AsyncSession under trio.
 http3  = ["aioquic>=1.3"]
 trio   = ["anyio>=4.0", "trio>=0.22"]
 docs   = ["mkdocs>=1.6", "mkdocs-material>=9.5", "mkdocstrings[python]>=0.26"]
-dev    = ["pytest>=7.0", "h2>=4", "tlslite-ng>=0.8", "brotli>=1.1", "zstandard>=0.23", "aioquic>=1.3", "anyio>=4.0", "trio>=0.22", "requests", "httpx", "ruff", "mypy>=1.10", "build", "twine"]
-all    = ["brotli>=1.1; platform_python_implementation == 'CPython'",
-          "brotlicffi>=1.1; platform_python_implementation != 'CPython'",
+dev    = ["pytest>=7.0", "h2>=4", "tlslite-ng>=0.8", "brotli>=1.2", "zstandard>=0.23", "aioquic>=1.3", "anyio>=4.0", "trio>=0.22", "requests", "httpx", "ruff", "mypy>=1.10", "build", "twine"]
+all    = ["brotli>=1.2; platform_python_implementation == 'CPython'",
+          "brotlicffi>=1.2; platform_python_implementation != 'CPython'",
           "zstandard>=0.23", "aioquic>=1.3", "anyio>=4.0", "trio>=0.22"]
 
 [project.urls]
@@ -73,7 +76,7 @@ include = ["fasthttpc*"]
 exclude = ["tests*", "interop*", "saha*", "examples*"]
 
 [tool.setuptools.package-data]
-fasthttpc = ["py.typed"]
+fasthttpc = ["py.typed", "public_suffix_list.dat.gz"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
@@ -128,6 +131,7 @@ files = [
     "fasthttpc/config.py",
     "fasthttpc/retry.py",
     "fasthttpc/cookies.py",
+    "fasthttpc/_psl.py",
     "fasthttpc/cache.py",
     "fasthttpc/metrics.py",
     "fasthttpc/timeout.py",

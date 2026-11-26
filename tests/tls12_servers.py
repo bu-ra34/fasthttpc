@@ -270,8 +270,21 @@ class Fake12Server:
     no_ccs, plain_finished, bad_curve, unoffered_curve, bad_pub, hello_request, hello_request_flood,
     bad_cert_host, untrusted, extra_ext, unsolicited_ticket, tls11, null_cmp_not, zero_len_rec,
     ccs_in_hs, replay_sha384, bad_record_mac, oversize_record, trailing_after_finished,
-    unoffered_alpn, close_after_hello, alert_in_hs, ske_curve_type_explicit, status
+    unoffered_alpn, close_after_hello, alert_in_hs, ske_curve_type_explicit, status,
+    ct_hello_request (no_ccs ile: nonce seçerek şifreli Finished gövdesini "HelloRequest,
+    dev uzunluk" gibi gösterir), no_nst (session_ticket kabul edilir ama NewSessionTicket
+    gönderilmez), ccs_payload_02 (CCS içeriği 0x02), hello_request_tail (NST'den sonra,
+    CCS'ten önce şifresiz HelloRequest), garbage_appdata_before_fin (CCS'ten sonra,
+    Finished'tan önce rastgele baytlı application_data record'u), ccs_before_sh (ServerHello'dan
+    ÖNCE TLS 1.3 uyumluluk CCS'i gibi bir CCS)
     """
+
+    #: İstemcinin sunucu uçuşunu (NST/CCS/Finished) aldıktan sonra REDDETMESİ beklenen
+    #: tamper'lar: sunucu yalnızca istemcinin (şifreli) alert'ini okuyup çıkar.
+    _REJECT_AFTER_FLIGHT = frozenset({
+        "no_ccs", "bad_finished", "plain_finished", "no_nst", "ccs_payload_02",
+        "hello_request_tail", "garbage_appdata_before_fin",
+    })
 
     def __init__(self, pki, *, suite=0xC02F, sigalg=None, group=0x001D, tamper=(), alpn=None,
                  split_flight=False, ticket=True, key=None, handler=None, cr_body=None):
@@ -333,6 +346,33 @@ class Fake12Server:
         aad = seq8 + struct.pack("!BHH", t, 0x0303, len(body) - 16)
         nonce = bytes(a ^ b for a, b in zip(iv, b"\x00" * 4 + seq8))
         return ChaCha20Poly1305(key).decrypt(nonce, body, aad)
+
+    def _hello_request_like_finished(self, skey, siv, fin):
+        """``ct_hello_request``: şifreli Finished'ın record GÖVDESİNİ, düz metin handshake
+        olarak okunursa ilk mesaj başlığı "HelloRequest(0), uzunluk 0x2FA22F" (> 2^18) olacak
+        biçimde üretir — CI'daki ``illegal_parameter: handshake mesajı çok büyük (3121711 bayt)``
+        hatasının birebir aynısı, ama 1/256 olasılıkla değil HER SEFERİNDE.
+
+        Finished başlığı (14 00 00 0c) sabit olduğundan şifreli metnin ilk baytları anahtar akışına
+        bağlıdır; kötü niyetli sunucunun elindeki serbestlik NONCE'tur:
+          * AES-GCM: explicit nonce telde açık ve sunucunun seçimidir (RFC 5288 §3); record GEÇERLİ
+            kalır (AAD'deki sequence number yine 0).
+          * ChaCha20-Poly1305: açık nonce yok; sunucu farklı bir nonce sayacıyla şifreleyip gövdesi
+            uygun düşeni seçer (~260 deneme). İstemci açısından CCS gelmeden bu baytlar zaten
+            yalnızca "saldırganın baytları"dır — alert'in onlara bağlı olmaması gerekir.
+        """
+        _h, _kl, _ivl, cls, _k = self.suite_info
+        aad = struct.pack("!Q", 0) + struct.pack("!BHH", 22, 0x0303, len(fin))
+        if cls is AESGCM:
+            explicit = b"\x00\x2f\xa2\x2f" + b"\x00" * 4
+            return explicit + AESGCM(skey).encrypt(siv + explicit, fin, aad)
+        aead = ChaCha20Poly1305(skey)
+        for k in range(1, 1 << 20):
+            nonce = bytes(a ^ b for a, b in zip(siv, b"\x00" * 4 + struct.pack("!Q", k)))
+            body = aead.encrypt(nonce, fin, aad)
+            if body[0] == 0 and int.from_bytes(body[1:4], "big") > (1 << 18):
+                return body
+        raise AssertionError("uygun nonce bulunamadı")  # pragma: no cover
 
     # --- sunucu akışı ---
     def serve(self, sock):
@@ -486,8 +526,11 @@ class Fake12Server:
             msgs.append(shd)
         for m in msgs:
             transcript += m
+        ccs_body = b"\x02" if "ccs_payload_02" in T else b"\x01"
+        if "ccs_before_sh" in T:
+            sock.sendall(rec(20, b"\x01"))
         if "early_ccs" in T:
-            sock.sendall(rec(22, sh) + rec(20, b"\x01"))
+            sock.sendall(rec(22, sh) + rec(20, ccs_body))
             msgs = msgs[1:]
         if self.split_flight:
             sock.sendall(rec(22, b"".join(msgs)))
@@ -551,27 +594,38 @@ class Fake12Server:
         transcript += fin
 
         out = b""
-        if "unsolicited_ticket" in T or self.ticket:
+        if ("unsolicited_ticket" in T or self.ticket) and "no_nst" not in T:
             nst = hs(4, struct.pack("!IH", 3600, 4) + b"tick")
             transcript += nst
             out += rec(22, nst)
         wseq = 0
+        if "hello_request_tail" in T:
+            out += rec(22, hs(0, b""))
         if "no_ccs" not in T:
-            out += rec(20, b"\x01")
+            out += rec(20, ccs_body)
+        if "garbage_appdata_before_fin" in T:
+            out += rec(23, os.urandom(40))
         vd = prf(hash_alg, master, b"server finished", hash_alg(bytes(transcript)).digest(), 12)
         if "bad_finished" in T:
             vd = bytes([vd[0] ^ 1]) + vd[1:]
         sfin = hs(20, vd)
         if "plain_finished" in T:
             out += rec(22, sfin)
+        elif "ct_hello_request" in T:
+            out += rec(22, self._hello_request_like_finished(skey, siv, sfin))
         else:
             out += rec(22, self._seal(skey, siv, wseq, 22, sfin + (b"\x00" if "trailing_after_finished" in T else b"")))
             wseq += 1
         sock.sendall(out)
-        if "no_ccs" in T or "bad_finished" in T or "plain_finished" in T:
+        if T & self._REJECT_AFTER_FLIGHT:
             try:
                 t, _h, b = self._read_rec(sock)
                 if t == 21:
+                    # İstemci CCS'ini göndermişti: alert'i (seq 1, Finished'tan sonra) şifreli.
+                    try:
+                        b = self._open(ckey, civ, 1, 21, b)
+                    except Exception:  # noqa: BLE001 - şifresizse olduğu gibi kaydet
+                        pass
                     self.alerts.append(b)
             except Exception:  # noqa: BLE001
                 pass
