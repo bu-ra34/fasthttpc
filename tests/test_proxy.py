@@ -20,6 +20,7 @@ from fasthttpc.transport.proxy import (
 )
 
 from fake_tls_server import FakeTLS13Server, recv_exact
+from netutil import refused_port
 
 
 @pytest.fixture
@@ -235,10 +236,7 @@ def test_socks5_connect_failure_reply():
 
 
 def test_proxy_unreachable():
-    s = socket.socket()
-    s.bind(("127.0.0.1", 0))
-    port = s.getsockname()[1]
-    s.close()
+    port = refused_port()
     with pytest.raises(ProxyError):
         connect_via_proxy(ProxyConfig("http", "127.0.0.1", port), "example.com", 443, timeout=2)
 

@@ -27,6 +27,7 @@ from fasthttpc.security.tls_adapter import HandshakeOrderValidator, TLSAdapter, 
 from fasthttpc.tls13 import AsyncTLSStream, HandshakeComplete, TLSClientConnection, TLSError  # noqa: E402
 from interop import pki as ipki  # noqa: E402
 from test_tls13_core import HOST, handshake, pki, trust  # noqa: E402,F401
+from netutil import start_server  # noqa: E402
 from tls12_servers import Fake12Server, PKI12, serve_fake_in_thread  # noqa: E402
 from tls13_fakeserver import FakeTLS13Server, expand_label, sync_serve  # noqa: E402
 
@@ -367,7 +368,7 @@ def test_async_13_stream(pki, trust, cca):
                         await writer.drain()
             finally:
                 writer.close()
-        server = await asyncio.start_server(handler, "127.0.0.1", 0)
+        server = await start_server(handler, "127.0.0.1", 0)
         port = server.sockets[0].getsockname()[1]
         st = await AsyncTLSStream.connect("127.0.0.1", port, "chrome_131", server_hostname=HOST,
                                           ca_path=trust["ca_path"], client_cert=cc)

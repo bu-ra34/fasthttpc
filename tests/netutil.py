@@ -7,9 +7,27 @@ bağlantı ilk denemede kurulur ve IPv6 yolu da gerçekten sınanır. IPv6 yoksa
 from __future__ import annotations
 
 import asyncio
+import atexit
 import socket
 import threading
 from typing import Any, Awaitable, Callable, Optional
+
+
+_RESERVED: "list[socket.socket]" = []
+atexit.register(lambda: [s.close() for s in _RESERVED])
+
+
+def refused_port() -> int:
+    """Bağlantıyı REDDEDEN (RST/ECONNREFUSED) bir TCP portu.
+
+    "Boş port seç ve kapat" paralel test süreçlerinde yarışır: araya giren başka bir süreç
+    portu dinlemeye başlarsa "kapalı port" testi bir sunucuya bağlanır. Burada port, bağlanmış
+    ama dinlemeyen bir sokete süreç boyunca ayrılır: kimse onu alamaz ve dinleyen olmadığı için
+    çekirdek bağlantıyı reddeder (Linux/macOS/Windows)."""
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s.bind(("127.0.0.1", 0))
+    _RESERVED.append(s)
+    return s.getsockname()[1]
 
 
 def dual_endpoint() -> "tuple[list[str], int]":
@@ -175,12 +193,19 @@ async def start_server(client_connected_cb: Callable[..., Awaitable[Any]], host:
 
 
 async def start_dual(client_connected_cb: Callable[..., Awaitable[Any]], **kw: Any) -> TrackedServer:
-    """``start_server`` — 127.0.0.1 ve ::1'de aynı portta."""
-    hosts, port = dual_endpoint()
-    try:
-        return await start_server(client_connected_cb, hosts, port, **kw)
-    except OSError:                           # port yarışı kaybedildi / IPv6 bind hatası
-        return await start_server(client_connected_cb, "127.0.0.1", 0, **kw)
+    """``start_server`` — 127.0.0.1 ve ::1'de aynı portta.
+
+    ``dual_endpoint`` portu seçip bırakır; başka bir süreç araya girerse bind başarısız olur:
+    birkaç kez yeni portla denenir, sonra yalnızca IPv4 (port 0, yarışsız)."""
+    for _ in range(5):
+        hosts, port = dual_endpoint()
+        if len(hosts) == 1:
+            break
+        try:
+            return await start_server(client_connected_cb, hosts, port, **kw)
+        except OSError:                       # port yarışı kaybedildi / IPv6 bind hatası
+            continue
+    return await start_server(client_connected_cb, "127.0.0.1", 0, **kw)
 
 
 def close_loop(loop: asyncio.AbstractEventLoop) -> None:
