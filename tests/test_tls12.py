@@ -625,6 +625,24 @@ def test_fake_erken_ccs_icerigi_bozuk_olsa_da_unexpected_message(pki, files):
     assert not srv.cke_seen
 
 
+def test_tls12_server_hello_oncesi_ccs_reddedilir(pki, files):
+    """TLS 1.3 uyumluluk CCS'i ServerHello'dan önce atlanabilir; ama sunucu TLS 1.2 seçerse
+    bu CCS TLS 1.2'de geçersizdir (CCS yalnızca istemci uçuşundan sonra) — reddedilir."""
+    for use_async in (False, True):
+        srv = Fake12Server(pki, tamper={"ccs_before_sh"})
+        port, t, ls = serve_fake_in_thread(srv)
+        with pytest.raises(ConnectionError, match="unexpected_message: TLS 1.2 ServerHello'dan önce"):
+            if use_async:
+                async def main():
+                    await _async_negotiate(port, files[0])
+                asyncio.run(asyncio.wait_for(main(), 15))
+            else:
+                _connect(port, files[0])
+        t.join(5)
+        ls.close()
+        assert not srv.cke_seen
+
+
 def test_wait_tail_kayit_tipi_birim():
     """İstemci uçuşundan sonraki pencere (WAIT_TAIL): NST zorunlu, sonra YALNIZCA CCS."""
     order = tls12.HandshakeOrder12(ticket_ok=True)

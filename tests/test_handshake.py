@@ -228,6 +228,71 @@ def test_server_hello_oncesi_tek_ccs_yok_sayilir():
         ta._read_server_hello(FakeSocket(ccs + plain_records(msg)), allow_ccs=False)
 
 
+def _ccs_yerlestir(server, at):
+    """FakeTLSServer çıktısındaki uyumluluk CCS'ini kaldırıp ``at``ıncı record'dan önce koyar."""
+    def responder(data):
+        out = server(data)
+        recs, i = [], 0
+        while i < len(out):
+            n = struct.unpack("!H", out[i + 3:i + 5])[0]
+            recs.append(out[i:i + 5 + n])
+            i += 5 + n
+        if not recs or recs[0][0] != 22:      # ServerHello uçuşu değil (ör. NST): dokunma
+            return out
+        recs = [r for r in recs if r[0] != 20]
+        recs.insert(at, CCS_REC)
+        return b"".join(recs)
+    return responder
+
+
+CCS_REC = struct.pack("!BHH", 20, 0x0303, 1) + b"\x01"
+
+
+def test_senkron_ikinci_ccs_reddedilir(no_pki):
+    srv = FakeTLSServer()
+    orig = srv._on_client_hello
+
+    def iki_ccs(ch):
+        out = orig(ch)
+        sh_len = struct.unpack("!H", out[3:5])[0]
+        j = 5 + sh_len + len(CCS_REC)              # ServerHello + uyumluluk CCS'i
+        return out[:j] + CCS_REC + out[j:]
+    srv._on_client_hello = iki_ccs
+    with pytest.raises(TLSProtocolError, match="unexpected_message: ikinci change_cipher_spec"):
+        _negotiate(srv)
+
+
+def test_senkron_ccs_handshake_parcalari_arasinda_reddedilir(no_pki):
+    msg = hs(11, b"\x00" * 40)
+    flight = [("hs", 8), ("raw", 22, msg[:10]), ("raw", 22, msg[10:]), ("hs", 15), ("hs", 20)]
+    srv = FakeTLSServer(flight=flight)
+    # Kayıtlar: ServerHello, EE, Cert[:10], Cert[10:] ... -> CCS'i Cert parçaları arasına koy.
+    with pytest.raises(TLSProtocolError, match="unexpected_message: change_cipher_spec, bölünmüş"):
+        _negotiate(_ccs_yerlestir(srv, 3))
+
+
+def test_senkron_el_sikisma_sonrasi_ccs_reddedilir(no_pki):
+    srv = FakeTLSServer(after_finished=CCS_REC)
+    es, _ = _negotiate(srv)
+    with pytest.raises(TLSProtocolError, match="unexpected_message: el sıkışma bittikten sonra"):
+        es.recv_record()
+
+
+def test_senkron_ikinci_server_hello_tipi_ve_boyutu():
+    """HRR sonrası 2. ServerHello: tip uzunluktan önce, uzunluk gövdeden önce denetlenir."""
+    with pytest.raises(TLSProtocolError, match=r"unexpected_message: 2. ServerHello \(2\) beklenirken"):
+        ta._recv_handshake_message(FakeSocket(plain_records(b"\x08\xff\xff\xff")), "2. ServerHello",
+                                   expect_type=2)
+    with pytest.raises(TLSProtocolError, match="decode_error: 2. ServerHello makul boyutu"):
+        ta._recv_handshake_message(FakeSocket(plain_records(b"\x02\xff\xff\xff")), "2. ServerHello",
+                                   expect_type=2)
+    # HRR'den önce görülmüş CCS ile birlikte ikinci CCS reddedilir (el sıkışma boyunca tek CCS).
+    st = {"ccs_seen": True}
+    with pytest.raises(TLSProtocolError, match="ikinci change_cipher_spec"):
+        ta._recv_handshake_message(FakeSocket(CCS_REC + plain_records(server_hello(SID, PUB))),
+                                   "2. ServerHello", st, expect_type=2)
+
+
 def test_downgrd_isareti_mesajda():
     rnd = os.urandom(24) + b"DOWNGRD\x01"
     body = b"\x03\x03" + rnd + b"\x20" + SID + b"\xc0\x2f\x00" + struct.pack("!H", 0)

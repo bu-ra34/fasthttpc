@@ -29,8 +29,8 @@ No Critical or High findings were identified.
 | FHC-08 | Low | No Public Suffix List for multi-label suffixes | Open |
 | FHC-09 | Low | Conflicting `Transfer-Encoding` / `Content-Length` responses are not treated as errors | Open |
 | FHC-10 | Info | TLS 1.3 cipher suite and ALPN not checked against what was offered | Open |
-| FHC-11 | Info | Sync TLS 1.3 record layer accepts compatibility CCS after the handshake | Open |
-| FHC-12 | Info | Unbounded count of TLS 1.2 warning alerts / TLS 1.3 handshake CCS records | Open |
+| FHC-11 | Info | Sync TLS 1.3 record layer accepts compatibility CCS after the handshake | Fixed |
+| FHC-12 | Info | Unbounded count of TLS 1.2 warning alerts / TLS 1.3 handshake CCS records | Partially fixed (CCS) |
 | FHC-13 | Info | `rsa_pss_pss_*` CertificateVerify schemes accepted with rsaEncryption keys | Open |
 | FHC-14 | Info | Low-level `TLSClientConnection(cert_validator=...)` hook can replace validation | Open |
 | FHC-15 | Info | Legacy CBC (MAC-then-encrypt) Lucky13 mitigation is best effort | Open (by design) |
@@ -208,24 +208,33 @@ cannot change these values. Only the authenticated server itself can pick
 something unexpected. (The TLS 1.2 path already checks both.)
 **Recommendation:** compare against the parsed ClientHello, as `tls12.py` does.
 
-### FHC-11 — CCS tolerated after the TLS 1.3 handshake (Info, Open)
+### FHC-11 — CCS tolerated after the TLS 1.3 handshake (Info, Fixed)
 
-**Location:** `fasthttpc/security/tls_adapter.py:466` (`EncryptedSocket.recv_record`).
+**Location:** `fasthttpc/security/tls_adapter.py` (`EncryptedSocket.recv_record`).
 
 RFC 8446 section 5 requires an `unexpected_message` abort when a CCS arrives
-after the peer's Finished. The sync path drops it silently (a code comment says
-this is intentional for a performance test). The sans-IO path already rejects it.
-There is no known impact because the record carries no data.
+after the peer's Finished. The sync path dropped it silently (a code comment said
+this was intentional for a performance test). The sans-IO path already rejected it.
+There was no known impact because the record carries no data.
 
-### FHC-12 — Unbounded warning alerts / compatibility CCS (Info, Open)
+**Fix:** both paths now share `check_compat_ccs`: a CCS after the handshake is
+`unexpected_message`.
 
-**Location:** `fasthttpc/security/tls12.py:1175`,
-`fasthttpc/tls13/connection.py:388`.
+### FHC-12 — Unbounded warning alerts / compatibility CCS (Info, Partially fixed)
+
+**Location:** `fasthttpc/security/tls12.py` (`_on_alert`),
+`fasthttpc/tls13/connection.py` (`_handle_record`).
 
 Before the handshake is authenticated, an on-path attacker can inject any number
 of TLS 1.2 warning alerts or TLS 1.3 compatibility CCS records, and each one is
 silently dropped. The cost is bounded by bandwidth. **Recommendation:** cap the
 count, as is already done for `HelloRequest`.
+
+**Partial fix:** the TLS 1.3 compatibility CCS is now dropped at most once per
+handshake, on both paths (RFC 8446 appendix D.4: the server sends it once, right
+after its first handshake message). A second CCS, a CCS between the fragments of
+a handshake message (section 5.1) and a CCS before a TLS 1.2 ServerHello are
+`unexpected_message`. TLS 1.2 warning alerts are still not counted.
 
 ### FHC-13 — `rsa_pss_pss_*` accepted with rsaEncryption keys (Info, Open)
 

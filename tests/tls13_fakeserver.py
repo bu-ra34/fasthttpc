@@ -182,7 +182,10 @@ class FakeTLS13Server:
       tls12 (supported_versions göndermeme), wrong_session_id, oversize_record,
       cert_request, early_app_data, psk_with_cert (PSK kabulünden sonra yine de
       Certificate/CertificateVerify gönder), force_psk (ClientHello'da PSK
-      olmasa/HRR sonrası bile ServerHello'da pre_shared_key seç)
+      olmasa/HRR sonrası bile ServerHello'da pre_shared_key seç),
+      double_ccs (ServerHello'dan sonra İKİ uyumluluk CCS'i), bad_ccs (CCS içeriği 0x02),
+      ccs_mid_message (split_records + no_ccs ile: CCS, bölünmüş bir handshake mesajının
+      iki şifreli parçası arasına), ccs_after_finished (CCS, sunucu Finished'ından sonra)
 
     psk_store: dict verilirse sunucu PSK resumption destekler: tam handshake
     sonrası gerçek (benzersiz) biletler verir ve ticket->PSK kaydını bu sözlükte
@@ -306,6 +309,8 @@ class FakeTLS13Server:
         self.transcript += sh
         out = struct.pack("!BHH", 22, 0x0303, len(sh)) + sh
         if "no_ccs" not in self.tamper:
+            out += b"\x14\x03\x03\x00\x01" + (b"\x02" if "bad_ccs" in self.tamper else b"\x01")
+        if "double_ccs" in self.tamper:
             out += b"\x14\x03\x03\x00\x01\x01"
 
         # key schedule
@@ -380,6 +385,9 @@ class FakeTLS13Server:
         elif "split_records" in self.tamper:
             for i in range(0, len(flight), 50):
                 out += self.write.seal(flight[i:i + 50], 22)
+                if i == 0 and "ccs_mid_message" in self.tamper:
+                    assert len(flight) > 50 and len(msgs[0]) < 50, "ilk 50 bayt bir mesajı bölmeli"
+                    out += b"\x14\x03\x03\x00\x01\x01"
         else:
             for i, m in enumerate(msgs):
                 out += self.write.seal(m, 22)
@@ -395,6 +403,8 @@ class FakeTLS13Server:
         self.s_ats = expand_label(self.h, master, "s ap traffic", th_sf, hl)
         self.app_write = self._traffic(self.s_ats)
         self.state = "WAIT_FINISHED"
+        if "ccs_after_finished" in self.tamper:
+            out += b"\x14\x03\x03\x00\x01\x01"
         return out
 
     def _select_psk(self, ch: dict, msg: bytes):

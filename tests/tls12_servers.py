@@ -272,7 +272,8 @@ class Fake12Server:
     dev uzunluk" gibi gösterir), no_nst (session_ticket kabul edilir ama NewSessionTicket
     gönderilmez), ccs_payload_02 (CCS içeriği 0x02), hello_request_tail (NST'den sonra,
     CCS'ten önce şifresiz HelloRequest), garbage_appdata_before_fin (CCS'ten sonra,
-    Finished'tan önce rastgele baytlı application_data record'u)
+    Finished'tan önce rastgele baytlı application_data record'u), ccs_before_sh (ServerHello'dan
+    ÖNCE TLS 1.3 uyumluluk CCS'i gibi bir CCS)
     """
 
     #: İstemcinin sunucu uçuşunu (NST/CCS/Finished) aldıktan sonra REDDETMESİ beklenen
@@ -517,6 +518,8 @@ class Fake12Server:
         for m in msgs:
             transcript += m
         ccs_body = b"\x02" if "ccs_payload_02" in T else b"\x01"
+        if "ccs_before_sh" in T:
+            sock.sendall(rec(20, b"\x01"))
         if "early_ccs" in T:
             sock.sendall(rec(22, sh) + rec(20, ccs_body))
             msgs = msgs[1:]
