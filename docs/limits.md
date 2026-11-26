@@ -40,7 +40,6 @@
 - `http://` is plain HTTP/1.1 only: no h2c (cleartext HTTP/2) and no HTTP/3.
   There is no HSTS, so an `http://` URL is never upgraded to `https://`. (Up to
   0.6.2, `http://` URLs were fetched over TLS.)
-- HPACK Huffman encoding missing (small HTTP/2 fingerprint deviation).
 - HTTP/2 server push is disabled (`ENABLE_PUSH=0`). PRIORITY frames are not
   sent; the HEADERS priority field follows the profile.
 - Concurrent HTTP/2 streams on one connection are an `AsyncSession` feature;
@@ -48,8 +47,10 @@
 - HTTP/3 is experimental: it is not used through proxies or with `cert=`, is
   not used under trio (`http3=True` falls back, `"force"` raises
   `Http3ConnectError`), buffers whole response bodies, never uses resumption or
-  0-RTT, and its QUIC TLS handshake is aioquic's (no browser ClientHello). It has
-  only been tested against a local aioquic server. See [HTTP/3](features/http3.md).
+  0-RTT, and its QUIC TLS handshake is aioquic's (no browser ClientHello). Live
+  tests against public servers (Cloudflare, nginx, Google) run only weekly and
+  on demand in a separate workflow, not on every push or pull request (see
+  [Live HTTP/3 tests](testing.md#live-http3-tests)). See [HTTP/3](features/http3.md).
 
 ## Client
 
@@ -86,10 +87,12 @@ the sources. The table below lists everything known not to match the real browse
 | `firefox_160` | The `zstd` certificate-compression entry is only advertised when `zstandard` is installed, and `brotli` only when `brotli` is installed. |
 | `firefox_160` | The TLS values come from the Firefox 160 source. The newest real capture available was Firefox 155. |
 | `safari_27` | Built from the Safari 27.0 capture data; 27.1/27.2 are assumed to have the same network stack (only the User-Agent says 27.2). |
+| `safari_27`, `safari_18` | HPACK: Safari's encoder (CFNetwork) is closed source. A Safari 26.6.1 capture (277-byte HEADERS payload) confirms Huffman coding and that regular headers are added to the dynamic table. Not verified, Chrome's behaviour assumed: Huffman only when shorter, which pseudo-headers are indexed, name references, no never-indexed fields, table size updates. The `Cookie` header is assumed to be sent as one field (not split). |
+| all | HPACK: if a server advertises a `SETTINGS_HEADER_TABLE_SIZE` above 16 MiB, the encoder uses 16 MiB and its table size update says so; Chrome and Firefox would use the advertised value. Real servers advertise 4096 or 65536. |
 | all | HTTP/3 uses aioquic's ClientHello (no browser TLS fingerprint over QUIC); the Chrome QUIC profile does not send the `H3_DATAGRAM` (0x33) setting current Chrome sends. |
 
 ## Project
 
 - Young project with a small user base. There has been an internal security
   review ([Security review (2026-11)](security-audit.md), with open findings
-  such as no limit on decompressed body size), but no external audit.
+  such as no Public Suffix List for cookie domains), but no external audit.

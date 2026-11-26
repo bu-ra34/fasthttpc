@@ -20,6 +20,8 @@ from __future__ import annotations
 import os
 from typing import Any, Mapping, Optional, Union
 
+from .streaming import DEFAULT_MAX_DECOMPRESSED_SIZE
+
 _DEFAULT_TIMEOUT = 30.0
 _UNSET = object()
 
@@ -141,9 +143,17 @@ class Limits:
                                    (``None`` → ``max_connections``).
         keepalive_expiry:          Boştaki bağlantının kapatılmadan önce
                                    bekleyebileceği süre (saniye).
+        max_decompressed_size:     Content-Encoding (gzip/deflate/br/zstd) ya da
+                                   aktarım kodlaması açıldıktan sonra yanıt gövdesi
+                                   için üst sınır (bayt). Aşılınca
+                                   :class:`~fasthttpc.DecompressedSizeError`
+                                   (sıkıştırma bombası koruması; gövde asla sessizce
+                                   kısaltılmaz). Varsayılan 256 MiB; ``None`` sınırı
+                                   kapatır. Sıkıştırılmamış gövdeye uygulanmaz.
     """
 
-    __slots__ = ("max_connections", "max_keepalive_connections", "keepalive_expiry")
+    __slots__ = ("max_connections", "max_keepalive_connections", "keepalive_expiry",
+                 "max_decompressed_size")
 
     def __init__(
         self,
@@ -151,6 +161,7 @@ class Limits:
         max_connections:           int             = 10,
         max_keepalive_connections: Optional[int]   = None,
         keepalive_expiry:          Optional[float] = 30.0,
+        max_decompressed_size:     Optional[int]   = DEFAULT_MAX_DECOMPRESSED_SIZE,
     ) -> None:
         for name, v in (("max_connections", max_connections),
                         ("max_keepalive_connections", max_keepalive_connections),
@@ -162,6 +173,12 @@ class Limits:
         self.max_connections = max_connections
         self.max_keepalive_connections = max_keepalive_connections
         self.keepalive_expiry = keepalive_expiry
+        if max_decompressed_size is not None and (
+                isinstance(max_decompressed_size, bool) or not isinstance(max_decompressed_size, int)
+                or max_decompressed_size < 1):
+            raise ValueError("Limits.max_decompressed_size pozitif bir tam sayı (bayt) ya da "
+                             f"None olmalı: {max_decompressed_size!r}")
+        self.max_decompressed_size = max_decompressed_size
 
     def apply_to_pool(self, pool: Any) -> None:
         """Sınırları bir :class:`ConnectionPool` örneğine uygular."""
@@ -172,13 +189,16 @@ class Limits:
 
     def __eq__(self, other: object) -> bool:
         return isinstance(other, Limits) and (
-            self.max_connections, self.max_keepalive_connections, self.keepalive_expiry
-        ) == (other.max_connections, other.max_keepalive_connections, other.keepalive_expiry)
+            self.max_connections, self.max_keepalive_connections, self.keepalive_expiry,
+            self.max_decompressed_size,
+        ) == (other.max_connections, other.max_keepalive_connections, other.keepalive_expiry,
+              other.max_decompressed_size)
 
     def __repr__(self) -> str:
         return (f"Limits(max_connections={self.max_connections}, "
                 f"max_keepalive_connections={self.max_keepalive_connections}, "
-                f"keepalive_expiry={self.keepalive_expiry})")
+                f"keepalive_expiry={self.keepalive_expiry}, "
+                f"max_decompressed_size={self.max_decompressed_size})")
 
 
 VERIFY_FALSE_MESSAGE = (

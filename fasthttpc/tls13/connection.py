@@ -689,7 +689,10 @@ class TLSClientConnection:
             if hs_type == HS_COMPRESSED_CERTIFICATE:
                 try:
                     msg = _cv.decompress_certificate_message(msg)
-                except CertificateValidationError as e:
+                except _cv.CertificateDecompressionError as e:
+                    # RFC 8879 §4: bağlantı alert ile sonlandırılır (istemci handshake
+                    # anahtarıyla şifreli; çağıran data_to_send() ile gönderir).
+                    self._seal(bytes((2, e.alert)), CT_ALERT)
                     raise TLSError(f"Sıkıştırılmış sertifika açılamadı: {e}") from e
             try:
                 self.peer_certificate = self._validate_cert(msg)
