@@ -29,6 +29,16 @@
   değişince, Firefox her ayarda yazar. 16 MiB üstü ilanlar 16 MiB'ye sınırlanır.
 - `hpack_huffman_encode`, `hpack_huffman_size`, `HPACK_HUFFMAN_CODES` (kod
   tablosu decode trie'sinden türetilir; RFC tablosuyla testte karşılaştırılır).
+- **secp521r1, x448, ffdhe2048 ve ffdhe3072 anahtar değişimi.** TLS 1.3'te
+  sunucu bu gruplardan birini HelloRetryRequest ile isterse 2. ClientHello o
+  grubun payını taşır (önceden açık hatayla kesiliyordu). TLS 1.2 ECDHE
+  ServerKeyExchange'te (RFC 8422) secp521r1 ve x448 kabul edilir. ffdhe yalnızca
+  TLS 1.3'tedir (RFC 7919 sabit asalları, g = 2; parametre çalışma anında
+  üretilmez); TLS 1.2 DHE suite'leri eskisi gibi her zaman reddedilir.
+- Karşı değer doğrulaması: P-521'de yalnızca tam uzunlukta uncompressed ve eğri
+  üzerindeki nokta, x448'de 56 byte ve sıfır olmayan paylaşılan sır, ffdhe'de p
+  uzunluğunda ve 1 < Y < p-1 olan değer kabul edilir. ffdhe paylaşılan sırrı p
+  uzunluğuna soldan sıfırla doldurulur (RFC 8446 §7.4.1).
 
 ### Testler / CI
 - RFC 7541 Appendix B tablosu (257 sembol), C.4 ve C.6 örnekleri (tahliye
@@ -38,6 +48,29 @@
 - Bağımsız sunucuyla birlikte-çalışma (OpenSSL TLS + `h2`): senkron ve async,
   üç profil, bağlantı ortasında tablo küçültme/büyütme, eşzamanlı stream'ler;
   ham HEADERS blokları sunucu tarafında denetlenir.
+- `tests/test_kex_groups.py`: gidiş-dönüş, geçersiz karşı değerler (eğri dışı
+  nokta, yanlış uzunluk, x448 sıfır sır, ffdhe Y=0/1/p-1/>=p), deterministik
+  ffdhe dolgu vakaları, HRR kuralları (senkron ve sans-IO), TLS 1.2 ECDHE.
+- `tests/test_interop_kex_groups.py`: `openssl s_server -groups` karşısında her
+  grup × TLS 1.3/1.2 × senkron/async. Yerel openssl bir grubu tanımıyorsa test
+  gerekçesiyle atlanır.
+
+### Değişti
+- **Parmak izi DEĞİŞMEDİ:** her profilin supported_groups listesi ve ilk
+  key_share'leri bayt bayt aynıdır. Firefox/Safari secp521r1'i (ve
+  `firefox_133` ffdhe'yi) eskisi gibi yalnızca ilan eder, ilk pay göndermez.
+  Chrome ve `default` bu grupları ilan etmez; x448'i hiçbir profil ilan etmez.
+  Yeni testler her profilin grup/key_share baytlarını sabitler.
+- HelloRetryRequest'in seçtiği grup ClientHello'nun supported_groups'unda
+  ilan edilmemişse async (sans-IO) yol da artık `illegal_parameter` ile
+  reddeder (RFC 8446 §4.1.4; senkron yol zaten reddediyordu).
+  `TLSImpersonator.advertised_groups()` telde gerçekten ilan edilen listeyi döner.
+- TLS 1.2 ServerKeyExchange yalnızca eliptik eğri seçebilir: ffdhe ve
+  X25519MLKEM768 "eğrisi" el sıkışmanın başında açık hatayla reddedilir.
+- cryptography'nin FFDH kullanımdan kaldırma uyarısı yalnızca fasthttpc'nin
+  kendi çağrıları için susturulur. Destek ileride kaldırılırsa ffdhe grupları
+  ilan edilmeye devam eder, HRR ile istenirlerse açık hata verilir.
+
 - Artan GOAWAY kimliği testi (8 → 12, H3_ID_ERROR) aioquic 1.9'da yeni istek
   başlatılamadığı için düşüyordu. İkinci GOAWAY artık aynı bağlantıda, istek
   sürerken gönderiliyor (yerel sunucuda `/goaway-hold` yolu); test aioquic 1.3,

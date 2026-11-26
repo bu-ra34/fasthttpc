@@ -182,7 +182,8 @@ class FakeTLS13Server:
       tls12 (supported_versions göndermeme), wrong_session_id, oversize_record,
       cert_request, early_app_data, psk_with_cert (PSK kabulünden sonra yine de
       Certificate/CertificateVerify gönder), force_psk (ClientHello'da PSK
-      olmasa/HRR sonrası bile ServerHello'da pre_shared_key seç)
+      olmasa/HRR sonrası bile ServerHello'da pre_shared_key seç), double_hrr
+      (2. ClientHello'ya da HelloRetryRequest ile yanıt ver — RFC 8446 §4.1.4 ihlali)
 
     psk_store: dict verilirse sunucu PSK resumption destekler: tam handshake
     sonrası gerçek (benzersiz) biletler verir ve ticket->PSK kaydını bu sözlükte
@@ -253,7 +254,8 @@ class FakeTLS13Server:
         ch = parse_client_hello(msg)
         self.client_hellos.append(ch)
         sid = ch["session_id"]
-        if self.state == "WAIT_CH" and self.hrr_group is not None:
+        if self.hrr_group is not None and (
+                self.state == "WAIT_CH" or (self.state == "WAIT_CH2" and "double_hrr" in self.tamper)):
             # HelloRetryRequest
             exts = ext(43, b"\x03\x04") + ext(51, struct.pack("!H", self.hrr_group))
             if self.hrr_cookie:
@@ -280,12 +282,16 @@ class FakeTLS13Server:
             shared = priv.exchange(x25519.X25519PublicKey.from_public_bytes(peer))
             pub = priv.public_key().public_bytes(serialization.Encoding.Raw,
                                                  serialization.PublicFormat.Raw)
-        else:
+        elif group in (0x0017, 0x0018):
             curve = {0x0017: ec.SECP256R1(), 0x0018: ec.SECP384R1()}[group]
             priv = ec.generate_private_key(curve)
             shared = priv.exchange(ec.ECDH(), ec.EllipticCurvePublicKey.from_encoded_point(curve, peer))
             pub = priv.public_key().public_bytes(serialization.Encoding.X962,
                                                  serialization.PublicFormat.UncompressedPoint)
+        else:   # secp521r1 / x448 / ffdhe: HRR ile istenen grup için sunucu payı
+            from fasthttpc.security.keyshare import compute_shared_secret, generate_key_share
+            priv, pub = generate_key_share(group)
+            shared = compute_shared_secret(group, priv, peer)
 
         psk = None
         if "force_psk" in self.tamper:           # teklif edilmemiş PSK'yı seçen kötü niyetli sunucu
