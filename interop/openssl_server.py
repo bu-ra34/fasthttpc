@@ -1,6 +1,7 @@
 """`openssl s_server` alt süreç yönetimi (rastgele port, hazır olana kadar bekleme)."""
 from __future__ import annotations
 
+import functools
 import os
 import queue
 import re
@@ -29,6 +30,31 @@ def free_port() -> int:
 def s_server_supports(flag: str) -> bool:
     out = subprocess.run([OPENSSL, "s_server", "-help"], capture_output=True, text=True).stderr
     return flag in out
+
+
+@functools.lru_cache(maxsize=None)
+def s_server_supports_group(group: str) -> bool:
+    """Yerel `openssl s_server` bu TLS grubunu (``-groups``) ayarlayabiliyor mu?
+
+    Tanımadığı grupta s_server başlarken ``SSL_CONF_cmd(-groups, ...)`` hatasıyla çıkar;
+    tanıyorsa dinlemeye başlar (``ACCEPT`` satırı). ``-nocert``: yalnızca yoklama, sertifika gerekmez.
+    """
+    if OPENSSL is None:
+        return False
+    proc = subprocess.Popen(
+        [OPENSSL, "s_server", "-accept", "127.0.0.1:0", "-nocert", "-groups", group],
+        stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+        env={**os.environ, "OPENSSL_CONF": os.devnull})
+    killer = threading.Timer(15, proc.kill)      # takılırsa (beklenmez) yoklamayı sonlandır
+    killer.start()
+    try:
+        return any(raw.startswith(b"ACCEPT") for raw in iter(proc.stdout.readline, b""))
+    finally:
+        killer.cancel()
+        if proc.poll() is None:
+            proc.kill()
+        proc.wait(5)
+        proc.stdout.close()
 
 
 _HTTP_MODES = ("-WWW", "-HTTP")

@@ -135,6 +135,69 @@ def chrome_sec_ch_ua(major: int, brand: "str | None" = "Google Chrome") -> str:
         shuffled[pos] = brands[i]
     return ", ".join(f'"{b}";v="{v}"' for b, v in shuffled)
 
+
+# ---------------------------------------------------------------------------
+# HPACK kodlayıcı davranışı (h2["hpack"]; alanlar: http2_parser.HpackPolicy).
+# RFC 7541 Huffman'ın ne zaman kullanılacağını, hangi başlığın dinamik tabloya
+# gireceğini, ad referansını, cookie bölmeyi ve tablo boyutu güncellemesini
+# tarayıcıya bırakır; bunlar HEADERS frame'inin BAYTLARINI belirler.
+#
+#  [QH]  Chromium/QUICHE (google/quiche main): quiche/http2/hpack/hpack_encoder.cc
+#        (DefaultPolicy, EmitString, EmitNonIndexedLiteral, CookieToCrumbs,
+#        ApplyHeaderTableSizeSetting, MaybeEmitTableSize), hpack_header_table.cc
+#        (GetByName/GetByNameAndValue: önce statik, sonra en yeni dinamik),
+#        hpack_static_table.cc (aynı adlı statik girişlerde İLKİ),
+#        http2/core/spdy_framer.cc (GetHpackEncoder: ENABLE_COMPRESSION, cookie
+#        parçalama kapatılmaz); Chromium net/spdy/spdy_session.cc HandleSetting
+#        (SETTINGS_HEADER_TABLE_SIZE -> UpdateHeaderEncoderTableSize, üst sınır yok).
+#        Bağımsız doğrulama: httpcloak 8a8f2be1e7 commit'indeki gerçek Chrome 151
+#        yakalamaları (":path /fi/matkat" = 048762533148d3d469, "cookie alpha=one" =
+#        60871d15ce380f517f, :authority 0x41, 65536 için size update 3fe1ff03).
+#  [FH]  Firefox (mozilla-firefox/firefox main) netwerk/protocol/http/
+#        Http2Compression.cpp: EncodeHeaderBlock (:path noLocalIndex, cookie "; "
+#        ile bölünür, <20 bayt parça never-indexed, authorization never-indexed,
+#        te: trailers sonda), ProcessHeader (tablo taraması: SON ad eşleşmesi;
+#        giriş > tablo/2 ya da tablo < 128 -> indekslenmez), HuffmanAppend (her dize
+#        Huffman), SetMaxBufferSize (her SETTINGS_HEADER_TABLE_SIZE'da güncelleme);
+#        Http2Session.cpp RecvSettings.
+#  [SC]  Safari: CFNetwork kapalı kaynak. httpcloak testdata/safari-26-ios-capture.json
+#        (tls.peet.ws, Safari 26.6.1 iOS) başlık listesi + PR #135'teki 277 baytlık
+#        HEADERS yükü: 277 ancak Huffman AÇIK ve user-agent/accept/accept-language/
+#        accept-encoding "incremental indexing" (6 bit önek) ile çıkar (Huffman'sız
+#        359, indekslemesiz 281). Gerisi (Huffman "yalnızca kısaysa" mı "her zaman"
+#        mı, pseudo-header indeksleme, cookie, size update) DOĞRULANMADI: Chromium
+#        davranışı varsayıldı; cookie tek alan (httpcloak'ın WebKit varsayımı).
+# ---------------------------------------------------------------------------
+
+_HPACK_CHROMIUM = {
+    "huffman": "shorter",              # EmitString: HuffmanSize < ham uzunluk ise
+    "name_ref": "first",               # GetByName: statik ilk, sonra en yeni dinamik
+    "index_pseudo": [":authority"],    # DefaultPolicy: pseudo'lardan yalnızca :authority
+    "always_literal": [],
+    "never_index": [],                 # QUICHE kodlayıcı 0x10 hiç üretmez
+    "cookie_crumbs": "chromium",       # CookieToCrumbs (crumble_cookies_ = true)
+    "cookie_never_index_below": 0,
+    "index_max_entry_divisor": 0,      # TryAddEntry: sığmayan giriş tabloyu boşaltır
+    "index_min_table_size": 0,
+    "size_update": "on_change",        # ApplyHeaderTableSizeSetting
+}
+
+_HPACK_FIREFOX = {
+    "huffman": "always",               # HuffmanAppend koşulsuz
+    "name_ref": "last",                # ProcessHeader taraması
+    "index_pseudo": None,              # :method/:authority/:scheme indekslenebilir
+    "always_literal": [":path"],       # ProcessHeader(":path", noLocalIndex=true)
+    "never_index": ["authorization"],
+    "cookie_crumbs": "firefox",        # "; " ile böl
+    "cookie_never_index_below": 20,    # "cookies less than 20 bytes are not indexed"
+    "index_max_entry_divisor": 2,      # newSize > mMaxBuffer / 2
+    "index_min_table_size": 128,       # mMaxBuffer < 128
+    "size_update": "on_setting",       # SetMaxBufferSize her SETTINGS'te
+}
+
+# [SC]: Huffman + regular başlıkların indekslenmesi doğrulandı; kalanı varsayım.
+_HPACK_SAFARI = dict(_HPACK_CHROMIUM, cookie_crumbs=None)
+
 PROFILES = {
 
     # Chrome 131 (Windows). TLS: [CI][TC][KD]; h2: [CI][TC][SW].
@@ -194,6 +257,8 @@ PROFILES = {
                 "sec-fetch-dest", "accept-encoding", "accept-language",
                 "cookie", "priority",
             ],
+            # HPACK kodlayıcı: Chromium/QUICHE [QH]
+            "hpack": _HPACK_CHROMIUM,
         },
         # Varsayılan gezinme başlıkları [CI] curl_chrome131 betiği (başlık
         # değerleri) — Content-Length/Content-Type/Origin/Referer'in gerçek
@@ -277,6 +342,8 @@ PROFILES = {
                 "upgrade-insecure-requests", "sec-fetch-dest", "sec-fetch-mode",
                 "sec-fetch-site", "sec-fetch-user", "cookie", "priority", "te",
             ],
+            # HPACK kodlayıcı: Firefox Http2Compression.cpp [FH]
+            "hpack": _HPACK_FIREFOX,
         },
         # [CI] curl_firefox133 başlık değerleri (bellekten; Accept'teki
         # image/* listesi ve TE: trailers'ın h2'ye özgülüğü doğrulanmadı).
@@ -355,6 +422,8 @@ PROFILES = {
                 "accept", "sec-fetch-site", "sec-fetch-mode",
                 "accept-language", "priority", "accept-encoding", "cookie",
             ],
+            # HPACK kodlayıcı: Safari [SC] (kısmen doğrulandı)
+            "hpack": _HPACK_SAFARI,
         },
         # [CI] curl_safari180 (bellekten). Safari UA'sı macOS sürümünü hep
         # 10_15_7 olarak dondurur. upgrade-insecure-requests'in sırası ve h1
@@ -438,6 +507,8 @@ PROFILES = {
                 "sec-fetch-dest", "accept-encoding", "accept-language",
                 "cookie", "priority",
             ],
+            # HPACK kodlayıcı: Chromium/QUICHE [QH]
+            "hpack": _HPACK_CHROMIUM,
         },
         # [CAP] (Chrome 153 gezinme isteği, başlık sırası/değerleri) + sec-ch-ua
         # 158 için chrome_sec_ch_ua() ile hesaplandı.
@@ -523,6 +594,8 @@ PROFILES = {
                 "upgrade-insecure-requests", "sec-fetch-dest", "sec-fetch-mode",
                 "sec-fetch-site", "sec-fetch-user", "cookie", "priority", "te",
             ],
+            # HPACK kodlayıcı: Firefox Http2Compression.cpp [FH]
+            "hpack": _HPACK_FIREFOX,
         },
         # Accept: [FF] DocumentAcceptHeader (accept_include_images=false).
         # Accept-Language: en-US + en için Firefox q=0.5 üretir (PrepareAcceptLanguages).
@@ -601,6 +674,8 @@ PROFILES = {
                 "sec-fetch-site", "sec-fetch-mode", "accept-language",
                 "priority", "accept-encoding", "cookie",
             ],
+            # HPACK kodlayıcı: Safari [SC] (kısmen doğrulandı)
+            "hpack": _HPACK_SAFARI,
         },
         # [CI2] safari270 (sec-fetch-site doğrudan gezinme için "none":
         # safari_26.0.1 yakalamasıyla aynı).
@@ -657,6 +732,8 @@ PROFILES = {
             "headers_priority": None,
             "pseudo_header_order": [":method", ":authority", ":scheme", ":path"],
             "header_order": [],
+            # HPACK: tarayıcı taklidi yok; Chromium politikası (Huffman + dinamik tablo)
+            "hpack": _HPACK_CHROMIUM,
         },
         # Tarayıcı taklidi yok: yalnızca gerekli/zararsız başlıklar (sıra serbest).
         "http_headers": {

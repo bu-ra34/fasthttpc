@@ -182,8 +182,12 @@ class TLSImpersonator:
         return self.key_shares.public(GROUP_X25519)
 
     def advertised_groups(self) -> list[int]:
-        """supported_groups uzantısında ilan edilen gruplar (GREASE hariç)."""
-        return [g for g in self.profile.get("supported_groups", []) if isinstance(g, int)]
+        """supported_groups uzantısında telde GERÇEKTEN ilan edilen gruplar (GREASE hariç).
+
+        HelloRetryRequest'in seçtiği grup bu listede olmalıdır (RFC 8446 §4.1.4);
+        desteklenmediği için ClientHello'dan düşen PQ gruplar burada da yoktur.
+        """
+        return [g for g in self._supported_groups_list() if g not in self._GREASE_SET]
 
     # GREASE değerleri (RFC 8701). Profillerde "GREASE" placeholder'ı olarak
     # geçer ve her bağlantıda rastgele bir değerle doldurulur.
@@ -254,7 +258,13 @@ class TLSImpersonator:
     def _pack_renegotiation_info(self) -> bytes:
         return self._ext(0xFF01, b"\x00")
 
-    def _pack_supported_groups(self) -> bytes:
+    def _supported_groups_list(self) -> list[int]:
+        """supported_groups uzantısının telde gönderilen listesi (GREASE dahil).
+
+        Profil sırası ve içeriği AYNEN korunur (parmak izi); yalnızca _NEEDS_SUPPORT
+        grupları gerçekten desteklenmiyorsa düşer. SUPPORTED_GROUPS'a yeni grup
+        eklemek bu listeyi DEĞİŞTİRMEZ (profilde olmayan grup ilan edilmez).
+        """
         profile_groups = self.profile.get("supported_groups", [0x001D, 0x0017, 0x0018])
         groups: list[int] = []
         for g in profile_groups:
@@ -264,6 +274,10 @@ class TLSImpersonator:
                 groups.append(g)
         if not groups:
             groups = [0x001D, 0x0017, 0x0018]
+        return groups
+
+    def _pack_supported_groups(self) -> bytes:
+        groups = self._supported_groups_list()
         raw = b"".join(struct.pack("!H", g) for g in groups)
         payload = struct.pack(f"!H{len(raw)}s", len(raw), raw)
         return self._ext(0x000A, payload)
@@ -544,6 +558,9 @@ class TLSImpersonator:
         """
         if self._client_random is None:
             raise RuntimeError("build_retry_client_hello, build_client_hello'dan önce çağrılamaz.")
+        if group not in self.advertised_groups():
+            # RFC 8446 §4.1.4: HRR'nin grubu 1. ClientHello'nun supported_groups'unda olmalı.
+            raise ValueError(f"HRR grubu supported_groups'ta ilan edilmedi: {group_name(group)}")
         if group not in SUPPORTED_GROUPS:
             raise ValueError(f"HRR grubu desteklenmiyor: {group_name(group)}")
         self.key_shares = KeyShareSet([group])

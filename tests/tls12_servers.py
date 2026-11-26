@@ -21,11 +21,13 @@ from netutil import linger_close
 
 from cryptography import x509
 from cryptography.hazmat.primitives import hashes, serialization
-from cryptography.hazmat.primitives.asymmetric import ec, padding, rsa, x25519
+from cryptography.hazmat.primitives.asymmetric import ec, padding, rsa, x448, x25519
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM, ChaCha20Poly1305
 from cryptography.x509.oid import ExtendedKeyUsageOID, NameOID
 
 HOST = "localhost"
+# ECDHE ServerKeyExchange'te kullanılabilen NIST eğrileri (RFC 8422 named_curve)
+_EC_CURVES = {0x0017: ec.SECP256R1, 0x0018: ec.SECP384R1, 0x0019: ec.SECP521R1}
 
 
 # ---------------------------------------------------------------- PKI
@@ -292,6 +294,7 @@ class Fake12Server:
         self.client_hello = None
         self.finished_ok = False
         self.cke_seen = False
+        self.cke_pub = None         # istemcinin ClientKeyExchange'teki ECDHE public değeri
         self.suite_info = _SUITES.get(suite, _SUITES[0xC02F])
 
     # --- kayıt katmanı ---
@@ -430,21 +433,26 @@ class Fake12Server:
         # ---- ServerKeyExchange ----
         group = self.group
         if "bad_curve" in T:
-            group = 0x0019        # secp521r1: istemci desteklemiyor
+            group = 0x001A        # brainpoolP256r1: istemci desteklemiyor
         if "unoffered_curve" in T:
-            group = 0x001E        # x448: ilan edilmedi
+            group = 0x001E        # x448: chrome profili ilan etmiyor
         if group == 0x001D:
             priv = x25519.X25519PrivateKey.generate()
             pub = priv.public_key().public_bytes(serialization.Encoding.Raw, serialization.PublicFormat.Raw)
-        elif group in (0x0017, 0x0018):
-            curve = {0x0017: ec.SECP256R1(), 0x0018: ec.SECP384R1()}[group]
-            priv = ec.generate_private_key(curve)
+        elif group == 0x001E:
+            priv = x448.X448PrivateKey.generate()
+            pub = priv.public_key().public_bytes(serialization.Encoding.Raw, serialization.PublicFormat.Raw)
+        elif group in _EC_CURVES:
+            priv = ec.generate_private_key(_EC_CURVES[group]())
             pub = priv.public_key().public_bytes(serialization.Encoding.X962,
                                                  serialization.PublicFormat.UncompressedPoint)
         else:
             priv, pub = None, os.urandom(32)
         if "bad_pub" in T:
-            pub = b"\x04" + os.urandom(64) if group != 0x001D else b"\x00" * 32
+            if group in (0x001D, 0x001E):
+                pub = bytes(len(pub))                      # u = 0: paylaşılan sır tamamen sıfır
+            else:
+                pub = pub[:-1] + bytes([pub[-1] ^ 1])      # Y'nin son biti: aralıkta ama eğri dışı
         params = bytes([3]) + struct.pack("!H", group) + bytes([len(pub)]) + pub
         if "ske_curve_type_explicit" in T:
             params = bytes([1]) + struct.pack("!H", group) + bytes([len(pub)]) + pub
@@ -511,11 +519,13 @@ class Fake12Server:
         assert cke[0] == 16
         cpub = cke[5:5 + cke[4]]
         transcript += cke
+        self.cke_pub = bytes(cpub)
         if group == 0x001D:
             pms = priv.exchange(x25519.X25519PublicKey.from_public_bytes(cpub))
+        elif group == 0x001E:
+            pms = priv.exchange(x448.X448PublicKey.from_public_bytes(cpub))
         else:
-            curve = {0x0017: ec.SECP256R1(), 0x0018: ec.SECP384R1()}[group]
-            pms = priv.exchange(ec.ECDH(), ec.EllipticCurvePublicKey.from_encoded_point(curve, cpub))
+            pms = priv.exchange(ec.ECDH(), ec.EllipticCurvePublicKey.from_encoded_point(_EC_CURVES[group](), cpub))
         session_hash = hash_alg(bytes(transcript)).digest()
         master = prf(hash_alg, pms, b"extended master secret", session_hash, 48)
         _h, klen, ivlen, _cls, _kt = self.suite_info
