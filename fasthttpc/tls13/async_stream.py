@@ -172,7 +172,7 @@ class AsyncTLSStream:
         self.writer.close()
 
     async def wait_closed(self) -> None:
-        await self.writer.wait_closed()
+        await B.wait_closed(self.writer)       # iptal kapanış future'ını iptal etmesin
 
     def get_extra_info(self, name: str, default=None):
         if name == "alpn":

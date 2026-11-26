@@ -7,6 +7,7 @@ import pytest
 from cryptography.hazmat.primitives import serialization
 
 from fasthttpc import AsyncSession, Limits, Timeout
+from fasthttpc import _backend as B
 
 from netutil import start_dual
 from async_fakes import AsyncFakeProxy, start_tls13
@@ -455,5 +456,28 @@ def test_iptal_edilen_istek_slotu_birakir(pki, ca, tmp_path):
                 await t
             assert s._sem._value == 1 and not s._idle
             assert (await s.get(f"{srv.base}/ok")).body == b"/ok"
+        await srv.stop()
+    run(main())
+
+
+def test_wait_closed_iptali_kapanis_futureini_bozmaz(pki, ca, tmp_path):
+    """asyncio StreamWriter.wait_closed() protokolün paylaşılan kapanış future'ını doğrudan
+    bekler; bekleyen iptal edilirse future da iptal olur ve sonraki wait_closed() TLS kapanışı
+    bitmeden döner (iptal edilen istekten sonra session.close() bağlantıyı yarım bırakırdı).
+    B.wait_closed iptal edilse de kapanış future'ı sağlam kalır ve gerçekten beklenir."""
+    async def main():
+        srv = await H1Server(pki, tmp_path).start()
+        ctx = ssl.create_default_context(cafile=ca)
+        _r, w = await asyncio.open_connection("127.0.0.1", srv.port, ssl=ctx,
+                                              server_hostname="localhost")
+        sock = w.get_extra_info("socket")
+        w.close()                                      # TLS kapanışı birkaç tur sürer
+        t = asyncio.ensure_future(B.wait_closed(w))
+        await asyncio.sleep(0)
+        t.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await t
+        await asyncio.wait_for(B.wait_closed(w), 5)    # iptal edilmiş future'la hemen dönmez
+        assert sock.fileno() == -1                     # ham soket gerçekten kapandı
         await srv.stop()
     run(main())

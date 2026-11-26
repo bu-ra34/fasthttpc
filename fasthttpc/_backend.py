@@ -331,6 +331,28 @@ async def run_in_thread(func: Callable, *args) -> Any:
     return await asyncio.get_running_loop().run_in_executor(None, func, *args)
 
 
+def _retrieve(t: "asyncio.Future") -> None:
+    if not t.cancelled() and t.exception() is not None:
+        logger.debug("wait_closed hatası yok sayıldı: %r", t.exception())
+
+
+async def wait_closed(w) -> None:
+    """``await w.wait_closed()``, iptale dayanıklı.
+
+    asyncio'nun ``StreamWriter.wait_closed()``'ı protokolün PAYLAŞILAN kapanış future'ını
+    doğrudan bekler: bekleyen görev iptal edilirse (ör. anyio iptal kapsamı, kullanıcının
+    ``task.cancel()``'ı) o future da iptal olur ve sonraki tüm ``wait_closed()`` çağrıları
+    kapanışı beklemeden hemen döner. TLS kapanışı sürerken olay döngüsü kapanırsa taşıma
+    yarım kalır (açık soket, ResourceWarning). Burada bekleme ayrı bir görevde yapılır ve
+    ``shield`` ile korunur: çağıran iptal edilse de future iptal edilmez."""
+    if _is_trio():
+        await w.wait_closed()
+        return
+    inner = asyncio.ensure_future(w.wait_closed())
+    inner.add_done_callback(_retrieve)
+    await asyncio.shield(inner)
+
+
 async def close_streams(writers: list, timeout: float) -> None:
     """Boştaki akışların ``wait_closed``'ını en fazla ``timeout`` sn bekler.
 
@@ -346,10 +368,12 @@ async def close_streams(writers: list, timeout: float) -> None:
                 for w in writers:
                     tg.start_soon(_quiet_wait_closed, w)
         return
-    waits = [(w, asyncio.ensure_future(w.wait_closed())) for w in writers]
+    waits = [(w, asyncio.ensure_future(wait_closed(w))) for w in writers]
     _, pending = await asyncio.wait([t for _, t in waits], timeout=timeout)
     for w, t in waits:
-        if t in pending:
+        # İptal edilmiş sonuç: kapanış future'ı daha önce (korumasız bir bekleyicide) iptal
+        # olmuş, kapanıp kapanmadığı bilinmiyor -> bekleyenler gibi kesilir.
+        if t in pending or t.cancelled():
             t.cancel()
             inner = getattr(w, "writer", w)
             transport = getattr(inner, "transport", None)
@@ -361,7 +385,7 @@ async def close_streams(writers: list, timeout: float) -> None:
 
 async def _quiet_wait_closed(w) -> None:
     try:
-        await w.wait_closed()
+        await wait_closed(w)
     except Exception as e:  # noqa: BLE001
         logger.debug("wait_closed hatası yok sayıldı: %s", e)
 
