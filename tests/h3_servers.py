@@ -68,6 +68,7 @@ def make_leaf(tmp_path, ca_key, ca_cert, names=("localhost",), tag="leaf"):
 
 _REFUSED: "set[str]" = set()     # /refuse-once yolları: yalnız İLK istek GOAWAY ile reddedilir
 _HELD: "dict[str, _H3Server]" = {}  # /goaway-hold yolları: yanıtı bekletilen isteğin bağlantısı
+HITS: "dict[str, int]" = {}         # /reject*, /cancel yollarına gelen istek sayısı (yeniden deneme sayımı)
 
 
 class _H3Server(QuicConnectionProtocol):
@@ -106,6 +107,25 @@ class _H3Server(QuicConnectionProtocol):
             self._send_goaway(sid)
             self.transmit()
             return
+        if path.startswith(("/reject", "/cancel")):
+            HITS[path] = HITS.get(path, 0) + 1
+            if path.startswith("/reject-after-headers"):
+                # Yanıt başlığı gönderildikten SONRA REJECTED: işlenmiş istek, yeniden denenmemeli.
+                # (reset, gönderilmemiş akış verisini atar: önce başlıklar gitsin)
+                self._http.send_headers(sid, [(b":status", b"200")])
+                self.transmit()
+
+                def reset():
+                    self._quic.reset_stream(sid, 0x10B)
+                    self.transmit()
+                asyncio.get_running_loop().call_later(0.05, reset)
+                return
+            if path.startswith("/cancel") or path.startswith("/reject-always") or HITS[path] == 1:
+                # İsteği işlemeden akışı sıfırla: H3_REQUEST_REJECTED (0x10B) / H3_REQUEST_CANCELLED (0x10C).
+                self._quic.reset_stream(sid, 0x10C if path.startswith("/cancel") else 0x10B)
+                self.transmit()
+                return
+            # /reject-once: ikinci istek normal yanıtlanır
         if path.startswith("/goaway-hold="):
             # GOAWAY(id) gönder, yanıtı VERME: istek, test H3TestServer.send_goaway ile aynı
             # bağlantıda bir GOAWAY daha gönderene kadar sürer (istemci yeni istek başlatmadan).

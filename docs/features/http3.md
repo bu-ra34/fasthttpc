@@ -86,6 +86,25 @@ connection is closing (RFC 9114 section 5.2). Such a request was never sent, so
 fasthttpc retries it once on a new connection too; aioquic's
 `InvalidConnectionStateError` does not reach the caller.
 
+## Rejected requests
+
+A server that resets a request stream with `H3_REQUEST_REJECTED` (0x10B) before
+sending response headers has not processed the request (RFC 9114 section 4.1.1:
+servers must not use this code for requests that were partially or fully
+processed). fasthttpc treats it like a GOAWAY refusal: the connection is no
+longer used for new requests and the request is retried on a new connection.
+Requests already in flight on the old connection still complete; it closes once
+they are done.
+
+- A refused request (GOAWAY or `H3_REQUEST_REJECTED`) is retried at most once.
+  If the new connection refuses it too, `Http3RequestRefused` (a
+  `ConnectionError`) is raised, naming the number of attempts.
+- Only buffered bodies are resent. All HTTP/3 request bodies are `bytes` today,
+  so this always holds.
+- `H3_REQUEST_CANCELLED` (0x10C), any other code, and `H3_REQUEST_REJECTED`
+  after the response headers are not retried: the request may have been
+  processed. They raise `Http3Error` with the code (`stream sıfırlandı: 0x10c`).
+
 ## Testing against real servers
 
 The offline suite uses a local aioquic server. To check HTTP/3 against public

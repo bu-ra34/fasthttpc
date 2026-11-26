@@ -41,6 +41,7 @@ class AsyncH3Connection:
         self._state_waiters: "list[asyncio.Future]" = []
         self.loop: "Optional[asyncio.AbstractEventLoop]" = None
         self._connected_addr = None
+        self._retired = False
 
     # -- IO ---------------------------------------------------------------------
     def _on_datagram(self, data: bytes) -> None:
@@ -155,6 +156,21 @@ class AsyncH3Connection:
         return (c is not None and c.usable
                 and time.monotonic() - c.last_activity < self._opts.idle_timeout)
 
+    @property
+    def finished(self) -> bool:
+        return self._transport is None
+
+    def retire(self) -> None:
+        """Yeni istek alma; süren istekler bitince (son akış serbest bırakılınca) kapan."""
+        self._retired = True
+        if self.core is None or not self.core.streams:
+            self._close_now()
+
+    def _release(self, st) -> None:
+        self.core.release(st)
+        if self._retired and not self.core.streams:
+            self._close_now()
+
     # -- istekler ---------------------------------------------------------------
     async def _open(self, method, path, headers, body):
         st = self.core.send_request(method, authority_for(*self.origin), path, headers, body)
@@ -179,7 +195,7 @@ class AsyncH3Connection:
                 raise st.error
             return st.headers, b"".join(st.chunks)
         finally:
-            self.core.release(st)
+            self._release(st)
 
     async def stream(self, method: str, path: str, headers, body: bytes = b"",
                      timeout: Optional[float] = None):
@@ -199,7 +215,7 @@ class AsyncH3Connection:
             if st.headers is None:
                 raise st.error or Http3Error("yanıt başlıkları gelmedi")
         except BaseException:
-            self.core.release(st)
+            self._release(st)
             raise
 
         async def body_iter() -> AsyncIterator[bytes]:
@@ -216,11 +232,14 @@ class AsyncH3Connection:
                         continue
                     await asyncio.wait_for(evt.wait(), timeout)
             finally:
-                self.core.release(st)
+                self._release(st)
 
         return st.headers, body_iter()
 
     async def close(self) -> None:
+        self._close_now()
+
+    def _close_now(self) -> None:
         if self.core is not None and not self.core.closed:
             self.core.close()
         if self._transport is not None:
