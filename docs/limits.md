@@ -96,4 +96,5 @@ the sources. The table below lists everything known not to match the real browse
 
 - Young project with a small user base. There has been an internal security
   review ([Security review (2026-11)](security-audit.md), with open findings
-  such as no Public Suffix List for cookie domains), but no external audit.
+  such as the TLS 1.3 cipher suite and ALPN not being checked against the
+  offer), but no external audit.
