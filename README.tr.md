@@ -471,8 +471,10 @@ verir veya belgelenmiştir:
   `FASTHTTPC_TLS_RESUMPTION=1` ile açılır (yalnızca `psk_dhe_ke`, biletler tek
   kullanımlık). Kapalıyken her bağlantı tam handshake yapar. 0-RTT hiç yoktur;
   HTTP/3'te oturum devamı kullanılmaz.
-- **HPACK huffman ENCODE yok** (decode var). Protokolde geçerli, ama h2 parmak
-  izinde küçük bir sapma yaratır.
+- **HPACK kodlama tarayıcıya göre:** Huffman, dinamik tablo, cookie parçalama ve
+  tablo boyutu güncellemesi profilin tarayıcısı gibi (Chrome: QUICHE, Firefox:
+  `Http2Compression.cpp`). Safari'nin kodlayıcısı kapalı kaynak; yalnızca kısmen
+  doğrulandı (bkz. [HTTP/2](docs/http2.md#hpack-header-compression)).
 - **key_share grupları:** x25519, x448, secp256r1, secp384r1, secp521r1,
   ffdhe2048, ffdhe3072 ve hibrit post-kuantum X25519MLKEM768. X25519MLKEM768
   Chrome ve Firefox profillerinde ve `safari_27`'de, yalnızca kurulu
