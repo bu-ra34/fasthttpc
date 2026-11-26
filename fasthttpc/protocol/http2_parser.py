@@ -5,15 +5,19 @@ FAZ 4 — Özellik 23+24: HTTP/2 Pasif Algılama + Frame Parser
 
 HTTP/2 ALPN "h2" müzakeresi tespit edilir.
 Frame parser: DATA, HEADERS, SETTINGS, PING, GOAWAY, RST_STREAM, WINDOW_UPDATE
-HPACK: static table decode (basit, tam HPACK için hpack kütüphanesi önerilir)
+HPACK: tam çözücü (statik + dinamik tablo, Huffman) ve tarayıcıya özgü kodlayıcı
+(HpackPolicy: Huffman, dinamik tablo, cookie parçalama, tablo boyutu güncellemesi)
 """
 from __future__ import annotations
+import collections
+import functools
 import struct
 import socket
 import time
 import threading
+from dataclasses import dataclass
 from enum import IntEnum
-from typing import Iterator, Optional, Generator
+from typing import Iterable, Iterator, Optional, Generator
 
 from .._log import get_logger
 # Content-Encoding açma tek yerde: fasthttpc.streaming (çıktısı sınırlı açıcı, FHC-07).
@@ -463,6 +467,54 @@ def _hpack_huffman_decode(data: bytes) -> bytes:
     return bytes(out)
 
 
+# ---------------------------------------------------------------------------
+# RFC 7541 Appendix B — Huffman KODLAMA tablosu. Ayrı bir kopya tutulmaz: decode
+# trie'sinden türetilir (sembol -> (kod, bit uzunluğu)). tests/test_hpack_kodlayici.py
+# tabloyu RFC metninden aktarılmış Appendix B tablosuyla ve ``hpack`` paketinin
+# tablosuyla 257 sembolün tamamında birebir karşılaştırır.
+# ---------------------------------------------------------------------------
+
+def _huffman_codes_from_trie(trie: list) -> "list[tuple[int, int]]":
+    codes: "list[tuple[int, int]]" = [(0, 0)] * 257
+    stack = [(0, 0, 0)]                      # (düğüm, kod, uzunluk)
+    while stack:
+        node, code, length = stack.pop()
+        for bit in (0, 1):
+            child = trie[node][bit]
+            if child is None:
+                continue
+            c, n = (code << 1) | bit, length + 1
+            if isinstance(child, tuple):
+                codes[child[1]] = (c, n)
+            else:
+                stack.append((child, c, n))
+    return codes
+
+
+#: Sembol (0..255, 256 = EOS) -> (kod, bit uzunluğu); RFC 7541 Appendix B.
+HPACK_HUFFMAN_CODES: "list[tuple[int, int]]" = _huffman_codes_from_trie(HPACK_HUFFMAN_TRIE)
+# Tablo güdümlü kodlama: bayt başına kodun bit dizisi ('0'/'1' metni) ve uzunluk
+# tablosu. Bit bit Python döngüsü yok: birleştirme (str.join + map), sayma
+# (bytes.translate + sum) ve ikiliden bayta çevirme (int(.., 2).to_bytes) C'de.
+_HUFF_BITS: "list[str]" = [format(c, "0%db" % n) for c, n in HPACK_HUFFMAN_CODES[:256]]
+_HUFF_LEN_TABLE = bytes(n for _, n in HPACK_HUFFMAN_CODES[:256])   # bytes.translate tablosu
+
+
+def hpack_huffman_size(data: bytes) -> int:
+    """``data``'nın Huffman kodlu uzunluğu (bayt; QUICHE ``HuffmanSize`` karşılığı)."""
+    return (sum(data.translate(_HUFF_LEN_TABLE)) + 7) >> 3
+
+
+def hpack_huffman_encode(data: bytes) -> bytes:
+    """RFC 7541 §5.2 Huffman kodlama; son bayt EOS'un en anlamlı bitleriyle (1) doldurulur."""
+    if not data:
+        return b""
+    bits = "".join(map(_HUFF_BITS.__getitem__, data))
+    n = len(bits)
+    pad = -n % 8
+    return int(bits + "1" * pad, 2).to_bytes((n + pad) >> 3, "big")
+
+
 HPACK_STATIC_TABLE = [
     None,                       
     (":authority", ""),
@@ -674,80 +726,404 @@ class HpackDecoder:
         return raw.decode("latin-1"), pos
 
 
-                                                                               
-                                           
-                                                                               
+# ---------------------------------------------------------------------------
+# HPACK KODLAYICI (RFC 7541): Huffman + dinamik tablo + tablo boyutu güncellemesi.
+# RFC'nin serbest bıraktığı her seçim (Huffman ne zaman, hangi başlık tabloya
+# girer, ad referansı hangi indeksten, cookie nasıl bölünür, size update ne
+# zaman yazılır) tarayıcıya özgüdür ve HEADERS frame'inin baytlarını belirler.
+# Bu seçimler HpackPolicy'dedir; profil değerleri ``fingerprint.PROFILES[ad]
+# ["h2"]["hpack"]``'ten gelir (kaynaklar orada ve docs/http2.md'de).
+# ---------------------------------------------------------------------------
+
+#: Kodlayıcının tutacağı dinamik tablo üst sınırı (bayt). Eş daha büyük bir
+#: SETTINGS_HEADER_TABLE_SIZE ilan ederse tablo ve size update bu değerde kalır
+#: (QUICHE ``HpackEncoder::SetHeaderTableSizeBound`` ile aynı mekanizma). Gerçek
+#: sunucular 4096 / 65536 ilan eder; sınır yalnızca saçma büyük değerlerde (bellek
+#: koruması) devreye girer.
+HPACK_ENCODER_MAX_TABLE_SIZE = 1 << 24
+
+# Statik tablo aramaları (bayt anahtarlı): tam eşleşme, adın İLK ve SON indeksi.
+_STATIC_EXACT: "dict[tuple[bytes, bytes], int]" = {}
+_STATIC_NAME_FIRST: "dict[bytes, int]" = {}
+_STATIC_NAME_LAST: "dict[bytes, int]" = {}
+for _i, _entry in enumerate(HPACK_STATIC_TABLE):
+    if _entry is not None:
+        _sn, _sv = _entry[0].encode("latin-1"), _entry[1].encode("latin-1")
+        _STATIC_EXACT.setdefault((_sn, _sv), _i)
+        _STATIC_NAME_FIRST.setdefault(_sn, _i)
+        _STATIC_NAME_LAST[_sn] = _i
+del _i, _entry, _sn, _sv
+_STATIC_COUNT = len(HPACK_STATIC_TABLE) - 1      # 61; dinamik indeksler 62'den başlar
+
+
+def _hpack_int(value: int, prefix_bits: int, prefix: int) -> bytes:
+    """RFC 7541 §5.1 tamsayı; ``prefix`` önek baytının üst (opcode) bitleri."""
+    mask = (1 << prefix_bits) - 1
+    if value < mask:
+        return bytes((prefix | value,))
+    out = bytearray((prefix | mask,))
+    value -= mask
+    while value >= 128:
+        out.append((value & 0x7F) | 0x80)
+        value >>= 7
+    out.append(value)
+    return bytes(out)
+
+
+def _hpack_bytes(s: str) -> bytes:
+    # latin-1: header decode tarafıyla (session.py, latin-1) simetrik — orijinal
+    # bayt dizisi bozulmadan geri üretilir. latin-1'e sığmayan gerçek Unicode
+    # (ör. kullanıcının elle verdiği emoji) utf-8'e düşer.
+    try:
+        return s.encode("latin-1")
+    except UnicodeEncodeError:
+        return s.encode("utf-8")
+
+
+def _crumbs_chromium(v: bytes) -> "list[bytes]":
+    """QUICHE ``HpackEncoder::CookieToCrumbs``: baş/son ' '/'\\t' kırpılır, her ';'
+    bir sınırdır, ';'dan sonraki TEK boşluk atlanır (boş parçalar korunur)."""
+    v = v.strip(b" \t")
+    out = []
+    pos = 0
+    while True:
+        end = v.find(b";", pos)
+        if end < 0:
+            out.append(v[pos:])
+            return out
+        out.append(v[pos:end])
+        pos = end + 1
+        if pos != len(v) and v[pos] == 0x20:
+            pos += 1
+
+
+def _crumbs_firefox(v: bytes) -> "list[bytes]":
+    """Firefox ``Http2Compressor::EncodeHeaderBlock``: yalnızca "; " ayırıcıdır."""
+    return v.split(b"; ")
+
+
+# -- dize literal'leri (RFC 7541 §5.2): H biti + uzunluk + veri ----------------
+
+def _str_shorter(raw: bytes) -> bytes:
+    """QUICHE ``EmitString``: Huffman yalnızca KESİN kısaysa (eşitse ham)."""
+    n = hpack_huffman_size(raw)
+    if n < len(raw):
+        return _hpack_int(n, 7, 0x80) + hpack_huffman_encode(raw)
+    return _hpack_int(len(raw), 7, 0x00) + raw
+
+
+def _str_always(raw: bytes) -> bytes:
+    """Firefox ``HuffmanAppend``: her zaman Huffman (daha uzun olsa bile)."""
+    enc = hpack_huffman_encode(raw)
+    return _hpack_int(len(enc), 7, 0x80) + enc
+
+
+def _str_raw(raw: bytes) -> bytes:
+    return _hpack_int(len(raw), 7, 0x00) + raw
+
+
+# Aynı dizeler (User-Agent, Accept, sec-ch-ua, :authority...) her YENİ bağlantının
+# ilk isteğinde yeniden kodlanır (dinamik tablo bağlantı başınadır). Kısa dizelerin
+# kodlanmış hâli süreç genelinde LRU önbellekte tutulur; uzun/tekil değerler
+# (büyük cookie'ler, uzun yollar) önbelleğe girmez. Bellek: <= 2 x 1024 x ~2 x 256 B.
+_STR_CACHE_MAX_LEN = 256
+_str_shorter_cached = functools.lru_cache(maxsize=1024)(_str_shorter)
+_str_always_cached = functools.lru_cache(maxsize=1024)(_str_always)
+
+
+def _hpack_str_shorter(raw: bytes) -> bytes:
+    return _str_shorter_cached(raw) if len(raw) <= _STR_CACHE_MAX_LEN else _str_shorter(raw)
+
+
+def _hpack_str_always(raw: bytes) -> bytes:
+    return _str_always_cached(raw) if len(raw) <= _STR_CACHE_MAX_LEN else _str_always(raw)
+
+
+_HPACK_STRING_ENCODERS = {"shorter": _hpack_str_shorter, "always": _hpack_str_always,
+                          "never": _str_raw}
+
+_CRUMBLERS = {None: None, "chromium": _crumbs_chromium, "firefox": _crumbs_firefox}
+_HPACK_ENUMS = {
+    "huffman": ("shorter", "always", "never"),
+    "name_ref": ("first", "last"),
+    "cookie_crumbs": tuple(_CRUMBLERS),
+    "size_update": ("on_change", "on_setting"),
+}
+
+
+@dataclass(frozen=True)
+class HpackPolicy:
+    """Bir tarayıcının HPACK kodlayıcı davranışı. Varsayılanlar Chromium/QUICHE'dir.
+
+    Alanlar (``fingerprint.PROFILES[ad]["h2"]["hpack"]`` anahtarlarıyla aynı):
+
+    ``huffman``
+        ``"shorter"``: Huffman yalnızca ham dizeden KESİN kısaysa (QUICHE
+        ``HpackEncoder::EmitString``); ``"always"``: her dize (Firefox
+        ``Http2Compressor::HuffmanAppend``); ``"never"``: hiç.
+    ``name_ref``
+        Literal'in ad referansı. ``"first"``: statik tablodaki İLK eşleşme, yoksa
+        dinamik tablodaki EN YENİ (QUICHE ``HpackHeaderTable::GetByName``).
+        ``"last"``: tablo (statik, sonra dinamik en yeniden en eskiye) taranır, tam
+        eşleşmede durulur, yoksa SON ad eşleşmesi (Firefox ``ProcessHeader``).
+    ``index_pseudo``
+        Dinamik tabloya eklenebilen pseudo-header'lar (``None`` = hepsi).
+        Chromium ``DefaultPolicy``: yalnızca ``:authority``.
+    ``always_literal``
+        Tam eşleşme olsa bile "literal without indexing" (0x00) gönderilen adlar
+        (Firefox ``:path``: ``noLocalIndex``).
+    ``never_index``
+        "Literal never indexed" (0x10) gönderilen adlar (Firefox ``authorization``).
+    ``cookie_crumbs``
+        Cookie'nin RFC 9113 §8.2.3 parçalara bölünmesi: ``"chromium"``,
+        ``"firefox"`` ya da ``None`` (bölünmez); bkz. ``_crumbs_*``.
+    ``cookie_never_index_below``
+        Bu uzunluktan (bayt) kısa cookie parçaları never-indexed (Firefox: 20).
+    ``index_max_entry_divisor``
+        >0 ise boyutu ``tablo_sınırı // bölen``'i aşan giriş tabloya eklenmez
+        (Firefox: 2).
+    ``index_min_table_size``
+        Tablo sınırı bundan küçükse hiçbir giriş eklenmez (Firefox: 128).
+    ``size_update``
+        Eşin SETTINGS_HEADER_TABLE_SIZE'ı geldiğinde: ``"on_change"`` yalnızca
+        değer mevcut sınırdan farklıysa (QUICHE ``ApplyHeaderTableSizeSetting``);
+        ``"on_setting"`` her seferinde, aynı değer olsa bile (Firefox
+        ``SetMaxBufferSize``). Güncelleme sonraki başlık bloğunun başına yazılır;
+        arada daha küçük bir değer görüldüyse önce o, sonra güncel değer.
+    """
+
+    huffman: str = "shorter"
+    name_ref: str = "first"
+    index_pseudo: "Optional[frozenset[str]]" = frozenset({":authority"})
+    always_literal: "frozenset[str]" = frozenset()
+    never_index: "frozenset[str]" = frozenset()
+    cookie_crumbs: Optional[str] = "chromium"
+    cookie_never_index_below: int = 0
+    index_max_entry_divisor: int = 0
+    index_min_table_size: int = 0
+    size_update: str = "on_change"
+
+    def __post_init__(self) -> None:
+        for key, allowed in _HPACK_ENUMS.items():
+            if getattr(self, key) not in allowed:
+                raise ValueError(f"Geçersiz HPACK politikası: {key}={getattr(self, key)!r} "
+                                 f"(izinli: {', '.join(map(repr, allowed))}).")
+        for key in ("cookie_never_index_below", "index_max_entry_divisor", "index_min_table_size"):
+            if not isinstance(getattr(self, key), int) or getattr(self, key) < 0:
+                raise ValueError(f"Geçersiz HPACK politikası: {key} negatif olmayan tamsayı olmalı.")
+
+
+_DEFAULT_HPACK_POLICY = HpackPolicy()
+
+
+def hpack_policy(spec: "HpackPolicy | dict | None" = None) -> HpackPolicy:
+    """Profil sözlüğündeki ``"hpack"`` değerini (ya da None -> Chromium) doğrulanmış
+    :class:`HpackPolicy`'ye çevirir. Bilinmeyen anahtar/değer ValueError'dır: sessiz
+    varsayılana düşüş, baytları yanlış ama isteği başarılı bir parmak izi üretirdi."""
+    if spec is None:
+        return _DEFAULT_HPACK_POLICY
+    if isinstance(spec, HpackPolicy):
+        return spec
+    if not isinstance(spec, dict):
+        raise TypeError(f"HPACK politikası sözlük olmalı, {type(spec).__name__} verildi.")
+    unknown = set(spec) - set(HpackPolicy.__dataclass_fields__)
+    if unknown:
+        raise ValueError(f"Bilinmeyen HPACK politika anahtarı: {', '.join(sorted(unknown))}.")
+    kw = dict(spec)
+    for key in ("always_literal", "never_index", "index_pseudo"):
+        if kw.get(key) is not None:
+            kw[key] = frozenset(str(x).lower() for x in kw[key])
+    return HpackPolicy(**kw)
+
 
 class HpackEncoder:
+    """HPACK kodlayıcı (RFC 7541): statik + dinamik tablo, Huffman, dinamik tablo
+    boyutu güncellemeleri; temsil seçimleri ``policy``'den (:class:`HpackPolicy`;
+    profil sözlüğü, politika ya da None = Chromium).
+
+    Durum BAĞLANTI BAŞINADIR ve eşin çözücüsüyle birebir senkron kalmalıdır: her
+    başlık bloğu, telde gönderileceği SIRAYLA ve tam bir kez kodlanmalı (kodlanıp
+    gönderilmeyen blok tabloyu kaydırır); eşin SETTINGS_HEADER_TABLE_SIZE'ı
+    :meth:`set_peer_table_size` ile bildirilmelidir.
     """
-    Basit HPACK encoder — literal header encode (Huffman'sız, "never indexed" değil).
-    Karşı taraf her zaman literal'i doğru okur; sıkıştırma oranı Huffman kadar
-    yüksek olmasa da protokol açısından tamamen geçerlidir.
-    RFC 7541 §6.2.2 (Literal Header Field without Indexing) kullanılır — basit ve güvenli.
-    """
-    # (name) statik tabloda birebir varsa index'ini bulmak için ad->ilk index haritası
-    _NAME_INDEX = {}
-    for _i, _entry in enumerate(HPACK_STATIC_TABLE):
-        if _entry and _entry[0] not in _NAME_INDEX:
-            _NAME_INDEX[_entry[0]] = _i
 
-    def __init__(self):
-        self._dynamic: list[tuple[str, str]] = []
-        self._max_size = 4096
+    #: Bkz. HPACK_ENCODER_MAX_TABLE_SIZE.
+    max_table_size_cap = HPACK_ENCODER_MAX_TABLE_SIZE
 
-    @staticmethod
-    def _encode_int(value: int, prefix_bits: int, prefix_val: int = 0) -> bytes:
-        max_prefix = (1 << prefix_bits) - 1
-        if value < max_prefix:
-            return bytes([prefix_val | value])
-        out = bytearray([prefix_val | max_prefix])
-        value -= max_prefix
-        while value >= 128:
-            out.append((value % 128) + 128)
-            value //= 128
-        out.append(value)
-        return bytes(out)
+    def __init__(self, policy: "HpackPolicy | dict | None" = None):
+        p = self.policy = hpack_policy(policy)
+        self._name_last = p.name_ref == "last"
+        self._index_pseudo = (None if p.index_pseudo is None
+                              else frozenset(n.encode("latin-1") for n in p.index_pseudo))
+        self._always_literal = frozenset(n.encode("latin-1") for n in p.always_literal)
+        self._never = frozenset(n.encode("latin-1") for n in p.never_index)
+        self._cookie_never_below = p.cookie_never_index_below
+        self._crumbs = _CRUMBLERS[p.cookie_crumbs]
+        self._string = _HPACK_STRING_ENCODERS[p.huffman]
+        # Dinamik tablo: en eski solda. Her girişin sıra numarası (``_insertions``
+        # sayacı) indeksi verir: indeks = 61 + _insertions - sıra (en yeni = 62).
+        self._entries: "collections.deque[tuple[bytes, bytes, int]]" = collections.deque()
+        self._size = 0
+        self._insertions = 0
+        self._dyn_exact: "dict[tuple[bytes, bytes], int]" = {}       # (ad, değer) -> en yeni sıra
+        self._dyn_names: "dict[bytes, collections.deque[int]]" = {}  # ad -> sıralar (eskiden yeniye)
+        # Tablo boyutu: eşin son SETTINGS_HEADER_TABLE_SIZE'ı ve etkin sınır.
+        self._settings_bound = HPACK_DEFAULT_TABLE_SIZE
+        self._max_size = HPACK_DEFAULT_TABLE_SIZE
+        self._update_pending = False
+        self._pending_min: Optional[int] = None
 
-    @classmethod
-    def _encode_string(cls, s: str) -> bytes:
-        # latin-1: header decode tarafıyla (session.py, latin-1) simetrik —
-        # orijinal byte dizisi bozulmadan geri üretilir. utf-8 kullanılırsa
-        # latin-1'de decode edilmiş çok-byte karakterler (örn. 0xFC -> 'ü')
-        # tekrar encode edilirken farklı bir byte dizisine döner ve bütünlük bozulur.
-        try:
-            raw = s.encode("latin-1")
-        except UnicodeEncodeError:
-            # latin-1'e sığmayan (gerçek Unicode, örn. emoji) bir str geldiyse
-            # (örn. kullanıcı elle unicode bir header value verdiyse) utf-8'e düş.
-            raw = s.encode("utf-8")
-        # Huffman kullanmıyoruz (0x80 biti kapalı) — literal, doğrudan uyumlu.
-        return cls._encode_int(len(raw), 7, 0x00) + raw
+    # -- durum (testler / hata ayıklama) ---------------------------------
+    @property
+    def max_table_size(self) -> int:
+        """Etkin dinamik tablo üst sınırı (eşin çözücüsünün bildiği değer)."""
+        return self._max_size
 
-    def _add_dynamic(self, name: str, value: str) -> None:
-        entry_size = len(name) + len(value) + 32
-        self._dynamic.insert(0, (name, value))
-        total = sum(len(n) + len(v) + 32 for n, v in self._dynamic)
-        while total > self._max_size and self._dynamic:
-            n, v = self._dynamic.pop()
-            total -= len(n) + len(v) + 32
+    @property
+    def table_size(self) -> int:
+        return self._size
 
-    def encode(self, headers: list[tuple[str, str]]) -> bytes:
-        """(name, value) listesini HPACK bytes'a çevirir. Header adları küçük harf olmalı (h2 zorunluluğu)."""
-        out = bytearray()
-        for name, value in headers:
-            name = name.lower()
-            idx = self._NAME_INDEX.get(name)
-            # Not: karşı taraftaki basit decoder, "literal with indexed name" alanında
-            # 4-bit prefix continuation byte'ını desteklemiyor (idx <= 15 olmalı).
-            # Bu yüzden 15'i aşan statik index'ler için de literal isim gönderiyoruz —
-            # biraz daha fazla byte ama her decoder ile (bizimki dahil) kesin uyumlu.
-            if idx and idx <= 15:
-                # İsim statik tabloda var → indexed name, literal value, indexlemeden (0x00 prefix)
-                out += self._encode_int(idx, 4, 0x00)
+    @property
+    def dynamic_table(self) -> "list[tuple[str, str]]":
+        """Dinamik tablo, en yeni (indeks 62) başta — HpackDecoder._dynamic ile aynı düzen."""
+        return [(n.decode("latin-1"), v.decode("latin-1")) for n, v, _ in reversed(self._entries)]
+
+    # -- tablo boyutu ------------------------------------------------------
+    def set_peer_table_size(self, value: int) -> None:
+        """Eşin SETTINGS_HEADER_TABLE_SIZE değeri geldi (RFC 9113 §6.5.2, RFC 7541 §4.2).
+
+        Yeni sınır hemen uygulanır (gerekirse tahliye); size update sonraki blokta."""
+        cap = self.max_table_size_cap
+        if self.policy.size_update == "on_change":
+            # QUICHE ApplyHeaderTableSizeSetting: aynı değer -> hiçbir şey; küçülme
+            # en küçük değer olarak hatırlanır.
+            if value == self._settings_bound and value <= cap:
+                return
+            if value < self._settings_bound:
+                self._pending_min = value if self._pending_min is None else min(self._pending_min, value)
+        elif not self._update_pending or self._pending_min is None or value < self._pending_min:
+            # Firefox SetMaxBufferSize: bekleyen güncelleme yoksa ya da daha küçükse.
+            self._pending_min = value
+        self._settings_bound = value
+        self._max_size = min(value, cap)
+        while self._entries and self._size > self._max_size:
+            self._evict()
+        self._update_pending = True
+
+    # -- dinamik tablo -----------------------------------------------------
+    def _evict(self) -> None:
+        name, value, size = self._entries.popleft()
+        seq = self._insertions - len(self._entries) - 1
+        self._size -= size
+        key = (name, value)
+        if self._dyn_exact.get(key) == seq:
+            del self._dyn_exact[key]
+        seqs = self._dyn_names[name]
+        seqs.popleft()                  # tahliye her zaman en eskiden: adın da en eskisi
+        if not seqs:
+            del self._dyn_names[name]
+
+    def _insert(self, name: bytes, value: bytes, size: int) -> None:
+        # RFC 7541 §4.4: önce yer açılır; tablodan büyük giriş tabloyu boşaltır, eklenmez.
+        while self._entries and self._size + size > self._max_size:
+            self._evict()
+        if size > self._max_size:
+            return
+        seq = self._insertions
+        self._insertions = seq + 1
+        self._entries.append((name, value, size))
+        self._size += size
+        self._dyn_exact[(name, value)] = seq
+        seqs = self._dyn_names.get(name)
+        if seqs is None:
+            self._dyn_names[name] = collections.deque((seq,))
+        else:
+            seqs.append(seq)
+
+    def _exact(self, name: bytes, value: bytes) -> int:
+        """Tam eşleşme: önce statik, sonra dinamikteki en yeni; yoksa 0."""
+        idx = _STATIC_EXACT.get((name, value))
+        if idx is not None:
+            return idx
+        seq = self._dyn_exact.get((name, value))
+        return 0 if seq is None else _STATIC_COUNT + self._insertions - seq
+
+    def _name_ref(self, name: bytes, value: "Optional[bytes]") -> int:
+        if self._name_last:
+            # Firefox: statik + dinamik (en yeniden en eskiye) taranır; tam
+            # eşleşmede durulur, yoksa SON ad eşleşmesi kalır.
+            if value is not None:
+                idx = self._exact(name, value)
+                if idx:
+                    return idx
+            seqs = self._dyn_names.get(name)
+            if seqs:
+                return _STATIC_COUNT + self._insertions - seqs[0]
+            return _STATIC_NAME_LAST.get(name, 0)
+        idx = _STATIC_NAME_FIRST.get(name)
+        if idx is not None:
+            return idx
+        seqs = self._dyn_names.get(name)
+        return _STATIC_COUNT + self._insertions - seqs[-1] if seqs else 0
+
+    # -- kodlama ------------------------------------------------------------
+    def _field(self, out: bytearray, name: bytes, value: bytes, crumb: bool) -> None:
+        string = self._string
+        if name in self._never or (crumb and len(value) < self._cookie_never_below):
+            ref = self._name_ref(name, value)
+            out += _hpack_int(ref, 4, 0x10)                  # §6.2.3 never indexed
+        elif name in self._always_literal:
+            ref = self._name_ref(name, value)
+            out += _hpack_int(ref, 4, 0x00)                  # §6.2.2 without indexing
+        else:
+            idx = self._exact(name, value)
+            if idx:
+                out += _hpack_int(idx, 7, 0x80)              # §6.1 indexed
+                return
+            ref = self._name_ref(name, None)
+            size = len(name) + len(value) + 32
+            ip = self._index_pseudo
+            p = self.policy
+            if ((ip is not None and name[:1] == b":" and name not in ip)
+                    or (p.index_max_entry_divisor and size > self._max_size // p.index_max_entry_divisor)
+                    or self._max_size < p.index_min_table_size):
+                out += _hpack_int(ref, 4, 0x00)              # §6.2.2 without indexing
             else:
-                out += bytes([0x00])       # yeni isim, indexlemeden
-                out += self._encode_string(name)
-            out += self._encode_string(value)
+                out += _hpack_int(ref, 6, 0x40)              # §6.2.1 incremental indexing
+                if not ref:
+                    out += string(name)
+                out += string(value)
+                # Ad referansı EKLEMEDEN ÖNCE hesaplandı: çözücü de adı tahliyeden
+                # önce okur (RFC 7541 §4.4).
+                self._insert(name, value, size)
+                return
+        if not ref:
+            out += string(name)
+        out += string(value)
+
+    def encode(self, headers: "Iterable[tuple[str, str]]") -> bytes:
+        """(ad, değer) listesini HPACK başlık bloğuna çevirir (adlar küçük harfe).
+
+        Bekleyen tablo boyutu güncellemesi bloğun başına yazılır (RFC 7541 §4.2).
+        Sıra korunur; cookie politika gereği parçalara bölünebilir."""
+        out = bytearray()
+        if self._update_pending:
+            pmin, target = self._pending_min, self._max_size
+            if pmin is not None and pmin < target:
+                out += _hpack_int(pmin, 5, 0x20)
+            out += _hpack_int(target, 5, 0x20)
+            self._update_pending = False
+            self._pending_min = None
+        field = self._field
+        crumbs = self._crumbs
+        for name, value in headers:
+            n = _hpack_bytes(name.lower())
+            v = _hpack_bytes(value)
+            if crumbs is not None and n == b"cookie":
+                for c in crumbs(v):
+                    field(out, n, c, True)
+            else:
+                field(out, n, v, False)
         return bytes(out)
 
 
@@ -897,12 +1273,13 @@ class Http2Connection:
       - Tek TLS bağlantısı üzerinden ardışık (sıralı) istekler — her istek
         kendi stream_id'sini alır, aynı bağlantı yeniden kullanılır.
 
+      - HPACK kodlama profilin tarayıcısı gibi (Huffman, dinamik tablo, cookie
+        parçalama; bkz. HpackPolicy) ve sunucunun SETTINGS_HEADER_TABLE_SIZE'ına
+        göre dinamik tablo boyutu güncellemesi
+
     Desteklenmeyenler (kapsam dışı, ileride eklenebilir):
       - Gerçek eşzamanlı multiplexing (aynı anda birden fazla açık stream)
       - Sunucu PUSH_PROMISE
-      - HPACK Huffman ENCODE (decode destekleniyor; gönderimde literal
-        kullanılıyor — protokolde geçerli ama Chrome huffman kodladığı için
-        h2 parmak izinde küçük bir sapma yaratır)
     """
 
     DEFAULT_WINDOW = 65535
@@ -919,7 +1296,8 @@ class Http2Connection:
         # (ilan edilmediyse RFC varsayılanı 4096).
         self._decoder = HpackDecoder(max_table_size=h2_setting(self._h2, 0x1, HPACK_DEFAULT_TABLE_SIZE),
                                      max_header_list_size=HPACK_MAX_HEADER_LIST_SIZE)
-        self._encoder = HpackEncoder()
+        # Kodlayıcı bağlantı başınadır; davranışı profilin tarayıcısınınki.
+        self._encoder = HpackEncoder(self._h2.get("hpack"))
         self._recv_buf = bytearray()
         self._conn_window_send = self.DEFAULT_WINDOW      # bizim gönderebileceğimiz (server bize izin verdikçe artar)
         self._conn_window_recv = self.DEFAULT_WINDOW      # server'ın bize gönderebileceği (biz WINDOW_UPDATE yolladıkça artar)
@@ -1022,7 +1400,11 @@ class Http2Connection:
         payload = frame.payload
         for i in range(0, len(payload) - 5, 6):
             ident, value = struct.unpack("!HI", payload[i:i + 6])
-            if ident == 0x4:
+            if ident == 0x1:
+                # Sunucunun çözücü tablosu: kodlayıcı sınırı hemen uygular, size
+                # update'i sonraki HEADERS bloğunun başına yazar (RFC 7541 §4.2).
+                self._encoder.set_peer_table_size(value)
+            elif ident == 0x4:
                 self._peer_settings["initial_window_size"] = value
             elif ident == 0x5:
                 self._peer_settings["max_frame_size"] = value
@@ -1053,6 +1435,8 @@ class Http2Connection:
         return sid
 
     def _send_headers(self, stream_id: int, headers: list[tuple[str, str]], end_stream: bool) -> None:
+        # Bağlantı kilidi altında: bloklar telde gidecekleri sırayla kodlanır
+        # (HPACK dinamik tablosu sunucunun çözücüsüyle senkron kalır).
         block = self._encoder.encode(headers)
         max_frame = self._peer_settings.get("max_frame_size", 16384)
         prio = h2_headers_priority_field(self._h2)
