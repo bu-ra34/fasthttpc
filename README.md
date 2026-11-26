@@ -83,7 +83,7 @@ with Session(transport=transport) as s:
 | Area | Support |
 |---|---|
 | Protocols | HTTP/1.1 (keep-alive, chunked; also plain-text `http://`), HTTP/2 (flow control, GOAWAY; concurrent streams on `AsyncSession`), WebSocket (`ws://`, `wss://`), HTTP/3 (**experimental**, opt-in, see below) |
-| TLS | Own TLS 1.3 (HelloRetryRequest; key_share x25519, secp256r1, secp384r1, and hybrid post-quantum X25519MLKEM768 when `cryptography` provides ML-KEM) and a safe subset of TLS 1.2 (ECDHE + AEAD, EMS required). TLS 1.3 PSK resumption is implemented but off by default; no 0-RTT |
+| TLS | Own TLS 1.3 (HelloRetryRequest; key_share x25519, x448, secp256r1, secp384r1, secp521r1, ffdhe2048, ffdhe3072, and hybrid post-quantum X25519MLKEM768 when `cryptography` provides ML-KEM) and a safe subset of TLS 1.2 (ECDHE + AEAD, EMS required). TLS 1.3 PSK resumption is implemented but off by default; no 0-RTT |
 | Server authentication | Chain + hostname, CertificateVerify, Finished, all mandatory; `verify=` custom CA bundle |
 | Client certificates | `cert=` (mTLS): PEM, encrypted PKCS#8 or PKCS#12; RSA >= 2048, P-256, P-384, Ed25519; TLS 1.3 and TLS 1.2 |
 | Fingerprints | `chrome_158`, `firefox_160`, `safari_27` (current stable releases as of 2026-11; older `chrome_131`, `firefox_133`, `safari_18` kept): ClientHello (JA3/JA4, incl. Chrome's ALPS 17613, trust anchor IDs and ML-DSA signature schemes), HTTP/2 SETTINGS, pseudo-header order, header order. Sources and known deviations: [profiles](https://bu-ra34.github.io/fasthttpc/profiles/) |
@@ -188,7 +188,9 @@ privately via GitHub security advisories.
   ML-KEM (version 47 or newer). Otherwise the group is left out of the
   ClientHello, which then differs from the real browser's. `chrome_158`'s ML-DSA
   signature schemes likewise need `cryptography` 48 or newer. secp521r1, x448
-  and ffdhe key exchange are not implemented.
+  and ffdhe2048/3072 get no key_share in the first ClientHello (as in the
+  browsers); they are used only when a server asks for an advertised one
+  through HelloRetryRequest (ffdhe: TLS 1.3 only).
 - TLS 1.2: by default only ECDHE + AES-GCM / ChaCha20-Poly1305; CBC and static
   RSA only with `legacy_tls=True`. DHE, PSK and TLS 1.0/1.1 are always rejected
   with an explicit error. TLS 1.2 servers without Extended Master Secret (for
