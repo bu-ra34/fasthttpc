@@ -136,6 +136,10 @@
   bağımsızlığı, `total`'ın üst sınırı, gönderimden sonra okuma süresinin geri
   gelmesi; `send_all` ve proxy el sıkışması birim testleri.
 - `tests/thread_servers.py`: iş parçacıklı HTTP/2 (`h2`) ve "okumayan" sunucu.
+- TLS 1.2 `no_ccs` testi her koşuda hem AES-GCM hem ChaCha20-Poly1305 ile,
+  bilet olan/olmayan sunucuyla ve gövdesi "HelloRequest, dev uzunluk" gibi
+  görünen şifreli Finished'la (sahte sunucu nonce'u seçer) sync ve async
+  sınanır. Son varyant düzeltme öncesi koddaki hatayı her seferinde üretir.
 
 ### Değişti
 - **Parmak izi DEĞİŞMEDİ:** her profilin supported_groups listesi ve ilk
@@ -215,6 +219,27 @@
   isteğinde aioquic'in `ConnectionConfigurationError`'ı olarak çıkıyordu.
   0,001 sn'nin altındaki, negatif, sonsuz ya da NaN değer artık her aioquic
   sürümünde oturum kurulurken `ValueError` verir.
+- **TLS 1.2: ChangeCipherSpec'i atlayan sunucu her zaman `unexpected_message`
+  ile reddedilir.** İstemci sunucunun CCS'ini beklerken gelen handshake
+  record'unu (CCS'siz gönderilmiş şifreli Finished) düz metin gibi
+  ayrıştırıyordu; alert şifreli metnin rastgele baytlarına bağlıydı ve yaklaşık
+  1/256 olasılıkla `illegal_parameter: handshake mesajı çok büyük` çıkıyordu
+  (CI'da aralıklı düşen test). Record'un içerik tipi artık gövdeye bakılmadan
+  duruma göre denetlenir (sync ve async):
+  - CCS beklenirken gelen handshake ya da application_data record'u
+    ayrıştırılmadan / şifresi çözülmeden reddedilir.
+  - Sunucu session_ticket uzantısını kabul ettiyse NewSessionTicket zorunludur;
+    ondan önce gelen CCS reddedilir (RFC 5077 §3.3). Bu pencerede HelloRequest
+    yok sayılmaz.
+  - Yanlış durumda gelen CCS, içeriğine bakılmadan `unexpected_message` verir
+    (önceden içerik 0x01 değilse `illegal_parameter` çıkıyordu).
+- **TLS 1.3 uyumluluk CCS'i yalnızca bir kez, el sıkışma sırasında atlanır**
+  (RFC 8446 §5, §5.1, §D.4; sync ve async yol aynı kuralları kullanır). İkinci
+  CCS, bölünmüş bir handshake mesajının parçaları arasına giren CCS, el
+  sıkışmadan sonra gelen CCS (senkron yol bunu sessizce atlıyordu) ve TLS 1.2
+  ServerHello'dan önce gelen CCS `unexpected_message` ile reddedilir. Şifresiz
+  aşamada mesaj tipi uzunluk alanından önce denetlenir. Güvenlik incelemesinde
+  FHC-11 düzeltildi, FHC-12'nin CCS kısmı giderildi.
 - **HTTP/3 `H3_REQUEST_REJECTED`:** sunucunun yanıt başlığı göndermeden
   `H3_REQUEST_REJECTED` (0x10B) ile sıfırladığı istek işlenmemiştir (RFC 9114
   §4.1.1); artık GOAWAY reddi gibi `Http3RequestRefused` olur, bağlantı yeni
@@ -229,6 +254,7 @@
   reddedilen istek nedeniyle havuzdan çıkarılan bağlantı, yeni istek geldiğinde
   hemen kapatılıyor ve aynı bağlantıda süren istekler "bağlantı kapatıldı"
   hatasıyla düşüyordu. Bağlantı artık son akışı bitince kapanır.
+
 
 ### Bağımlılıklar
 - `brotli` / `brotlicffi` en az 1.2 (`output_buffer_limit` için). Daha eski bir

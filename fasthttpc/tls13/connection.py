@@ -34,6 +34,7 @@ from ..security import cert_validator as _cv
 from ..security import session_tickets as _st
 from ..security import mtls as _mtls
 from ..security.cert_validator import CertificateValidationError
+from ..security.tls_adapter import check_compat_ccs
 from . import _compat as C
 from ..security.alerts import describe_alert
 from .errors import TLSError, TLSAlertError
@@ -232,6 +233,7 @@ class TLSClientConnection:
         self._close_sent = False
         # ServerHello TLS 1.2 seçerse (security/tls12.py) tüm iş buna devredilir.
         self._t12 = None
+        self._ccs_seen = False         # TLS 1.3 uyumluluk CCS'i (en fazla bir kez; RFC 8446 §D.4)
 
     # ------------------------------------------------------------------ API
     @property
@@ -382,9 +384,15 @@ class TLSClientConnection:
 
     def _handle_record(self, rtype: int, header: bytes, payload: bytes, events: list) -> None:
         if rtype == CT_CHANGE_CIPHER_SPEC:
-            # TLS 1.3 uyumluluk CCS'i: yalnızca handshake sırasında, tek byte 0x01.
-            if self.state == ST_CONNECTED or payload != b"\x01":
-                raise TLSError("unexpected_message: beklenmeyen change_cipher_spec record'u")
+            # TLS 1.3 uyumluluk CCS'i: yalnızca handshake sırasında, bir kez, tek byte 0x01,
+            # handshake mesajı parçalarının arasında değil (senkron yolla ortak kurallar).
+            try:
+                check_compat_ccs(payload, seen=self._ccs_seen,
+                                 handshake_done=self.state == ST_CONNECTED,
+                                 buffered=bool(self._hs_buf))
+            except C.TLSProtocolError as e:
+                raise TLSError(str(e)) from e
+            self._ccs_seen = True
             return
 
         if self._read is None:
@@ -392,7 +400,7 @@ class TLSClientConnection:
             if rtype == CT_ALERT:
                 self._raise_alert(payload)
             if rtype != CT_HANDSHAKE:
-                raise TLSError(f"ServerHello beklenirken beklenmeyen record tipi: {rtype}")
+                raise TLSError(f"unexpected_message: ServerHello beklenirken beklenmeyen record tipi: {rtype}")
             if len(payload) > C.MAX_PLAINTEXT:
                 raise TLSError("record_overflow: düz metin record'u çok büyük")
             self._feed_handshake(payload, events, epoch=self._epoch)
@@ -452,6 +460,9 @@ class TLSClientConnection:
         self._hs_buf += data
         self._hs_buf_epoch = epoch
         while len(self._hs_buf) >= 4:
+            if self.state == ST_WAIT_SH and self._hs_buf[0] != HS_SERVER_HELLO:
+                # Şifresiz aşamada tip, uzunluk alanına/gövdeye bakılmadan denetlenir.
+                raise TLSError(f"unexpected_message: ServerHello beklenirken hs_type={self._hs_buf[0]}")
             hs_len = int.from_bytes(self._hs_buf[1:4], "big")
             if hs_len > MAX_HANDSHAKE_MESSAGE:
                 raise TLSError(f"Handshake mesajı çok büyük ({hs_len} byte)")
@@ -490,6 +501,10 @@ class TLSClientConnection:
         if self._hrr is not None:
             raise TLSError("unexpected_message: HelloRetryRequest'ten sonra sunucu TLS 1.2 seçti — "
                            "protokol ihlali / olası downgrade.")
+        if self._ccs_seen:
+            # Uyumluluk CCS'i yalnızca TLS 1.3'e özgü (RFC 8446 §D.4); TLS 1.2'de CCS ancak
+            # istemci uçuşundan sonra geçerlidir (RFC 5246 §7.1).
+            raise TLSError("unexpected_message: TLS 1.2 ServerHello'dan önce ChangeCipherSpec alındı.")
         trailing = bytes(self._hs_buf)        # ServerHello'yla aynı record'daki artık handshake baytları
         self._hs_buf = b""
         try:

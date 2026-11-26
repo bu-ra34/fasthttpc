@@ -127,6 +127,31 @@ def test_record_sinirlari_ve_handshake_birlestirme(pki, trust, mode):
     assert conn.handshake_complete and server.state == "CONNECTED"
 
 
+@pytest.mark.parametrize("tamper,match", [
+    ({"double_ccs"}, "ikinci change_cipher_spec"),
+    ({"bad_ccs"}, "geçersiz change_cipher_spec içeriği"),
+    ({"split_records", "no_ccs", "ccs_mid_message"}, "change_cipher_spec, bölünmüş bir handshake"),
+    ({"ccs_after_finished"}, "el sıkışma bittikten sonra"),
+])
+def test_uyumluluk_ccs_yalnizca_bir_kez_ve_dogru_pencerede(pki, trust, tamper, match):
+    """RFC 8446 §5/§5.1/§D.4: tek bayt 0x01'lik CCS el sıkışma sırasında BİR KEZ atlanır;
+    ikincisi, bozuk içerik, handshake parçaları arasına giren ya da sunucu Finished'ından
+    sonra gelen CCS unexpected_message'dır."""
+    server = FakeTLS13Server(pki, tamper=tamper)
+    conn = TLSClientConnection(HOST, "chrome_131", **trust)
+    with pytest.raises(TLSError, match="unexpected_message: " + match):
+        handshake(conn, server)
+    assert conn.closed
+
+
+def test_server_hello_beklenirken_tip_uzunluktan_once_denetlenir(trust):
+    """Şifresiz aşamada mesaj tipi, uzunluk alanına bakılmadan reddedilir (alert sabit)."""
+    conn = TLSClientConnection(HOST, "chrome_131", **trust)
+    conn.initiate()
+    with pytest.raises(TLSError, match=r"unexpected_message: ServerHello beklenirken hs_type=8"):
+        conn.receive_data(b"\x16\x03\x03\x00\x04\x08\xff\xff\xff")
+
+
 def test_buyuk_veri_record_lara_bolunur(pki, trust):
     server = FakeTLS13Server(pki)
     conn = TLSClientConnection(HOST, "chrome_131", **trust)
