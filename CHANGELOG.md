@@ -111,6 +111,25 @@
   uzunluğunda ve 1 < Y < p-1 olan değer kabul edilir. ffdhe paylaşılan sırrı p
   uzunluğuna soldan sıfırla doldurulur (RFC 8446 §7.4.1).
 
+### Testler / CI
+- RFC 7541 Appendix B tablosu (257 sembol), C.4 ve C.6 örnekleri (tahliye
+  dahil) bayt bayt; tipik Chrome ve Firefox istekleri ile aynı bağlantıdaki
+  ikinci isteğin tam baytları; rastgele istek + tablo boyutu değişikliklerinde
+  kodlayıcı tablosunun bizim ve `hpack` paketinin çözücüsüyle senkronu.
+- Bağımsız sunucuyla birlikte-çalışma (OpenSSL TLS + `h2`): senkron ve async,
+  üç profil, bağlantı ortasında tablo küçültme/büyütme, eşzamanlı stream'ler;
+  ham HEADERS blokları sunucu tarafında denetlenir.
+- `tests/test_kex_groups.py`: gidiş-dönüş, geçersiz karşı değerler (eğri dışı
+  nokta, yanlış uzunluk, x448 sıfır sır, ffdhe Y=0/1/p-1/>=p), deterministik
+  ffdhe dolgu vakaları, HRR kuralları (senkron ve sans-IO), TLS 1.2 ECDHE.
+- `tests/test_interop_kex_groups.py`: `openssl s_server -groups` karşısında her
+  grup × TLS 1.3/1.2 × senkron/async. Yerel openssl bir grubu tanımıyorsa test
+  gerekçesiyle atlanır.
+- TLS 1.2 `no_ccs` testi her koşuda hem AES-GCM hem ChaCha20-Poly1305 ile,
+  bilet olan/olmayan sunucuyla ve gövdesi "HelloRequest, dev uzunluk" gibi
+  görünen şifreli Finished'la (sahte sunucu nonce'u seçer) sync ve async
+  sınanır. Son varyant düzeltme öncesi koddaki hatayı her seferinde üretir.
+
 ### Değişti
 - **Parmak izi DEĞİŞMEDİ:** her profilin supported_groups listesi ve ilk
   key_share'leri bayt bayt aynıdır. Firefox/Safari secp521r1'i (ve
@@ -143,6 +162,27 @@
   isteğinde aioquic'in `ConnectionConfigurationError`'ı olarak çıkıyordu.
   0,001 sn'nin altındaki, negatif, sonsuz ya da NaN değer artık her aioquic
   sürümünde oturum kurulurken `ValueError` verir.
+- **TLS 1.2: ChangeCipherSpec'i atlayan sunucu her zaman `unexpected_message`
+  ile reddedilir.** İstemci sunucunun CCS'ini beklerken gelen handshake
+  record'unu (CCS'siz gönderilmiş şifreli Finished) düz metin gibi
+  ayrıştırıyordu; alert şifreli metnin rastgele baytlarına bağlıydı ve yaklaşık
+  1/256 olasılıkla `illegal_parameter: handshake mesajı çok büyük` çıkıyordu
+  (CI'da aralıklı düşen test). Record'un içerik tipi artık gövdeye bakılmadan
+  duruma göre denetlenir (sync ve async):
+  - CCS beklenirken gelen handshake ya da application_data record'u
+    ayrıştırılmadan / şifresi çözülmeden reddedilir.
+  - Sunucu session_ticket uzantısını kabul ettiyse NewSessionTicket zorunludur;
+    ondan önce gelen CCS reddedilir (RFC 5077 §3.3). Bu pencerede HelloRequest
+    yok sayılmaz.
+  - Yanlış durumda gelen CCS, içeriğine bakılmadan `unexpected_message` verir
+    (önceden içerik 0x01 değilse `illegal_parameter` çıkıyordu).
+- **TLS 1.3 uyumluluk CCS'i yalnızca bir kez, el sıkışma sırasında atlanır**
+  (RFC 8446 §5, §5.1, §D.4; sync ve async yol aynı kuralları kullanır). İkinci
+  CCS, bölünmüş bir handshake mesajının parçaları arasına giren CCS, el
+  sıkışmadan sonra gelen CCS (senkron yol bunu sessizce atlıyordu) ve TLS 1.2
+  ServerHello'dan önce gelen CCS `unexpected_message` ile reddedilir. Şifresiz
+  aşamada mesaj tipi uzunluk alanından önce denetlenir. Güvenlik incelemesinde
+  FHC-11 düzeltildi, FHC-12'nin CCS kısmı giderildi.
 - **HTTP/3 `H3_REQUEST_REJECTED`:** sunucunun yanıt başlığı göndermeden
   `H3_REQUEST_REJECTED` (0x10B) ile sıfırladığı istek işlenmemiştir (RFC 9114
   §4.1.1); artık GOAWAY reddi gibi `Http3RequestRefused` olur, bağlantı yeni
@@ -177,6 +217,7 @@
 - Liste dosyası Mozilla Public License 2.0 altında: `LICENSE-PSL` eklendi,
   paketin lisans ifadesi `MIT AND MPL-2.0` oldu (MPL yalnızca bu dosya için;
   kodun geri kalanı MIT).
+
 
 ### Bağımlılıklar
 - `brotli` / `brotlicffi` en az 1.2 (`output_buffer_limit` için). Daha eski bir

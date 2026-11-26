@@ -1077,3 +1077,37 @@ def test_sync_tlsadapter_gecerli_ve_bomba_sikistirilmis_sertifika(_no_pki, alg):
     st = srv.state
     rec = split_records(sock.sends[-1])[0]
     assert unseal(st["ck"], st["civ"], 0, rec, st["name"]) == (b"\x02\x2a", 21)
+
+
+# ---------------------------------------------------------------------------
+# FHC-11 / FHC-12 — TLS 1.3 uyumluluk CCS'i: el sıkışmadan sonra değil, en fazla bir kez
+# ---------------------------------------------------------------------------
+class _CcsSock:
+    def __init__(self, data):
+        self.data = data
+
+    def recv(self, n):
+        out, self.data = self.data[:n], self.data[n:]
+        return out
+
+
+_CCS = b"\x14\x03\x03\x00\x01\x01"
+
+
+def _es(**state):
+    from fasthttpc.security.tls_adapter import EncryptedSocket
+    st = {"is_tls13": True, "using_app_keys": False}
+    st.update(state)
+    return EncryptedSocket(_CcsSock(_CCS), st)
+
+
+def test_fhc11_ccs_after_handshake_rejected():
+    from fasthttpc.security.tls_adapter import TLSProtocolError
+    with pytest.raises(TLSProtocolError, match="unexpected_message: el sıkışma bittikten sonra"):
+        _es(using_app_keys=True).recv_record()
+
+
+def test_fhc12_second_compat_ccs_rejected():
+    from fasthttpc.security.tls_adapter import TLSProtocolError
+    with pytest.raises(TLSProtocolError, match="unexpected_message: ikinci change_cipher_spec"):
+        _es(ccs_seen=True).recv_record()
