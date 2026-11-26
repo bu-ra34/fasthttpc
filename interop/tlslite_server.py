@@ -7,6 +7,7 @@ from __future__ import annotations
 import re
 import socket
 import threading
+from pathlib import Path
 
 from tlslite.api import HandshakeSettings, TLSConnection, X509CertChain, parsePEMKey
 
@@ -19,9 +20,9 @@ class TlsliteServer:
         self.alpn = alpn if alpn is not None else [b"http/1.1"]
         self.hs_kwargs = hs_kwargs or {}
         chain = X509CertChain()
-        chain.parsePemList(open(cert_pem).read())
+        chain.parsePemList(Path(cert_pem).read_text())
         self.chain = chain
-        self.key = parsePEMKey(open(key_pem).read(), private=True)
+        self.key = parsePEMKey(Path(key_pem).read_text(), private=True)
         self.ls = socket.socket()
         self.ls.bind(("127.0.0.1", 0))
         self.ls.listen(8)

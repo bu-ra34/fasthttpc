@@ -107,7 +107,7 @@ class WSServer:
             w.close()
 
     async def stop(self):
-        self.server.close()
+        await self.server.aclose()
 
 
 async def talk(ws):

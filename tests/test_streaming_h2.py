@@ -2,7 +2,6 @@
 Session (iş parçacığındaki sahte h2 sunucusuna karşı), AsyncSession h2 akışı."""
 import asyncio
 import struct
-import threading
 
 import pytest
 
@@ -12,6 +11,7 @@ from fasthttpc.protocol.http2_parser import (
 )
 
 from async_fakes import RawH2Conn, start_h2
+from netutil import LoopThread
 from test_http2 import SahteSoket
 from tls13_fakeserver import PKI
 
@@ -105,31 +105,12 @@ class _Sunucu:
     """Ayrı iş parçacığında asyncio döngüsü: RawH2Conn tabanlı sahte h2 sunucusu."""
 
     def __init__(self, pki, script):
-        self.loop = asyncio.new_event_loop()
-        self.ready = threading.Event()
-        self.conns = []
-        self.port = None
-        threading.Thread(target=self._run, args=(pki, script), daemon=True).start()
-        assert self.ready.wait(10)
-
-    def _run(self, pki, script):
-        asyncio.set_event_loop(self.loop)
-
-        async def main():
-            self.server, self.port, self.conns = await start_h2(pki, script)
-            self.ready.set()
-            await self.server.serve_forever()
-        try:
-            self.loop.run_until_complete(main())
-        except asyncio.CancelledError:
-            pass
+        self._lt = LoopThread()
+        self.server, self.port, self.conns = self._lt.call(start_h2(pki, script))
 
     def stop(self):
-        def _s():
-            self.server.close()
-            for t in asyncio.all_tasks(self.loop):
-                t.cancel()
-        self.loop.call_soon_threadsafe(_s)
+        """Sunucuyu ve bağlantı görevlerini kapatır, döngüyü durdurup kapatır."""
+        self._lt.close()
 
 
 async def _servis(c: RawH2Conn):

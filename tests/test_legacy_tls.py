@@ -446,8 +446,13 @@ def _fake_connect(fpki, tmp_path, tamper, legacy, suite=0xC02F, **kw):
     port, t, ls = serve_fake_in_thread(srv)
     ca = tmp_path / "fca.pem"
     ca.write_bytes(fpki.ca_pem())
-    return srv, TLSAdapter.negotiate(socket.create_connection(("127.0.0.1", port), 5),
-                                     "localhost", "chrome_131", ca_path=str(ca), legacy_tls=legacy)
+    sock = socket.create_connection(("127.0.0.1", port), 5)
+    try:
+        return srv, TLSAdapter.negotiate(sock, "localhost", "chrome_131", ca_path=str(ca),
+                                         legacy_tls=legacy)
+    except BaseException:
+        sock.close()           # negotiate hata verirse ham soket çağıranındır
+        raise
 
 
 @pytest.mark.parametrize("tamper", [{"downgrd"}, {"downgrd0"}])
@@ -498,6 +503,6 @@ def test_legacy_ilan_edilmeyen_suite_reddedilir(fpki, tmp_path):
     srv.suite = 0x000A      # 3DES: legacy'de de YOK
     srv.suite_info = srv.suite_info
     port, t, ls = serve_fake_in_thread(srv)
-    with pytest.raises(ConnectionError, match="desteklenmeyen|insufficient|handshake_failure"):
-        TLSAdapter.negotiate(socket.create_connection(("127.0.0.1", port), 5), "localhost", "chrome_131",
-                             legacy_tls=True)
+    with socket.create_connection(("127.0.0.1", port), 5) as sock, \
+            pytest.raises(ConnectionError, match="desteklenmeyen|insufficient|handshake_failure"):
+        TLSAdapter.negotiate(sock, "localhost", "chrome_131", legacy_tls=True)

@@ -8,7 +8,6 @@ test gövdesi geçerlidir.
 """
 import asyncio
 import struct
-import threading
 import time
 
 import pytest
@@ -20,6 +19,7 @@ from fasthttpc import AsyncSession, Limits, Timeout  # noqa: E402
 from fasthttpc import _backend as B  # noqa: E402
 from fasthttpc.protocol.http2_parser import FrameType  # noqa: E402
 from tls13_fakeserver import PKI, http_responder  # noqa: E402
+from netutil import LoopThread, start_server  # noqa: E402
 from async_fakes import AsyncFakeProxy, start_h2, start_tls13, start_stdlib_tls  # noqa: E402
 from test_async_h2 import echo, _path  # noqa: E402
 from test_async_pool import H1Server, ok  # noqa: E402
@@ -43,29 +43,8 @@ def backend(request):
     return request.param
 
 
-class ServerLoop:
-    """Sahte sunucuları ayrı thread'deki asyncio döngüsünde çalıştırır."""
-
-    def __init__(self):
-        self.loop = asyncio.new_event_loop()
-        self.t = threading.Thread(target=self.loop.run_forever, daemon=True)
-        self.t.start()
-
-    def call(self, coro, timeout=10):
-        return asyncio.run_coroutine_threadsafe(coro, self.loop).result(timeout)
-
-    def close(self):
-        async def cancel_all():
-            tasks = [t for t in asyncio.all_tasks() if t is not asyncio.current_task()]
-            for t in tasks:
-                t.cancel()
-            await asyncio.gather(*tasks, return_exceptions=True)
-        try:
-            asyncio.run_coroutine_threadsafe(cancel_all(), self.loop).result(5)
-        except Exception:  # noqa: BLE001
-            pass
-        self.loop.call_soon_threadsafe(self.loop.stop)
-        self.t.join(5)
+class ServerLoop(LoopThread):
+    """Sahte sunucuları ayrı thread'deki asyncio döngüsünde çalıştırır (bkz. netutil.LoopThread)."""
 
 
 @pytest.fixture
@@ -628,7 +607,7 @@ def test_trio_acik_akis_readuntil_ve_sinirlar(backend, srvloop):
         w.close()
 
     async def start():
-        return await asyncio.start_server(srv_handler, "127.0.0.1", 0)
+        return await start_server(srv_handler, "127.0.0.1", 0)
     server = srvloop.call(start())
     port = server.sockets[0].getsockname()[1]
 

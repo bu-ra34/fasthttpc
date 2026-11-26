@@ -20,7 +20,7 @@ from cryptography.hazmat.primitives import serialization
 from fasthttpc.protocol.http2_parser import (
     FrameType, HTTP2Frame, HpackDecoder, HpackEncoder, _strip_headers_frame_fields,
 )
-from netutil import start_dual
+from netutil import start_dual, start_server
 from tls13_fakeserver import FakeTLS13Server
 
 PREFACE = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n"
@@ -55,13 +55,12 @@ class AsyncFakeProxy:
         self.port = 0
 
     async def start(self):
-        self.server = await asyncio.start_server(self._on_conn, "127.0.0.1", 0)
+        self.server = await start_server(self._on_conn, "127.0.0.1", 0)
         self.port = self.server.sockets[0].getsockname()[1]
         return self
 
     async def stop(self):
-        self.server.close()
-        await self.server.wait_closed()
+        await self.server.aclose()
 
     @property
     def url(self):
@@ -77,7 +76,10 @@ class AsyncFakeProxy:
                 w.close()
                 return
             ur, uw = await asyncio.open_connection("127.0.0.1", self.upstream_port)
-            await asyncio.gather(_pipe(r, uw), _pipe(ur, w))
+            try:
+                await asyncio.gather(_pipe(r, uw), _pipe(ur, w))
+            finally:
+                uw.close()                 # iptalde de (gather iç görevleri iptal eder)
         except (OSError, asyncio.IncompleteReadError):
             w.close()
 
@@ -290,6 +292,8 @@ class RawH2Conn:
     async def handshake(self, **settings):
         """TLS bitince sunucu SETTINGS'i gönderir; istemcininkini alır ve ack'ler."""
         while self.srv.state != "CONNECTED":
+            if self.eof:      # TLS bitmeden kapandı (ör. happy eyeballs'ın kaybeden denemesi)
+                raise ConnectionResetError("h2 el sıkışması bitmeden bağlantı kapandı")
             await asyncio.sleep(0.005)
         self.send(self.settings(**(settings or {"max_streams": 100})))
         await self.flush()
@@ -307,6 +311,8 @@ class RawH2Conn:
         finally:
             pump.cancel()
             self.writer.close()
+            # pompa görevi döngü kapanmadan bitsin (aksi hâlde sahipsiz kalır)
+            await asyncio.gather(pump, return_exceptions=True)
 
 
 async def start_h2(pki, script, **server_kw):
@@ -320,7 +326,7 @@ async def start_h2(pki, script, **server_kw):
         conns.append(c)
         try:
             await c.run(script)
-        except (OSError, asyncio.CancelledError, asyncio.TimeoutError):
+        except (OSError, asyncio.TimeoutError):
             pass
 
     server = await start_dual(on_conn)

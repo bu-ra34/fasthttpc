@@ -21,6 +21,8 @@ from aioquic.h3.connection import FrameType, H3Connection, encode_frame
 from aioquic.h3.events import DataReceived, HeadersReceived
 from aioquic.quic.configuration import QuicConfiguration
 
+from netutil import close_loop
+
 
 def _name(cn):
     return x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, cn)])
@@ -203,6 +205,8 @@ class H3TestServer:
         except BaseException as e:      # noqa: BLE001 - start() yeniden fırlatır
             self._exc = e
             self._ready.set()
+        finally:
+            close_loop(loop)            # UDP soketi ve kalan görevler döngüyle birlikte kapanır
 
     def send_goaway(self, path, goaway_id):
         """``/goaway-hold`` isteği ``path``'i bekleten bağlantıda bir GOAWAY(goaway_id) daha gönder
@@ -253,3 +257,4 @@ class H3TestServer:
             self._loop.call_soon_threadsafe(self._stop.set)
         if self.tcp:
             self._httpd.shutdown(); self._httpd.server_close()
+        self._thread.join(10)

@@ -63,16 +63,17 @@ def tls_server(tmp_path, monkeypatch):
                 c, _ = lsock.accept()
             except (socket.timeout, OSError):
                 continue
+            s = None
             try:
                 c.settimeout(5)
-                s = ctx.wrap_socket(c, server_side=True)
+                s = ctx.wrap_socket(c, server_side=True)    # c'yi devralır (detach)
                 data = s.recv(1024)
                 results.append(s.session_reused)
                 s.sendall(b"echo:" + data)
-                s.close()
             except Exception as e:  # pragma: no cover - teşhis için
                 results.append(e)
-                c.close()
+            finally:
+                (s or c).close()
 
     t = threading.Thread(target=serve, daemon=True)
     t.start()
@@ -91,11 +92,10 @@ def tls_server(tmp_path, monkeypatch):
 
 
 def _roundtrip(port, payload=b"ping", profile="chrome_131"):
-    raw = socket.create_connection(("127.0.0.1", port), timeout=5)
-    es = tls_adapter.TLSAdapter.negotiate(raw, "localhost", profile)
-    es.send_record(payload)
-    data, _ = es.recv_record(skip_post_handshake=True)
-    raw.close()
+    with socket.create_connection(("127.0.0.1", port), timeout=5) as raw:
+        es = tls_adapter.TLSAdapter.negotiate(raw, "localhost", profile)
+        es.send_record(payload)
+        data, _ = es.recv_record(skip_post_handshake=True)
     return es, data
 
 
@@ -166,9 +166,8 @@ def test_negotiate_passes_ca_path(tls_server, monkeypatch):
     orig = tls_adapter.validate_server_certificate
     monkeypatch.setattr(tls_adapter, "validate_server_certificate",
                         lambda p, h, ca_path=None: (seen.append(ca_path), orig(p, h))[1])
-    raw = socket.create_connection(("127.0.0.1", port), timeout=5)
-    tls_adapter.TLSAdapter.negotiate(raw, "localhost", "chrome_131", ca_path="/x/ca.pem")
-    raw.close()
+    with socket.create_connection(("127.0.0.1", port), timeout=5) as raw:
+        tls_adapter.TLSAdapter.negotiate(raw, "localhost", "chrome_131", ca_path="/x/ca.pem")
     assert seen == ["/x/ca.pem"]
 
 

@@ -57,7 +57,7 @@ class H1Server:
         return self
 
     async def stop(self):
-        self.server.close()
+        await self.server.aclose()
 
     @property
     def base(self):

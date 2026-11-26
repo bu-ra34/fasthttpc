@@ -130,18 +130,22 @@ class StdlibTLS12:
             threading.Thread(target=self._one, args=(raw,), daemon=True).start()
 
     def _one(self, raw):
+        conn = None
         try:
             raw.settimeout(10)
+            # wrap_socket ham soketi devralır (raw detach edilir): kapatılacak olan conn'dur.
             conn = self.ctx.wrap_socket(raw, server_side=True)
             self.negotiated.append((conn.version(), conn.cipher()[0], conn.selected_alpn_protocol()))
             self.handler(conn)
         except Exception as e:  # noqa: BLE001 - testte hata listesi
             self.errors.append(e)
         finally:
-            try:
-                raw.close()
-            except OSError:
-                pass
+            for s in (conn, raw):
+                if s is not None:
+                    try:
+                        s.close()
+                    except OSError:
+                        pass
 
     def close(self):
         self._stop = True
@@ -625,9 +629,13 @@ def serve_fake_in_thread(server: Fake12Server):
         try:
             c, _ = ls.accept()
         except OSError:
+            ls.close()
             return
-        server.serve(c)
-        ls.close()
+        try:
+            server.serve(c)
+        finally:
+            c.close()
+            ls.close()
 
     t = threading.Thread(target=run, daemon=True)
     t.start()
