@@ -51,7 +51,7 @@ pytest        # ağ gerektirmez (canlı testler FASTHTTPC_LIVE=1 olmadan atlanı
 | Alan | Destek |
 |---|---|
 | Protokoller | HTTP/1.1 (keep-alive, chunked; düz `http://` dahil), HTTP/2 (akış kontrolü, GOAWAY; eşzamanlı akışlar `AsyncSession`'da), WebSocket (`ws://`, `wss://`), HTTP/3 (**deneysel**, isteğe bağlı, aşağıya bakın) |
-| TLS | Kendi TLS 1.3'ümüz (HelloRetryRequest; key_share x25519, secp256r1, secp384r1 ve `cryptography` ML-KEM sunuyorsa hibrit post-kuantum X25519MLKEM768) ve TLS 1.2'nin güvenli bir alt kümesi (ECDHE + AEAD, EMS zorunlu). TLS 1.3 PSK oturum devamı var ama varsayılan kapalı; 0-RTT yok |
+| TLS | Kendi TLS 1.3'ümüz (HelloRetryRequest; key_share x25519, x448, secp256r1, secp384r1, secp521r1, ffdhe2048, ffdhe3072 ve `cryptography` ML-KEM sunuyorsa hibrit post-kuantum X25519MLKEM768) ve TLS 1.2'nin güvenli bir alt kümesi (ECDHE + AEAD, EMS zorunlu). TLS 1.3 PSK oturum devamı var ama varsayılan kapalı; 0-RTT yok |
 | Sunucu doğrulaması | Zincir + hostname, CertificateVerify, Finished, hepsi zorunlu; `verify=` ile özel CA bundle |
 | İstemci sertifikası | `cert=` (mTLS): PEM, şifreli PKCS#8 veya PKCS#12; RSA >= 2048, P-256, P-384, Ed25519; TLS 1.3 ve TLS 1.2 |
 | Parmak izi | `chrome_158`, `firefox_160`, `safari_27` (2026-11 itibarıyla güncel kararlı sürümler; eski `chrome_131`, `firefox_133`, `safari_18` korunur): ClientHello (JA3/JA4; Chrome'un ALPS 17613, trust anchor ID ve ML-DSA imza şemaları dahil), HTTP/2 SETTINGS, pseudo-header sırası, başlık sırası. Kaynaklar ve bilinen sapmalar: [profiller](https://bu-ra34.github.io/fasthttpc/profiles/) |
@@ -452,7 +452,8 @@ verir veya belgelenmiştir:
 - **TLS 1.2: varsayılan olarak yalnızca güvenli bir alt küme desteklenir**
   (`fasthttpc/security/tls12.py`, hem senkron hem async yolda). TLS 1.3 tercih
   edilir; sunucu TLS 1.2 seçerse:
-  - *Desteklenen:* ECDHE (x25519, secp256r1, secp384r1) + ECDSA/RSA sertifika;
+  - *Desteklenen:* ECDHE (x25519, x448, secp256r1, secp384r1, secp521r1; profilin
+    ilan ettiği bir eğri olmalı) + ECDSA/RSA sertifika;
     AES-128-GCM, AES-256-GCM, ChaCha20-Poly1305 (0xC02B, 0xC02F, 0xC02C, 0xC030,
     0xCCA9, 0xCCA8); ServerKeyExchange imza algoritmaları ecdsa, rsa_pss_rsae ve
     rsa_pkcs1 (SHA-256/384/512; ClientHello'da ilan edilenlerden biri olmalı).
@@ -479,13 +480,16 @@ verir veya belgelenmiştir:
   HTTP/3'te oturum devamı kullanılmaz.
 - **HPACK huffman ENCODE yok** (decode var). Protokolde geçerli, ama h2 parmak
   izinde küçük bir sapma yaratır.
-- **key_share grupları:** x25519, secp256r1, secp384r1 ve hibrit post-kuantum
-  X25519MLKEM768. X25519MLKEM768 Chrome ve Firefox profillerinde ve `safari_27`'de,
-  yalnızca kurulu `cryptography` ML-KEM sunuyorsa (47 ve üstü) gönderilir; aksi
-  halde supported_groups'tan da çıkarılır ve ClientHello gerçek tarayıcıdan
-  ayrışır. `chrome_158`'in ML-DSA imza şemaları da `cryptography` 48+ ister. secp521r1/x448/ffdhe implemente edilmedi: bunlar için
-  key_share *gönderilmez*; profil supported_groups'ta ilan ediyorsa (Firefox,
-  Safari) ve sunucu HRR ile bunları isterse açık hata verilir.
+- **key_share grupları:** x25519, x448, secp256r1, secp384r1, secp521r1,
+  ffdhe2048, ffdhe3072 ve hibrit post-kuantum X25519MLKEM768. X25519MLKEM768
+  Chrome ve Firefox profillerinde ve `safari_27`'de, yalnızca kurulu
+  `cryptography` ML-KEM sunuyorsa (47 ve üstü) gönderilir; aksi halde
+  supported_groups'tan da çıkarılır ve ClientHello gerçek tarayıcıdan ayrışır.
+  `chrome_158`'in ML-DSA imza şemaları da `cryptography` 48+ ister.
+  secp521r1/x448/ffdhe için ilk ClientHello'da key_share *gönderilmez* (gerçek
+  tarayıcılar gibi); sunucu profilin ilan ettiği birini HRR ile isterse 2.
+  ClientHello'da gönderilir. ffdhe yalnızca TLS 1.3'tedir; x448'i hiçbir profil
+  ilan etmez.
 - **HTTP/3 deneyseldir:** proxy üzerinden ve `cert=` ile kullanılmaz, trio
   altında kullanılmaz (`http3=True` HTTP/2'ye ya da 1.1'e düşer, `"force"` açık
   `Http3ConnectError` verir), yanıt gövdesini tamamen okur (`stream=True` ile de), QUIC
