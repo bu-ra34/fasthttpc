@@ -190,7 +190,8 @@
   kendi soketine çevirip kapanana dek bırakmıyordu. Döngü artık kendi iş
   parçacığında kuruluyor (regresyon testi ana iş parçacığının wakeup fd'sini denetler).
 - Kapatılmayan soket/dosya/döngüler: stdlib `ssl` ile sarılan sunucu soketleri
-  (`wrap_socket` ham soketi devralır; kapatılan ham soketti), hiç kapatılmayan
+  (`wrap_socket` ham soketi devralır; kapatılan ham soketti — `thread_servers`'ın
+  `close()`'u da bu yüzden açık TLS bağlantılarını kesemiyordu), hiç kapatılmayan
   dinleyiciler ve sahte proxy tünelleri, `TLSAdapter.negotiate` hata verince
   çağıranın kapatması gereken ham soketler, tlslite sunucusunun PEM dosyaları, HTTP/3
   test sunucusunun döngüsü. TLS 1.2 stdlib sunucusu okunmamış veriyle kapatırken RST

@@ -192,12 +192,13 @@ async def start_server(client_connected_cb: Callable[..., Awaitable[Any]], host:
     return await TrackedServer(client_connected_cb)._start(host, port, **kw)
 
 
-def listen_dual(backlog: int = 16) -> "tuple[list[socket.socket], int]":
+def listen_dual(backlog: int = 16, rcvbuf: Optional[int] = None) -> "tuple[list[socket.socket], int]":
     """127.0.0.1 ve ::1'de AYNI portta dinleyen soketler -> (soketler, port).
 
     ``dual_endpoint`` portu seçip bırakır; paralel bir süreç araya girip portu kaparsa bind
     EADDRINUSE verir: yeni portla tekrar denenir, son çare yalnız IPv4 ve port 0 (yarışsız).
-    SO_REUSEADDR kullanılmaz (Windows'ta kullanımdaki portu da bağlatır)."""
+    SO_REUSEADDR kullanılmaz (Windows'ta kullanımdaki portu da bağlatır). ``rcvbuf``: dinleyen
+    sokete konan alım tamponu (kabul edilen soketlere geçer)."""
     for attempt in range(6):
         hosts, port = dual_endpoint() if attempt < 5 else (["127.0.0.1"], 0)
         socks: "list[socket.socket]" = []
@@ -208,6 +209,8 @@ def listen_dual(backlog: int = 16) -> "tuple[list[socket.socket], int]":
                 socks.append(s)
                 if fam == socket.AF_INET6:
                     s.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 1)
+                if rcvbuf is not None:
+                    s.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, rcvbuf)
                 s.bind((h, port))
                 port = s.getsockname()[1]
                 s.listen(backlog)

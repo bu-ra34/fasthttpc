@@ -22,33 +22,8 @@ import time
 from typing import Optional
 from urllib.parse import parse_qs, urlsplit
 
-from netutil import dual_endpoint
+from netutil import listen_dual
 from saha.yerel_sunucu import pki_uret
-
-
-def _listen(rcvbuf: Optional[int] = None) -> "tuple[list[socket.socket], int]":
-    hosts, port = dual_endpoint()
-    socks: list[socket.socket] = []
-    for h in hosts:
-        fam = socket.AF_INET6 if ":" in h else socket.AF_INET
-        s = socket.socket(fam, socket.SOCK_STREAM)
-        try:
-            s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-            if fam == socket.AF_INET6:
-                s.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 1)
-            if rcvbuf is not None:
-                # Dinleyen sokete konan alım tamponu kabul edilen soketlere geçer.
-                s.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, rcvbuf)
-            s.bind((h, port))
-        except OSError:
-            s.close()
-            if socks:           # ::1 bağlanamadı: yalnız IPv4
-                break
-            raise
-        port = s.getsockname()[1]
-        s.listen(64)
-        socks.append(s)
-    return socks, port
 
 
 class _Base:
@@ -70,7 +45,7 @@ class _Base:
         self.errors: list[BaseException] = []
         self._stop = threading.Event()
         self._conns: set = set()
-        self._listeners, self.port = _listen(rcvbuf)
+        self._listeners, self.port = listen_dual(64, rcvbuf)   # paralel süreçlerde port yarışına dayanıklı
         for ls in self._listeners:
             threading.Thread(target=self._accept, args=(ls,), daemon=True).start()
 
@@ -92,11 +67,18 @@ class _Base:
             self.open += 1
             self.peak_open = max(self.peak_open, self.open)
             self._conns.add(raw)
+        s = raw
         try:
             raw.settimeout(30)
-            s = raw
             if self.ctx is not None:
+                # wrap_socket ham soketi DEVRALIR (raw detach edilir): bundan sonra kapatılacak
+                # ve close()'un keseceği soket s'dir; raw.close() hiçbir şeyi kapatmaz.
                 s = self.ctx.wrap_socket(raw, server_side=True)
+                with self.lock:
+                    self._conns.discard(raw)
+                    self._conns.add(s)
+                if self._stop.is_set():     # close() sarma sırasında koştu
+                    return
             self._serve(s)
         except (OSError, ssl.SSLError) as e:
             if not self._stop.is_set():
@@ -105,8 +87,9 @@ class _Base:
             with self.lock:
                 self.open -= 1
                 self._conns.discard(raw)
+                self._conns.discard(s)
             try:
-                raw.close()
+                s.close()
             except OSError:
                 pass
 
