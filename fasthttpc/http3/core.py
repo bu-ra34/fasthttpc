@@ -55,7 +55,15 @@ class Http3ConnectError(Http3Error):
 
 
 class Http3RequestRefused(Http3Error):
-    """Sunucu (GOAWAY) isteği işlemedi: yeni bağlantıda yeniden denemek güvenli."""
+    """Sunucu isteği işlemedi (GOAWAY ya da H3_REQUEST_REJECTED): yeni bağlantıda yeniden denemek güvenli."""
+
+
+# RFC 9114 §8.1 hata kodları. §4.1.1: REJECTED yalnızca hiç işlenmemiş istek içindir ("Servers MUST
+# NOT use the H3_REQUEST_REJECTED error code for requests that were partially or fully processed";
+# istemci böyle bir isteği "as though they had never been sent at all" sayıp yeniden deneyebilir).
+# CANCELLED (ve diğer kodlar) bu güvenceyi VERMEZ: istek kısmen işlenmiş olabilir, yeniden denenmez.
+H3_REQUEST_REJECTED = 0x10B
+H3_REQUEST_CANCELLED = 0x10C
 
 
 def make_h3_class(profile: fp.QuicProfile):
@@ -229,7 +237,15 @@ class H3Core:
             elif isinstance(ev, qevents.StreamReset):
                 st = self.streams.get(ev.stream_id)
                 if st is not None and not st.ended:
-                    st.error = Http3Error(f"stream sıfırlandı: {ev.error_code:#x}")
+                    if ev.error_code == H3_REQUEST_REJECTED and st.headers is None:
+                        # İşlenmedi (RFC 9114 §4.1.1): yeni bağlantıda yeniden denenebilir. Yanıt
+                        # başlığı geldiyse sunucu isteği işlemiştir: REJECTED'a güvenilmez.
+                        st.refused = True
+                        st.error = Http3RequestRefused(
+                            "sunucu isteği işlemeden reddetti (H3_REQUEST_REJECTED)")
+                        self.draining = True    # yeni istekler (yeniden deneme dahil) yeni bağlantıda
+                    else:
+                        st.error = Http3Error(f"stream sıfırlandı: {ev.error_code:#x}")
                     st.ended = True
                     st.wake()
             else:
