@@ -173,6 +173,21 @@
   ServerHello'dan önce gelen CCS `unexpected_message` ile reddedilir. Şifresiz
   aşamada mesaj tipi uzunluk alanından önce denetlenir. Güvenlik incelemesinde
   FHC-11 düzeltildi, FHC-12'nin CCS kısmı giderildi.
+- **HTTP/3 `H3_REQUEST_REJECTED`:** sunucunun yanıt başlığı göndermeden
+  `H3_REQUEST_REJECTED` (0x10B) ile sıfırladığı istek işlenmemiştir (RFC 9114
+  §4.1.1); artık GOAWAY reddi gibi `Http3RequestRefused` olur, bağlantı yeni
+  istek için kullanılmaz ve istek yeni bağlantıda tekrarlanır (sync ve async).
+  Önceden `Http3Error` olarak kullanıcıya ulaşıyordu. Reddedilen istek en fazla
+  bir kez tekrarlanır; yeni bağlantı da reddederse deneme sayısını belirten
+  `Http3RequestRefused` verilir. Yalnızca tamponlanmış (`bytes`) gövdeler
+  yeniden gönderilir; bugün tüm HTTP/3 gövdeleri böyledir.
+  `H3_REQUEST_CANCELLED` (0x10C), diğer kodlar ve yanıt başlığından sonra gelen
+  REJECTED yeniden denenmez (istek işlenmiş olabilir).
+- **Async HTTP/3 bağlantı değişimi süren istekleri kesmiyor:** GOAWAY ya da
+  reddedilen istek nedeniyle havuzdan çıkarılan bağlantı, yeni istek geldiğinde
+  hemen kapatılıyor ve aynı bağlantıda süren istekler "bağlantı kapatıldı"
+  hatasıyla düşüyordu. Bağlantı artık son akışı bitince kapanır.
+
 
 ### Bağımlılıklar
 - `brotli` / `brotlicffi` en az 1.2 (`output_buffer_limit` için). Daha eski bir
