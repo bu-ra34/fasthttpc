@@ -18,6 +18,10 @@ from .options import Http3Options
 class _Proto(asyncio.DatagramProtocol):
     def __init__(self, owner: "AsyncH3Connection"):
         self.owner = owner
+        # Taşıma GERÇEKTEN kapandığında (soket kapatıldı) tamamlanır: transport.close()
+        # eşzamansızdır; ProactorEventLoop'ta süren bir overlapped yazma varken soketin
+        # kapanması o yazma bitene dek ertelenir.
+        self.lost: "asyncio.Future[None]" = asyncio.get_running_loop().create_future()
 
     def datagram_received(self, data, addr):
         self.owner._on_datagram(data)
@@ -26,6 +30,8 @@ class _Proto(asyncio.DatagramProtocol):
         self.owner._on_udp_error(exc)
 
     def connection_lost(self, exc):
+        if not self.lost.done():
+            self.lost.set_result(None)
         self.owner._on_udp_error(exc or Http3Error("UDP taşıması kapandı"))
 
 
@@ -43,6 +49,7 @@ class AsyncH3Connection:
         self.loop: "Optional[asyncio.AbstractEventLoop]" = None
         self._connected_addr = None
         self._retired = False
+        self._protos: "list[_Proto]" = []      # kapanışı beklenecek UDP protokolleri
 
     # -- IO ---------------------------------------------------------------------
     def _on_datagram(self, data: bytes) -> None:
@@ -145,8 +152,9 @@ class AsyncH3Connection:
             # asyncio remote_addr için 2'li (host, port) ister; aile adresle eşleşir
             # (IPv6 4'lü adresi AF_INET soketine verilmez). scope id gerekiyorsa host'ta %scope.
             host_part = addr[0] if len(addr) == 2 or not addr[3] else f"{addr[0]}%{addr[3]}"
-            self._transport, _ = await self.loop.create_datagram_endpoint(
+            self._transport, proto = await self.loop.create_datagram_endpoint(
                 lambda: _Proto(self), remote_addr=(host_part, addr[1]), family=family)
+            self._protos.append(proto)
         except OSError as e:
             raise Http3ConnectError(f"UDP soketi açılamadı: {e}", e) from e
         self._connected_addr = addr
@@ -191,7 +199,8 @@ class AsyncH3Connection:
 
     @property
     def finished(self) -> bool:
-        return self._transport is None
+        """Kapatıldı VE UDP taşıması gerçekten kapandı (soket serbest)."""
+        return self._transport is None and all(p.lost.done() for p in self._protos)
 
     def retire(self) -> None:
         """Yeni istek alma; süren istekler bitince (son akış serbest bırakılınca) kapan."""
@@ -270,7 +279,25 @@ class AsyncH3Connection:
         return st.headers, body_iter()
 
     async def close(self) -> None:
+        """Bağlantıyı kapatır ve UDP taşımasının gerçekten kapanmasını (connection_lost) bekler.
+
+        ``transport.close()`` soketi hemen kapatmaz: kapanış olay döngüsünün sonraki
+        turlarında olur (ProactorEventLoop'ta süren overlapped yazma bitene dek ertelenir).
+        Beklenmeden dönülürse döngü (ör. ``asyncio.run`` sonu) kapanınca taşıma yarım kalır:
+        açık UDP soketi, ``_ProactorBasePipeTransport.__del__`` ResourceWarning'i."""
         self._close_now()
+        await self.wait_transport_closed()
+
+    async def wait_transport_closed(self, timeout: float = 2.0) -> None:
+        """Kapatılmış UDP taşımalarının ``connection_lost``'unu (en fazla ``timeout`` sn) bekler."""
+        try:
+            running = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        pending = [p.lost for p in self._protos
+                   if not p.lost.done() and p.lost.get_loop() is running]
+        if pending:
+            await asyncio.wait([asyncio.shield(f) for f in pending], timeout=timeout)
 
     def _close_now(self) -> None:
         if self.core is not None and not self.core.closed:

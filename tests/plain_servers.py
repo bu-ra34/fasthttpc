@@ -178,5 +178,5 @@ class ForwardProxy(ThreadedHTTPServer):
 
 
 def closed_port() -> int:
-    """Bağlantıyı reddeden port (bkz. netutil.refused_port: paralel süreçlerde yarışsız)."""
+    """Bağlantıyı reddeden port (bkz. netutil.refused_port; platforma göre ayrılır)."""
     return refused_port()

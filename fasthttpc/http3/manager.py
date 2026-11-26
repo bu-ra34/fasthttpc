@@ -266,4 +266,4 @@ class AsyncHttp3:
         conns += list(self._retired)
         self._retired = set()
         for c in conns:
-            await c.close()
+            await c.close()          # UDP taşımasının gerçekten kapanmasını da bekler

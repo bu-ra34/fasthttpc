@@ -219,8 +219,10 @@
   olma da bu satırla anlaşılır (eskiden seçilip bırakılan port araya giren başka bir
   sunucuya gidebiliyor, yoklama o yabancı sunucuya bağlanıp "hazır" sanıyordu —
   `test_sadece_p256_sunan_sunucu_hrr_yolu` gibi testlerin paralel koşuda düşmesi).
-  "Kapalı port" testleri bağlı ama dinlemeyen, süreç boyunca ayrılmış bir port
-  kullanır (`netutil.refused_port`); çift yığınlı (127.0.0.1 + ::1) dinleyiciler port
+  "Kapalı port" testleri Linux ve Windows'ta bağlı ama dinlemeyen, süreç boyunca
+  ayrılmış bir port kullanır (`netutil.refused_port`). macOS'ta (XNU, 4.4BSD kökenli
+  `tcp_input`) dinlemeyen bağlı sokete gelen SYN RST'siz atılır, bağlantı reddedilmez
+  zaman aşımına uğrar; orada port seçilip bırakılır; çift yığınlı (127.0.0.1 + ::1) dinleyiciler port
   kapılırsa yeni portla yeniden dener (`netutil.listen_dual`, `start_dual`).
   Dört tam takım aynı makinede eşzamanlı koşarak doğrulandı.
 - **Test başına zaman sınırı:** `pytest-timeout` geliştirme bağımlılığı oldu
@@ -428,6 +430,13 @@
   yüzünden yarım kalan kapanışlar oturumda izlenir ve `close()` onları da (en fazla
   1 sn, sonra TCP kesilir) bekler. `close_streams` iptal edilmiş kapanış future'ını
   "kapanmadı" sayıp bağlantıyı keser.
+- **Async HTTP/3: `close()` UDP taşımasının gerçekten kapanmasını bekler.**
+  `transport.close()` eşzamansızdır (ProactorEventLoop'ta süren overlapped yazma varken
+  soketin kapanması ertelenir); bağlantı ve `AsyncSession.close()` beklemeden dönünce
+  döngü sonunda taşıma yarım kalıyordu (Windows CI: açık UDP soketi,
+  `_ProactorBasePipeTransport.__del__` ResourceWarning, 24 test). Artık protokolün
+  `connection_lost`'u (en fazla 2 sn) beklenir; retire edilen bağlantılar da ancak
+  taşımaları kapanınca "bitti" sayılır ve oturum kapanışında beklenir.
 - **Async HTTP/3: kurulu bağlantıda UDP hatası bağlantıyı düşürür.** Önceden yalnızca
   el sıkışması sırasında dikkate alınıyordu; sonradan gelen ICMP reddinde (ya da
   Windows ProactorEventLoop'ta okumayı durduran herhangi bir alım hatasında) bağlantı

@@ -767,6 +767,29 @@ def test_kurulu_baglantida_udp_reddi_baglantiyi_dusurur(pki, h3):
     asyncio.run(go())
 
 
+def test_async_close_udp_tasimasinin_kapanmasini_bekler(pki, h3):
+    """AsyncSession.close() (ve bağlantının close()'u) UDP taşıması GERÇEKTEN kapanmadan
+    (protokolün connection_lost'u) dönmez. transport.close() eşzamansızdır; beklenmeden
+    dönülürse asyncio.run sonunda taşıma yarım kalır (Windows Proactor: açık UDP soketi,
+    _ProactorBasePipeTransport.__del__ ResourceWarning). Retire edilmiş bağlantılar dahil."""
+    async def go():
+        a = AsyncSession(http3="force", verify=pki["ca"])
+        assert (await a.get(url(h3))).http_version == "HTTP/3"
+        conn = next(iter(a._h3._conns.values()))
+        protos = list(conn._protos)
+        assert protos and not any(p.lost.done() for p in protos)
+        conn.retire()                         # akış yok: hemen kapanır (eşzamanlı yol)
+        a._h3._retired.add(conn)
+        a._h3._conns.clear()
+        assert (await a.get(url(h3))).http_version == "HTTP/3"
+        second = next(iter(a._h3._conns.values()))
+        await a.close()
+        for c in (conn, second):
+            assert c._protos and all(p.lost.done() for p in c._protos), "close() connection_lost'tan önce döndü"
+            assert c.finished
+    asyncio.run(go())
+
+
 def test_multi_address_all_dead_fails_within_timeout(pki, monkeypatch):
     s1 = socket.socket(socket.AF_INET, socket.SOCK_DGRAM); s1.bind(("127.0.0.1", 0))
     port = s1.getsockname()[1]            # sessiz adres; ikinci adres: kapalı port

@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 import atexit
 import socket
+import sys
 import threading
 from typing import Any, Awaitable, Callable, Optional
 
@@ -17,17 +18,33 @@ _RESERVED: "list[socket.socket]" = []
 atexit.register(lambda: [s.close() for s in _RESERVED])
 
 
+# Bağlı ama dinlemeyen sokete gelen SYN'e RST dönen çekirdekler (CI'da doğrulandı).
+_RST_FOR_BOUND_PORT = sys.platform.startswith(("linux", "win32", "cygwin"))
+
+
 def refused_port() -> int:
     """Bağlantıyı REDDEDEN (RST/ECONNREFUSED) bir TCP portu.
 
     "Boş port seç ve kapat" paralel test süreçlerinde yarışır: araya giren başka bir süreç
-    portu dinlemeye başlarsa "kapalı port" testi bir sunucuya bağlanır. Burada port, bağlanmış
-    ama dinlemeyen bir sokete süreç boyunca ayrılır: kimse onu alamaz ve dinleyen olmadığı için
-    çekirdek bağlantıyı reddeder (Linux/macOS/Windows)."""
+    portu dinlemeye başlarsa "kapalı port" testi bir sunucuya bağlanır. Linux ve Windows'ta
+    port bu yüzden bağlanmış ama dinlemeyen bir sokete süreç boyunca ayrılır: kimse onu
+    alamaz ve dinleyen olmadığı için çekirdek SYN'e RST döner.
+
+    macOS (XNU) ve 4.4BSD kökenli yığınlarda bu YAPILAMAZ: ``tcp_input`` TCB'si CLOSED
+    durumdaki (bağlı ama ``listen`` çağrılmamış) sokete gelen SYN'i RST göndermeden atar
+    ("embryonic ... should either do a listen or a connect soon" -> ``goto drop``). Bağlantı
+    reddedilmez, zaman aşımına uğrar (macOS CI: ``test_hepsi_basarisizsa_son_hata_yukselir``
+    5 sn'de TimeoutError). Orada port seçilip bırakılır: hiçbir soket bağlı olmadığı için
+    çekirdek RST döner; paralel bir sürecin tam bu portu dinlemeye başlaması tek kalan
+    (çok küçük) risktir."""
     s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     s.bind(("127.0.0.1", 0))
-    _RESERVED.append(s)
-    return s.getsockname()[1]
+    port = s.getsockname()[1]
+    if _RST_FOR_BOUND_PORT:
+        _RESERVED.append(s)
+    else:
+        s.close()
+    return port
 
 
 def dual_endpoint() -> "tuple[list[str], int]":
