@@ -9,9 +9,9 @@ somut sonucu vardı:
   2. ``Secure`` bayrağı yok sayıldığı için HTTPS'te alınan çerez düz HTTP
      isteğine de ekleniyordu.
 
-Bu modül RFC 6265 §5.1.3 (domain matching), §5.1.4 (path matching), Secure ve
-Max-Age/Expires kurallarını uygular. Amaç tam bir tarayıcı uyumluluğu değil,
-çerezlerin yanlış hedefe gitmemesidir.
+Bu modül RFC 6265 §5.1.3 (domain matching), §5.1.4 (path matching), §5.3 adım 5
+(Public Suffix List; bkz. ``_psl``), Secure ve Max-Age/Expires kurallarını uygular.
+Amaç tam bir tarayıcı uyumluluğu değil, çerezlerin yanlış hedefe gitmemesidir.
 """
 from __future__ import annotations
 
@@ -21,6 +21,8 @@ import time
 from dataclasses import dataclass, field
 from email.utils import parsedate_to_datetime
 from typing import Iterable, Optional
+
+from ._psl import is_public_suffix, to_ascii
 
 
 @dataclass
@@ -60,20 +62,54 @@ def _is_ip(host: str) -> bool:
         return False
 
 
-def _domain_attr_allowed(host: str, declared: str) -> bool:
-    """``Domain=`` özniteliği çerezi alan-geneli (host-only olmayan) yapabilir mi?
+def _ip_literal(host: str) -> str:
+    """IP host'un tarayıcıların ``Domain=`` ile karşılaştırdığı biçimi: IPv6
+    köşeli parantezli (URL host'u gibi ``[::1]``), IPv4 olduğu gibi."""
+    bare = host.strip("[]")
+    return f"[{bare}]" if ":" in bare else bare
 
-    RFC 6265 §5.3 adım 5-6: öznitelik istek host'unu domain-match etmeli; IP adresi
-    olan host'ta alan-geneli çerez olmaz (``Domain=0.1`` '10.0.0.1'den '9.0.0.1'e
-    sızardı); tek etiketli bir değer (``com``, ``local``) genel sonek kabul edilir —
-    aksi halde ``Domain=com`` ile konan çerez TÜM ``.com`` sitelerine giderdi.
-    Tam Public Suffix List (``co.uk``, ``github.io``) uygulanmaz; bkz. docs/security-audit.md.
+
+def _domain_attr_allowed(host: str, declared: str) -> bool:
+    """İstek host'u ``Domain=`` değerini domain-match ediyor mu (RFC 6265 §5.1.3)?
+
+    Host ya değerin kendisi ya da onun alt alan adıdır: ``a.example.com`` <-
+    ``example.com`` evet, ``evil.com`` <- ``bank.com`` hayır. IP host'ta hiçbir
+    değer alan-geneli çerez vermez (``Domain=0.0.1`` '10.0.0.1'den '9.0.0.1'e
+    sızardı). ``host`` ve ``declared`` kanoniktir.
     """
     if not declared or _is_ip(host):
         return False
-    if host != declared and not host.endswith("." + declared):
-        return False
-    return "." in declared
+    return host == declared or host.endswith("." + declared)
+
+
+def _domain_attr_verdict(host: str, declared: str) -> Optional[bool]:
+    """``Domain=`` özniteliğinin sonucu: ``True`` alan-geneli çerez, ``False``
+    host-only çerez, ``None`` çerez tümden yok sayılır.
+
+    * IP host: öznitelik IP'nin kendisiyse host-only, başka her değerde çerez yok
+      sayılır. Tarayıcılar böyle yapar (2026-11-24'te kaynaktan bakıldı):
+      Chromium ``net/cookies/cookie_util.cc`` ``GetCookieDomainWithString()``
+      ("IP address that don't have an empty or matching domain attribute are
+      invalid"; eşitse host cookie) ve Firefox
+      ``netwerk/cookie/CookieValidation.cpp`` ``CookieValidation::CheckDomain()``
+      (IP / eTLD host'ta ``aRequireHostMatch``: tam eşitlik, yoksa
+      ``eRejectedInvalidDomain``; mozilla-central 8390f786553b). Karşılaştırma
+      URL host biçimiyledir (IPv6 köşeli parantezli).
+    * RFC 6265 §5.3 adım 5: öznitelik bir genel sonekse (Public Suffix List; tek
+      etiketli her değer de varsayılan ``*`` kuralıyla genel sonektir) ve istek
+      host'una eşitse çerez host-only olur, değilse yok sayılır — aksi halde
+      ``evil.co.uk``'nin ``Domain=co.uk`` çerezi tüm ``.co.uk`` sitelerine giderdi.
+    * RFC 6265 §5.3 adım 6: host özniteliği domain-match etmiyorsa
+      (``evil.com``'dan ``Domain=bank.com``) çerez yok sayılır; Chromium ve
+      Firefox da reddeder.
+    """
+    if not declared:
+        return False            # boş öznitelik yok sayılır (§5.2.3): host-only
+    if _is_ip(host):
+        return False if declared == _ip_literal(host) else None
+    if is_public_suffix(declared):
+        return False if declared == host else None
+    return True if _domain_attr_allowed(host, declared) else None
 
 
 def _path_matches(request_path: str, cookie_path: str) -> bool:
@@ -107,16 +143,18 @@ def parse_set_cookie(header_value: str, request_host: str, request_path: str) ->
     if not name:
         return None
 
+    host = to_ascii(request_host)       # küçük harf, sondaki nokta yok, IDN -> A-label
     cookie = Cookie(
         name=name,
         value=value,
-        domain=request_host.lower(),
+        domain=host,
         path=_default_path(request_path),
         host_only=True,
     )
 
     max_age: Optional[float] = None
     expires: Optional[float] = None
+    domain_attr: Optional[str] = None
 
     for attr in parts[1:]:
         key, _, val = attr.partition("=")
@@ -124,13 +162,7 @@ def parse_set_cookie(header_value: str, request_host: str, request_path: str) ->
         val = val.strip()
 
         if key == "domain" and val:
-            declared = val.lstrip(".").lower().rstrip(".")
-            # Sunucu yalnızca kendi alan adı veya üst alanı için çerez
-            # koyabilir; 'evil.com' 'bank.com' için çerez ayarlayamaz.
-            host = request_host.lower().rstrip(".")
-            if _domain_attr_allowed(host, declared):
-                cookie.domain = declared
-                cookie.host_only = False
+            domain_attr = val           # RFC 6265 §5.3 adım 4: son Domain geçerli
         elif key == "path" and val.startswith("/"):
             cookie.path = val
         elif key == "secure":
@@ -147,6 +179,17 @@ def parse_set_cookie(header_value: str, request_host: str, request_path: str) ->
                 expires = parsedate_to_datetime(val).timestamp()
             except (TypeError, ValueError):
                 pass
+
+    if domain_attr is not None:
+        # Sunucu yalnızca kendi alan adı veya üst alanı için çerez koyabilir
+        # ('evil.com' 'bank.com' için koyamaz), genel sonek için hiç koyamaz.
+        declared = to_ascii(domain_attr.lstrip(".")).rstrip(".")
+        verdict = _domain_attr_verdict(host, declared)
+        if verdict is None:
+            return None
+        if verdict:
+            cookie.domain = declared
+            cookie.host_only = False
 
     # Max-Age, Expires'a göre önceliklidir (RFC 6265 §5.2.2)
     cookie.expires_at = max_age if max_age is not None else expires
@@ -197,6 +240,7 @@ class CookieJar:
 
     def header_for(self, host: str, path: str, secure: bool) -> str:
         """Verilen istek için gönderilecek ``Cookie`` başlığı değerini üretir."""
+        host = to_ascii(host)
         now = time.time()
         with self._lock:
             snapshot = list(self._cookies.values())

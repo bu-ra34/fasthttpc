@@ -60,7 +60,7 @@ pytest        # ağ gerektirmez (canlı testler FASTHTTPC_LIVE=1 olmadan atlanı
 | Auth ve hook'lar | Basic, Digest (RFC 7616), Bearer, `.netrc`, özel auth (requests veya httpx tarzı); requests tarzı `hooks=`, httpx tarzı `event_hooks=`; `Session` ve `AsyncSession`'da plugin'ler |
 | Proxy | HTTP CONNECT (+Basic), SOCKS5 (RFC 1929), rotasyon; `trust_env=True` ile `HTTP_PROXY`/`HTTPS_PROXY`/`ALL_PROXY`/`NO_PROXY`; TLS her zaman tünelin içinde kurulur |
 | Zaman aşımı / sınır / yeniden deneme | `Timeout` (`total` dahil), `Limits`, urllib3 tarzı `Retry` (`Retry-After` ile) |
-| Çerez, cache, yönlendirme | RFC 6265 cookie jar, response cache, yönlendirme geçmişi |
+| Çerez, cache, yönlendirme | RFC 6265 cookie jar (Public Suffix List denetimiyle), response cache, yönlendirme geçmişi |
 | DNS | İsteğe bağlı DNS-over-HTTPS çözücü; çok adresli host'larda Happy Eyeballs (RFC 8305) |
 | Eski sunucular | `legacy_tls=True` (varsayılan kapalı): TLS 1.2 CBC ve statik RSA suite'leri. TLS 1.0/1.1 hiçbir zaman desteklenmez |
 | Test | `MockTransport` (senkron ve async handler) |
@@ -504,9 +504,8 @@ verir veya belgelenmiştir:
   kullanır); `AsyncSession` `write`'ı drain süresine uygular.
 - `Timeout.total`, başlıklar geldikten sonra akış (`stream=True`) gövdesinin
   okunmasını sınırlamaz (oradaki her okuma `read` ile sınırlıdır).
-- İç güvenlik incelemesinin açık bulguları (ör. çerezlerde Public Suffix List
-  yok, TLS 1.3 şifre takımı ve ALPN teklifle karşılaştırılmıyor)
-  [docs/security-audit.md](docs/security-audit.md)'de.
+- İç güvenlik incelemesinin açık bulguları (ör. TLS 1.3 şifre takımı ve ALPN
+  teklifle karşılaştırılmıyor) [docs/security-audit.md](docs/security-audit.md)'de.
 
 ## Modül yapısı
 
@@ -522,6 +521,7 @@ fasthttpc/
 ├── plugins.py          # Plugin arayüzü (Session ve AsyncSession)
 ├── streaming.py        # Akış gövdesi kod çözücüleri
 ├── cookies.py          # RFC 6265 cookie jar (domain/path/Secure)
+├── _psl.py             # Public Suffix List araması (çerez Domain=)
 ├── tls_crafter.py      # ClientHello oluşturucu
 ├── tls_tools.py        # TLS yardımcıları
 ├── crypto_math.py      # Key schedule + OpenSSL (cryptography) AEAD/X25519 sarmalayıcıları
@@ -548,3 +548,8 @@ python smoke_test.py  # ağ gerektiren elle doğrulama
 ## Lisans
 
 MIT
+
+Pakete gömülü Public Suffix List anlık görüntüsü
+(`fasthttpc/public_suffix_list.dat.gz`, çerez alan adları için) <https://publicsuffix.org/>
+kaynaklıdır ve Mozilla Public License 2.0 altındadır; bkz. [LICENSE-PSL](LICENSE-PSL).
+Güncellemek için: `python scripts/update_psl.py`.

@@ -7,8 +7,9 @@ name = "fasthttpc"
 version = "0.7.0"
 description = "Pure-Python HTTP client with its own TLS 1.3/1.2 stack, browser TLS/HTTP2 fingerprint impersonation, HTTP/2, asyncio/trio and experimental HTTP/3"
 readme = "README.md"
-license = "MIT"
-license-files = ["LICENSE"]
+# MPL-2.0: the bundled Public Suffix List snapshot only (see LICENSE-PSL).
+license = "MIT AND MPL-2.0"
+license-files = ["LICENSE", "LICENSE-PSL"]
 requires-python = ">=3.10"
 authors = [{ name = "Buğra" }]
 keywords = [
@@ -75,7 +76,7 @@ include = ["fasthttpc*"]
 exclude = ["tests*", "interop*", "saha*", "examples*"]
 
 [tool.setuptools.package-data]
-fasthttpc = ["py.typed"]
+fasthttpc = ["py.typed", "public_suffix_list.dat.gz"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
@@ -119,6 +120,7 @@ files = [
     "fasthttpc/config.py",
     "fasthttpc/retry.py",
     "fasthttpc/cookies.py",
+    "fasthttpc/_psl.py",
     "fasthttpc/cache.py",
     "fasthttpc/metrics.py",
     "fasthttpc/timeout.py",

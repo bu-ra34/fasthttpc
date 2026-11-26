@@ -14,8 +14,9 @@ from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import ec
 from cryptography.x509.oid import NameOID
 
-from fasthttpc import AsyncSession, Session
+from fasthttpc import AsyncSession, MockTransport, Response, Session
 from fasthttpc.cookies import CookieJar
+from fasthttpc.models.urls import URL
 from fasthttpc.models.headers import check_header_field, check_request_line
 from fasthttpc.protocol.http1_parser import HTTP1Parser, parse_chunk_size
 from fasthttpc.security.cert_validator import CertificateValidationError, validate_server_certificate
@@ -188,24 +189,65 @@ def test_async_session_rejects_crlf_before_connecting(kw):
 # ---------------------------------------------------------------------------
 # F3 — çerez Domain= özniteliği genel soneke / IP'ye yayılamaz
 # ---------------------------------------------------------------------------
-def test_cookie_domain_tld_is_host_only():
+def test_cookie_domain_tld_is_rejected():
     jar = CookieJar()
     jar.update_from_headers(["sid=evil; Domain=com; Path=/"], "attacker.com", "/")
     assert jar.header_for("bank.com", "/", True) == ""
-    assert jar.header_for("attacker.com", "/", True) == "sid=evil"
+    # FHC-08'den beri (RFC 6265 §5.3 adım 5) genel sonek Domain'li çerez host-only
+    # kalmaz, tümden yok sayılır.
+    assert jar.header_for("attacker.com", "/", True) == ""
 
 
-def test_cookie_domain_dot_tld_is_host_only():
+def test_cookie_domain_dot_tld_is_rejected():
     jar = CookieJar()
     jar.update_from_headers(["sid=evil; Domain=.com"], "www.attacker.com", "/")
     assert jar.header_for("bank.com", "/", True) == ""
+    assert jar.header_for("www.attacker.com", "/", True) == ""
 
 
-def test_cookie_domain_on_ip_host_is_host_only():
+@pytest.mark.parametrize("host,domain,other", [
+    ("10.0.0.1", "0.0.1", "9.0.0.1"),
+    ("10.0.0.1", "10.0.0.2", "10.0.0.2"),
+    ("10.0.0.1", "example.com", "example.com"),
+    ("::1", "::1", "::2"),          # IPv6 öznitelik köşeli parantezsiz: tarayıcılar da reddeder
+    ("::1", "[::2]", "::2"),
+])
+def test_cookie_domain_on_ip_host_is_rejected(host, domain, other):
+    # FHC-03'te host-only kalıyordu; Chromium/Firefox gibi artık tümden yok sayılır
+    # (bkz. fasthttpc/cookies.py _domain_attr_verdict).
     jar = CookieJar()
-    jar.update_from_headers(["sid=x; Domain=0.0.1"], "10.0.0.1", "/")
-    assert jar.header_for("9.0.0.1", "/", True) == ""
-    assert jar.header_for("10.0.0.1", "/", True) == "sid=x"
+    jar.update_from_headers([f"sid=x; Domain={domain}"], host, "/")
+    assert len(jar) == 0
+    assert jar.header_for(other, "/", True) == ""
+    assert jar.header_for(host, "/", True) == ""
+
+
+@pytest.mark.parametrize("host,domain,other", [
+    ("10.0.0.1", "10.0.0.1", "9.0.0.1"),
+    ("10.0.0.1", ".10.0.0.1", "10.0.0.10"),
+    ("::1", "[::1]", "::2"),
+    ("[::1]", "[::1]", "[::2]"),
+])
+def test_cookie_domain_equal_to_ip_host_is_host_only(host, domain, other):
+    jar = CookieJar()
+    jar.update_from_headers([f"sid=x; Domain={domain}"], host, "/")
+    assert jar.header_for(host, "/", True) == "sid=x"
+    assert jar.header_for(other, "/", True) == ""
+
+
+@pytest.mark.parametrize("host,domain", [
+    ("evil.com", "bank.com"),
+    ("example.com", "a.example.com"),           # öznitelik host'un alt alanı
+    ("notexample.com", "example.com"),          # sonek ama etiket sınırında değil
+    ("a.example.com", "b.example.com"),
+])
+def test_cookie_domain_not_matching_host_is_rejected(host, domain):
+    """RFC 6265 §5.3 adım 6: host özniteliği domain-match etmiyorsa çerez yok sayılır."""
+    jar = CookieJar()
+    jar.update_from_headers([f"sid=evil; Domain={domain}"], host, "/")
+    assert len(jar) == 0
+    assert jar.header_for(domain, "/", True) == ""
+    assert jar.header_for(host, "/", True) == ""
 
 
 def test_cookie_registrable_domain_still_shared():
@@ -213,6 +255,132 @@ def test_cookie_registrable_domain_still_shared():
     jar.update_from_headers(["sid=ok; Domain=example.com"], "a.example.com", "/")
     assert jar.header_for("b.example.com", "/", True) == "sid=ok"
     assert jar.header_for("example.org", "/", True) == ""
+
+
+# ---------------------------------------------------------------------------
+# F8 — Public Suffix List: Domain= genel sonek olamaz (RFC 6265 §5.3 adım 5)
+# ---------------------------------------------------------------------------
+def _jar_from(host, *set_cookies):
+    jar = CookieJar()
+    jar.update_from_headers(set_cookies, URL(f"https://{host}/").host, "/")
+    return jar
+
+
+def _sent(jar, host):
+    return jar.header_for(URL(f"https://{host}/").host, "/", True)
+
+
+@pytest.mark.parametrize("host,domain,sibling", [
+    ("example.co.uk", "co.uk", "victim.co.uk"),
+    ("evil.co.uk", ".CO.UK.", "victim.co.uk"),
+    ("foo.github.io", "github.io", "bar.github.io"),        # PRIVATE bölümü
+    ("app.herokuapp.com", "herokuapp.com", "bank.herokuapp.com"),
+    ("a.b.test.ck", "test.ck", "c.test.ck"),                 # joker *.ck
+    ("x.c.kobe.jp", "c.kobe.jp", "y.c.kobe.jp"),             # joker *.kobe.jp
+    ("пример.рф", "рф", "сайт.рф"),                          # IDN, Unicode öznitelik
+    ("пример.рф", "xn--p1ai", "сайт.рф"),                    # IDN, A-label öznitelik
+    ("食狮.公司.cn", "公司.cn", "shishi.公司.cn"),
+    ("xn--85x722f.xn--55qx5d.cn", "公司.cn", "shishi.xn--55qx5d.cn"),
+])
+def test_cookie_domain_public_suffix_is_ignored(host, domain, sibling):
+    jar = _jar_from(host, f"sid=evil; Domain={domain}; Path=/")
+    assert len(jar) == 0
+    assert _sent(jar, sibling) == ""
+    assert _sent(jar, host) == ""
+
+
+def test_cookie_last_domain_attribute_wins():
+    jar = _jar_from("example.co.uk", "sid=evil; Domain=example.co.uk; Domain=co.uk")
+    assert len(jar) == 0
+    jar = _jar_from("example.co.uk", "sid=ok; Domain=co.uk; Domain=example.co.uk")
+    assert _sent(jar, "www.example.co.uk") == "sid=ok"
+
+
+@pytest.mark.parametrize("host,domain,shared_with,not_sent_to", [
+    ("example.co.uk", "example.co.uk", "www.example.co.uk", "other.co.uk"),
+    ("login.foo.github.io", "foo.github.io", "foo.github.io", "bar.github.io"),
+    ("x.www.ck", "www.ck", "y.www.ck", "z.ck"),                          # istisna !www.ck
+    ("www.city.kobe.jp", "city.kobe.jp", "city.kobe.jp", "x.kobe.jp"),   # istisna !city.kobe.jp
+    ("a.b.test.ck", "b.test.ck", "c.b.test.ck", "c.test.ck"),
+    ("сайт.пример.рф", "пример.рф", "пример.рф", "другой.рф"),
+    ("сайт.пример.рф", "XN--E1AFMKFD.XN--P1AI", "www.пример.рф", "другой.рф"),
+    ("www.食狮.公司.cn", "食狮.公司.cn", "xn--85x722f.xn--55qx5d.cn", "shishi.公司.cn"),
+])
+def test_cookie_registrable_domain_under_public_suffix_accepted(host, domain, shared_with, not_sent_to):
+    jar = _jar_from(host, f"sid=ok; Domain={domain}")
+    assert _sent(jar, host) == "sid=ok"
+    assert _sent(jar, shared_with) == "sid=ok"
+    assert _sent(jar, not_sent_to) == ""
+
+
+@pytest.mark.parametrize("host,child", [
+    ("github.io", "foo.github.io"),
+    ("co.uk", "example.co.uk"),
+    ("test.ck", "b.test.ck"),
+    ("рф", "пример.рф"),
+])
+def test_cookie_domain_equal_to_public_suffix_host_is_host_only(host, child):
+    jar = _jar_from(host, f"sid=x; Domain={host}")
+    assert _sent(jar, host) == "sid=x"
+    assert _sent(jar, child) == ""
+
+
+def _psl_handler(request):
+    host = request.url.host
+    if host == "evil.co.uk":
+        return Response(302, headers=[
+            ("Location", "https://victim.co.uk/"),
+            ("Set-Cookie", "toss=evil; Domain=co.uk; Path=/"),
+            ("Set-Cookie", "own=1; Domain=evil.co.uk; Path=/"),
+        ])
+    if host == "foo.github.io":
+        return Response(200, headers={"Set-Cookie": "toss=gh; Domain=github.io; Path=/"})
+    if host == "login.example.co.uk":
+        return Response(302, headers=[
+            ("Location", "https://www.example.co.uk/"),
+            ("Set-Cookie", "sid=ok; Domain=example.co.uk; Path=/"),
+        ])
+    return Response(200)
+
+
+def _cookie_of(request):
+    return request.headers.get("cookie") or ""
+
+
+def _check_psl_session_requests(t):
+    reqs = {}
+    for r in t.requests:
+        reqs.setdefault(r.url.host, []).append(_cookie_of(r))
+    assert reqs["victim.co.uk"] == [""]             # yönlendirme ara yanıtındaki çerez
+    assert reqs["www.evil.co.uk"] == ["own=1"]
+    assert reqs["bar.github.io"] == [""]
+    assert reqs["foo.github.io"] == ["", ""]        # yok sayılan çerez host-only da kalmaz
+    assert reqs["www.example.co.uk"] == ["sid=ok"]  # meşru alan-geneli çerez yönlendirmede
+    assert reqs["other.co.uk"] == [""]
+
+
+_PSL_URLS = ["https://evil.co.uk/", "https://www.evil.co.uk/", "https://foo.github.io/",
+             "https://bar.github.io/", "https://foo.github.io/", "https://login.example.co.uk/",
+             "https://other.co.uk/"]
+
+
+def test_sync_session_public_suffix_cookie_not_sent_to_sibling_sites():
+    t = MockTransport(_psl_handler)
+    with Session(transport=t) as s:
+        for url in _PSL_URLS:
+            s.get(url)
+    _check_psl_session_requests(t)
+
+
+def test_async_session_public_suffix_cookie_not_sent_to_sibling_sites():
+    t = MockTransport(_psl_handler)
+
+    async def main():
+        async with AsyncSession(transport=t) as s:
+            for url in _PSL_URLS:
+                await s.get(url)
+    asyncio.run(main())
+    _check_psl_session_requests(t)
 
 
 # ---------------------------------------------------------------------------
