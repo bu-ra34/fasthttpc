@@ -15,7 +15,7 @@ from typing import Callable, Optional
 
 from cryptography.hazmat.primitives import serialization
 
-from netutil import dual_endpoint, refused_port
+from netutil import listen_dual, refused_port
 
 
 @dataclass
@@ -78,38 +78,12 @@ class ThreadedHTTPServer:
         self.conns = 0
         self.errors: "list[BaseException]" = []
         self._lock = threading.Lock()
-        self._socks: "list[socket.socket]" = []
-        for attempt in range(6):
-            # dual_endpoint portu seçip bırakır: paralel süreçte başkası kaparsa bind
-            # EADDRINUSE verir -> yeni portla tekrar; son çare yalnız IPv4, port 0 (yarışsız).
-            hosts, port = dual_endpoint() if attempt < 5 else (["127.0.0.1"], 0)
-            try:
-                port = self._listen(hosts, port)
-                break
-            except OSError:
-                for s in self._socks:
-                    s.close()
-                self._socks = []
-                if attempt == 5:
-                    raise
-        self.port = port
+        self._socks, self.port = listen_dual(16)
         scheme = "https" if ssl_ctx is not None else "http"
         self.base = f"{scheme}://{scheme_host}:{self.port}"
         self._stop = False
         for s in self._socks:
             threading.Thread(target=self._accept, args=(s,), daemon=True).start()
-
-    def _listen(self, hosts: "list[str]", port: int) -> int:
-        for h in hosts:
-            fam = socket.AF_INET6 if ":" in h else socket.AF_INET
-            s = socket.socket(fam, socket.SOCK_STREAM)
-            self._socks.append(s)
-            if fam == socket.AF_INET6:
-                s.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 1)
-            s.bind((h, port))
-            port = s.getsockname()[1]
-            s.listen(16)
-        return port
 
     def close(self) -> None:
         self._stop = True

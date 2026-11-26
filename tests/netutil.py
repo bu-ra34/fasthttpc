@@ -192,6 +192,34 @@ async def start_server(client_connected_cb: Callable[..., Awaitable[Any]], host:
     return await TrackedServer(client_connected_cb)._start(host, port, **kw)
 
 
+def listen_dual(backlog: int = 16) -> "tuple[list[socket.socket], int]":
+    """127.0.0.1 ve ::1'de AYNI portta dinleyen soketler -> (soketler, port).
+
+    ``dual_endpoint`` portu seçip bırakır; paralel bir süreç araya girip portu kaparsa bind
+    EADDRINUSE verir: yeni portla tekrar denenir, son çare yalnız IPv4 ve port 0 (yarışsız).
+    SO_REUSEADDR kullanılmaz (Windows'ta kullanımdaki portu da bağlatır)."""
+    for attempt in range(6):
+        hosts, port = dual_endpoint() if attempt < 5 else (["127.0.0.1"], 0)
+        socks: "list[socket.socket]" = []
+        try:
+            for h in hosts:
+                fam = socket.AF_INET6 if ":" in h else socket.AF_INET
+                s = socket.socket(fam, socket.SOCK_STREAM)
+                socks.append(s)
+                if fam == socket.AF_INET6:
+                    s.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 1)
+                s.bind((h, port))
+                port = s.getsockname()[1]
+                s.listen(backlog)
+            return socks, port
+        except OSError:
+            for s in socks:
+                s.close()
+            if attempt == 5:
+                raise
+    raise AssertionError("ulaşılamaz")
+
+
 async def start_dual(client_connected_cb: Callable[..., Awaitable[Any]], **kw: Any) -> TrackedServer:
     """``start_server`` — 127.0.0.1 ve ::1'de aynı portta.
 
