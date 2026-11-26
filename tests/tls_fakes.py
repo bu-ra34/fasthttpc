@@ -163,6 +163,7 @@ class FakeTLSServer:
 
     flight: şifreli handshake uçuşunun öğeleri; her öğe ("hs", tip) — standart
     mesaj üretilir (20=Finished doğru MAC'le), ("raw", ct, bytes) — ham içerik,
+    ("msg", bytes) — hazır handshake mesajı (transcript'e girer),
     ("record", [öğeler]) — birden fazla mesaj tek record'da.
     """
 
@@ -199,7 +200,8 @@ class FakeTLSServer:
         transcript = ch[5:] + sh
         hs_secret, ck, civ, sk, siv, c_hts, s_hts = P.derive_tls13_keys(
             shared, h(transcript).digest(), key_len, hash_alg=h)
-        self.state = dict(name=name, key_len=key_len, h=h, sk=sk, siv=siv, seq=0, hs_secret=hs_secret)
+        self.state = dict(name=name, key_len=key_len, h=h, sk=sk, siv=siv, seq=0, hs_secret=hs_secret,
+                          ck=ck, civ=civ)
 
         out = plain_records(sh, self.sh_split)
         out += struct.pack("!BHH", 20, 0x0303, 1) + b"\x01"  # uyumluluk CCS
@@ -208,6 +210,9 @@ class FakeTLSServer:
             nonlocal transcript
             if item[0] == "raw":
                 return item[2], item[1]
+            if item[0] == "msg":             # hazır handshake mesajı (transcript'e girer)
+                transcript += item[1]
+                return item[1], 22
             t = item[1]
             if t == 20:
                 fk = P.tls13_hkdf_expand_label(s_hts, "finished", b"", h().digest_size, hash_alg=h)

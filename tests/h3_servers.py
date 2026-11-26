@@ -3,13 +3,19 @@ from __future__ import annotations
 
 import asyncio
 import datetime
+import gzip
 import http.server
 import json
 import socket
 import socketserver
 import ssl
 import threading
+from urllib.parse import parse_qs, urlsplit
 
+try:
+    import brotli
+except ImportError:  # PyPy
+    import brotlicffi as brotli
 from cryptography import x509
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import ec
@@ -131,7 +137,13 @@ class _H3Server(QuicConnectionProtocol):
             # Yanıtı ver, ardından GOAWAY(id) (varsayılan: sonraki istemci akışı).
             gid = int(path.split("=")[1]) if "=" in path else sid + 4
             self._send_goaway(gid)
-        if path.startswith("/big"):
+        if path.startswith("/bomb"):
+            # /bomb?enc=gzip|br&n=N: N sıfır baytı sıkıştırılmış (Content-Encoding) gövde
+            q = {k: v[0] for k, v in parse_qs(urlsplit(path).query).items()}
+            enc, ham = q.get("enc", "gzip"), bytes(int(q.get("n", "1048576")))
+            body = gzip.compress(ham) if enc == "gzip" else brotli.compress(ham)
+            extra.append((b"content-encoding", enc.encode()))
+        elif path.startswith("/big"):
             body = b"x" * int(path.split("=")[1])
         elif path.startswith("/chunks"):
             asyncio.ensure_future(self._chunks(sid))

@@ -18,7 +18,7 @@ from typing import (
 )
 from .headers import Headers
 from ..streaming import (
-    IncrementalDecoder, LineSplitter, Rechunker, TextRechunker,
+    DEFAULT_MAX_DECOMPRESSED_SIZE, IncrementalDecoder, LineSplitter, Rechunker, TextRechunker,
     StreamConsumed, StreamClosed, ResponseNotRead,
 )
 
@@ -118,6 +118,10 @@ class Response:
     # İstek metrikleri: yalnızca ağ yolunda atanır (mock/transport yanıtında YOK;
     # ``hasattr(r, "metrics")`` ile denetlenir), bu yüzden sınıfta varsayılanı yoktur.
     metrics: "RequestMetrics"
+
+    # Akış gövdesi açılırken üst sınır (``Limits.max_decompressed_size``); oturum kendi
+    # ayarını akış yanıtına yazar. Aşılınca iter_*/content DecompressedSizeError verir.
+    _max_decompressed_size: Optional[int] = DEFAULT_MAX_DECOMPRESSED_SIZE
 
     def __init__(
         self,
@@ -252,7 +256,8 @@ class Response:
 
     def _get_decoder(self) -> IncrementalDecoder:
         if self._decoder is None:
-            self._decoder = IncrementalDecoder(self.headers.get("content-encoding", "") or "")
+            self._decoder = IncrementalDecoder(self.headers.get("content-encoding", "") or "",
+                                               self._max_decompressed_size)
         return self._decoder
 
     def _raw_chunks(self) -> Iterator[bytes]:
@@ -276,19 +281,17 @@ class Response:
             yield c
 
     def _decoded(self) -> Iterator[bytes]:
-        """Açılmış parçalar (senkron üreteç)."""
+        """Açılmış parçalar (senkron üreteç). Her parça sınırlıdır (~64 KiB); açıcıda
+        bekleyen çıktı (yarıda bırakılmış önceki okuma) önce verilir."""
         if self._body is not None:
             if self._body:
                 yield self._body
             return
         dec = self._get_decoder()
+        yield from dec.decode_iter(b"")
         for c in self._raw_chunks():
-            out = dec.decode(c)
-            if out:
-                yield out
-        tail = dec.flush()
-        if tail:
-            yield tail
+            yield from dec.decode_iter(c)
+        yield from dec.flush_iter()
 
     @staticmethod
     def _drive(gen: Iterable[_T], rc: _Chunker[_T]) -> Iterator[_T]:
@@ -411,13 +414,13 @@ class Response:
                 yield self._body
             return
         dec = self._get_decoder()
+        for out in dec.decode_iter(b""):
+            yield out
         async for c in self._araw_chunks():
-            out = dec.decode(c)
-            if out:
+            for out in dec.decode_iter(c):
                 yield out
-        tail = dec.flush()
-        if tail:
-            yield tail
+        for out in dec.flush_iter():
+            yield out
 
     @staticmethod
     async def _adrive(agen: AsyncIterable[_T], rc: _Chunker[_T]) -> AsyncIterator[_T]:

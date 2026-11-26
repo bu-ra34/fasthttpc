@@ -8,7 +8,6 @@ from typing import Any, Optional
 
 from .._backend import current_backend
 from ..models.headers import Headers
-from ..streaming import decode_body
 from ..security.cert_validator import CertificateValidationError
 from .altsvc import AltSvcCache
 from .core import Http3ConnectError, Http3Error, Http3RequestRefused
@@ -41,7 +40,10 @@ def require_aioquic() -> None:
 
 
 def convert_response(raw_headers, body: bytes):
-    """aioquic başlık listesi -> (status, Headers, çözülmüş gövde)."""
+    """aioquic başlık listesi -> (status, Headers, HAM gövde).
+
+    Content-Encoding burada AÇILMAZ: oturum, kendi ``Limits.max_decompressed_size``
+    sınırıyla açar (async yol eskiden gövdeyi burada ve oturumda iki kez açmaya çalışıyordu)."""
     status = 0
     headers = Headers()
     for k, v in raw_headers or []:
@@ -51,8 +53,7 @@ def convert_response(raw_headers, body: bytes):
                 status = int(v)
             continue
         headers.add(ks, v.decode("latin-1"))
-    body = decode_body(bytes(body), headers.get("content-encoding", "").lower())
-    return status, headers, body
+    return status, headers, bytes(body)
 
 
 class Http3State:
@@ -100,7 +101,7 @@ def _cert_error(e: BaseException) -> "Optional[CertificateValidationError]":
 
 
 class SyncHttp3:
-    """Sync Session için: ``exchange`` -> (status, Headers, body) ya da None (h2'ye düş)."""
+    """Sync Session için: ``exchange`` -> (status, Headers, ham body) ya da None (h2'ye düş)."""
 
     def __init__(self, opts: Http3Options, ca_path, impersonate):
         require_aioquic()
