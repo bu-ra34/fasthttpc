@@ -121,3 +121,21 @@ def test_async_bellek_sabit_50mb(sv):
                 tracemalloc.stop()
                 assert toplam == n and tepe < 10 * 1024 * 1024, f"{yol}: {tepe / 1e6:.1f} MB"
     run(main())
+
+
+@pytest.mark.parametrize("kind", ["raw", "bytes", "text", "lines"])
+def test_async_aclose_yarida_birakilan_iteratoru_kapatir(sv, kind):
+    """aclose() yarıda bırakılmış aiter_* üretecini (ve iç üreteçlerini) kapatır: çöp
+    toplayıcıya kalan üreteç trio'da ResourceWarning olurdu, asyncio'da sonlandırması döngü
+    kapandıktan sonraya kalabilirdi."""
+    async def main():
+        async with S(sv) as s:
+            r = await s.get(sv.url + "/lines?n=5&d=0.05", stream=True)
+            it = {"raw": r.aiter_raw, "bytes": r.aiter_bytes, "text": r.aiter_text,
+                  "lines": r.aiter_lines}[kind]()
+            assert await it.__anext__()
+            await r.aclose()
+            assert it.ag_frame is None                   # üreteç bitti (kapatıldı)
+            with pytest.raises(StopAsyncIteration):
+                await it.__anext__()
+    run(main())

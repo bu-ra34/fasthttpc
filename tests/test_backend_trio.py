@@ -54,6 +54,17 @@ def srvloop():
     s.close()
 
 
+def test_sunucu_dongusu_ana_is_parcaciginda_wakeup_fd_kurmaz(srvloop):
+    """Windows CI regresyonu: ana iş parçacığında oluşturulan ProactorEventLoop
+    ``signal.set_wakeup_fd``'yi kendi soketine çevirir; ardından ana iş parçacığında koşan
+    trio "signal handling code might have collided" RuntimeWarning'i verir (29 uyarı).
+    Sunucu döngüsü kendi iş parçacığında kurulmalı: ana iş parçacığının wakeup fd'si boş."""
+    import signal
+    old = signal.set_wakeup_fd(-1)
+    signal.set_wakeup_fd(old)
+    assert old == -1
+
+
 def run_client(backend, fn, timeout=20):
     async def main():
         with anyio.fail_after(timeout):
