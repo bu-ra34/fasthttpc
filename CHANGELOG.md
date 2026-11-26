@@ -36,6 +36,18 @@
   okunur; `gzip`/`deflate` aktarım kodlamaları açılır. HTTP/1.0 yanıtında TE
   varsa çerçeveleme bozuk sayılır: gövde kapanışa kadar okunur, bağlantı
   kapatılır.
+- **Çerez `Domain=` için Public Suffix List (FHC-08):** öznitelik artık pakete
+  gömülü bir Public Suffix List anlık görüntüsüyle (ICANN ve PRIVATE bölümleri,
+  tarayıcılar gibi) denetleniyor. Eskiden `evil.co.uk`'nin `Domain=co.uk`,
+  `foo.github.io`'nun `Domain=github.io` (ya da `herokuapp.com`, `рф` ...)
+  çerezi o sonekin altındaki bütün sitelere gidiyordu; artık RFC 6265 §5.3
+  adım 5 gereği tümden yok sayılıyor. Öznitelik istek host'una eşitse (ör.
+  doğrudan `github.io`'ya yapılan istek) çerez host-only kalır. Joker (`*.ck`),
+  istisna (`!www.ck`) ve varsayılan `*` kuralı resmi algoritmaya göre
+  uygulanıyor; IDN adlar liste ve host tarafında aynı fonksiyonla A-label'a
+  (punycode) çevrilip büyük/küçük harf ve sondaki nokta gözetilmeden
+  karşılaştırılıyor. `Session`, `AsyncSession` ve yönlendirme ara yanıtlarında
+  konan çerezler aynı denetimden geçiyor.
 
 ### Davranış değişikliği
 - **`Session` iş parçacığı güvenli:** tek oturum birden çok iş parçacığından aynı
@@ -76,6 +88,23 @@
   dizeleri ve SETTINGS/WINDOW_UPDATE/PRIORITY değişmedi.
 - Chrome ve Firefox profillerinde `Cookie` başlığı HTTP/2'de tarayıcı gibi
   parçalara bölünerek gönderilir (RFC 9113 §8.2.3); sunucu yine tek başlık görür.
+- Genel sonek olan `Domain=` taşıyan çerez (tek etiketli `com`, `local` dahil)
+  artık host-only olarak saklanmıyor, hiç saklanmıyor (FHC-03'te host-only
+  kalıyordu; tarayıcılar da reddeder).
+- İstek host'unun domain-match etmediği `Domain=` (`evil.com`'dan
+  `Domain=bank.com`, `example.com`'dan `Domain=a.example.com`) taşıyan çerez de
+  artık host-only kalmıyor, tümden yok sayılıyor (RFC 6265 §5.3 adım 6;
+  Chromium ve Firefox da reddeder).
+- IP host'ta `Domain=` IP'nin kendisiyse (IPv6'da URL'deki gibi köşeli
+  parantezli: `[::1]`) çerez host-only; başka her değerde çerez yok sayılıyor
+  (eskiden host-only kalıyordu). Davranış Chromium
+  (`net/cookies/cookie_util.cc`, `GetCookieDomainWithString`) ve Firefox
+  (`netwerk/cookie/CookieValidation.cpp`, `CookieValidation::CheckDomain`)
+  kaynağından doğrulandı.
+- Birden çok `Domain=` özniteliği varsa sonuncusu geçerli (RFC 6265 §5.3 adım 4).
+- Host-only çerezin alan adı kanonik biçimde saklanıyor (küçük harf, sondaki
+  nokta yok, IDN için A-label); `CookieJar.header_for()` Unicode host da kabul
+  ediyor.
 
 ### Eklenenler
 - `Session.pool_stats()` girdilerinde `in_use` (kirada bağlantı sayısı).
@@ -140,6 +169,16 @@
   bilet olan/olmayan sunucuyla ve gövdesi "HelloRequest, dev uzunluk" gibi
   görünen şifreli Finished'la (sahte sunucu nonce'u seçer) sync ve async
   sınanır. Son varyant düzeltme öncesi koddaki hatayı her seferinde üretir.
+- `tests/test_psl.py`: resmi PSL test vektörleri (upstream `tests/test_psl.txt`,
+  dosyaya kopyalandı), joker/istisna, IDN, tembel ve thread-safe yükleme, paketlenmiş
+  dosyanın içeriği ve güncelleme betiği (uydurma, küçük bir listeyle).
+- `tests/test_security_audit.py` (F8): `co.uk`, `github.io`, `herokuapp.com`,
+  joker/istisna ve IDN (`рф`, `公司.cn`) senaryoları; host'un kendisi genel
+  sonekse host-only çerez; `Session` ve `AsyncSession` ile yönlendirme ara
+  yanıtında konan çerezin kardeş sitelere gitmediği. FHC-03 testleri yeni
+  davranışa göre sıkılaştırıldı: `Domain=com`, IP host'ta IP'den farklı
+  `Domain=` ve host'un domain-match etmediği `Domain=` taşıyan çerez artık
+  tümden yok sayılıyor; IP'ye eşit `Domain=` host-only çerez veriyor.
 
 ### Değişti
 - **Parmak izi DEĞİŞMEDİ:** her profilin supported_groups listesi ve ilk
@@ -181,6 +220,9 @@
 - `usage.md`: "Using one `Session` from many threads" (garantiler, kilit tasarımı,
   `close()` anlamı); `timeouts-limits-retries.md`: senkron `write`; `limits.md`,
   `migration-requests.md`, README'ler güncellendi.
+- `docs/security-audit.md`: FHC-08 kapatıldı, FHC-03'e not eklendi.
+  `docs/usage.md` çerez bölümü, README ve README.tr (lisans, sınırlar,
+  geliştirme) güncellendi.
 
 ### Düzeltmeler
 - Havuz: `release()` idempotent; aynı bağlantının ikinci iadesi semaphore'u bir
@@ -255,10 +297,29 @@
   hemen kapatılıyor ve aynı bağlantıda süren istekler "bağlantı kapatıldı"
   hatasıyla düşüyordu. Bağlantı artık son akışı bitince kapanır.
 
+### Paketleme
+- Liste `fasthttpc/public_suffix_list.dat.gz` olarak wheel ve sdist'te: sürüm
+  `2026-11-23_15-54-01_UTC`, upstream commit
+  `faf981a207f390881e6c3bcc7b9a1d57b8db066f`, 10.472 kural. Yorumlar atılmış,
+  IDN'ler A-label'a çevrilmiş ve gzip'lenmiş haliyle ~44 KB; wheel ~48 KB
+  büyüdü. Yeni bağımlılık yok, çalışma anında ağa çıkılmıyor.
+- Liste `import fasthttpc` sırasında değil, `Domain=` içeren ilk `Set-Cookie`'de
+  süreç başına bir kez (thread-safe) yükleniyor: ~8 ms, ~1 MB bellek; sonraki
+  aramalar küme sorgusu (~1 µs). `import fasthttpc` süresi değişmedi.
+- Liste dosyası Mozilla Public License 2.0 altında: `LICENSE-PSL` eklendi,
+  paketin lisans ifadesi `MIT AND MPL-2.0` oldu (MPL yalnızca bu dosya için;
+  kodun geri kalanı MIT).
 
 ### Bağımlılıklar
 - `brotli` / `brotlicffi` en az 1.2 (`output_buffer_limit` için). Daha eski bir
   sürüm kuruluysa girdi küçük dilimlerle verilir; sınır yine geçerlidir.
+
+### Araçlar
+- `scripts/update_psl.py`: listeyi publicsuffix.org'dan indirir (ya da
+  `--input` ile yerel dosyayı okur) ve paketlenmiş dosyayı yeniden üretir.
+  Biçimi denetler (joker yalnızca en soldaki etiket, iki bölüm de var, MPL
+  bildirimi, VERSION/COMMIT satırları) ve aynı listeden bayt bayt aynı dosyayı
+  üretir. Testler ağa çıkmaz.
 
 ## [0.7.0] — 2026-11-16
 

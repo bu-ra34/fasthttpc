@@ -36,6 +36,9 @@ def test_sunucu_baska_domain_icin_cerez_koyamaz():
     """evil.com, bank.com için Set-Cookie gönderemez."""
     jar = _jar("a=1; Domain=bank.com", host="evil.com")
     assert jar.header_for("bank.com", "/", secure=True) == ""
+    # RFC 6265 §5.3 adım 6: host-only olarak da saklanmaz, tümden yok sayılır.
+    assert jar.header_for("evil.com", "/", secure=True) == ""
+    assert len(jar) == 0
 
 
 def test_secure_cerez_duz_http_ile_gonderilmez():

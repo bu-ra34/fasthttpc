@@ -152,7 +152,27 @@ with Session(resolver=DoHResolver(provider="cloudflare")) as s:
 
 ## Cookies and caching
 
-Cookies follow RFC 6265 (domain, path, `Secure`). `Domain=` is ignored for IP
-hosts and single-label suffixes such as `com`, but there is no Public Suffix
-List, so multi-label suffixes (`co.uk`) are still accepted. Pass `cache=True` (or a
-`ResponseCache`) to enable a response cache with conditional requests.
+Cookies follow RFC 6265 (domain, path, `Secure`). As in browsers, a cookie is
+ignored when its `Domain=` is not the request host or one of its parent domains
+(`evil.com` sending `Domain=bank.com`). On an IP host, `Domain=` must be the IP
+itself (IPv6 in brackets, `[::1]`), which gives a host-only cookie; any other
+value makes the cookie be ignored. Like browsers, fasthttpc also checks `Domain=`
+against the [Public Suffix List](https://publicsuffix.org/): a cookie whose
+`Domain` is a public suffix (`com`, `co.uk`, `github.io`, `herokuapp.com`,
+`рф`, ...) is ignored, so `evil.co.uk` cannot set a cookie that would be sent
+to every other `.co.uk` site. If the attribute equals the request host (a
+request to `github.io` itself), the cookie is kept as host-only. Both the ICANN
+and the PRIVATE sections of the list are used, and IDN names are compared as
+A-labels (`пример.рф` and `xn--e1afmkfd.xn--p1ai` are the same host).
+
+The list is a snapshot shipped inside the package
+(`fasthttpc/public_suffix_list.dat.gz`, about 44 KB, MPL-2.0); its upstream
+`VERSION` and `COMMIT` are at the top of the decompressed file, and the
+changelog names the snapshot a release ships. It is never downloaded at
+runtime and is parsed once per process (about 8 ms), on the first `Set-Cookie`
+with a `Domain` attribute. To refresh it, run `python scripts/update_psl.py` in
+a checkout of the repository (it downloads the list from publicsuffix.org,
+checks its format and rewrites the file), then commit the regenerated file.
+
+Pass `cache=True` (or a `ResponseCache`) to enable a response cache with
+conditional requests.
