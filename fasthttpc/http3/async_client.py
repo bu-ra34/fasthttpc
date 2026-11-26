@@ -10,7 +10,8 @@ import time
 from typing import AsyncIterator, Optional
 
 from ..security.cert_validator import CertificateValidationError
-from .core import H3Core, Http3ConnectError, Http3Error, Http3RequestRefused, authority_for
+from .core import (H3Core, Http3ConnectError, Http3Error, Http3RequestRefused, address_probe_window,
+                   authority_for)
 from .options import Http3Options
 
 
@@ -108,7 +109,7 @@ class AsyncH3Connection:
             if remaining <= 0:
                 break
             try:
-                await self._attempt(family, addr, remaining / (len(addrs) - i))
+                await self._attempt(family, addr, deadline, address_probe_window(remaining, len(addrs) - i))
                 return
             except Http3ConnectError as e:
                 last = e
@@ -116,7 +117,7 @@ class AsyncH3Connection:
                     raise
         raise last or Http3ConnectError("QUIC el sıkışması zaman aşımı")
 
-    async def _attempt(self, family, addr, timeout: float) -> None:
+    async def _attempt(self, family, addr, deadline: float, probe: "Optional[float]") -> None:
         o = self._opts
         host, port = self.origin
         try:
@@ -133,7 +134,14 @@ class AsyncH3Connection:
         self.core.connect(addr)
         self._after_event()
         try:
-            await asyncio.wait_for(self._wait_handshake(), timeout)
+            if probe is not None:
+                try:
+                    await asyncio.wait_for(self._wait_first_response(),
+                                           min(probe, deadline - time.monotonic()))
+                except asyncio.TimeoutError:
+                    if self.core.datagrams_received == 0:
+                        raise asyncio.TimeoutError(f"{probe:.2f} sn içinde yanıt yok") from None
+            await asyncio.wait_for(self._wait_handshake(), max(0.0, deadline - time.monotonic()))
         except (asyncio.TimeoutError, Http3Error) as e:
             err = self.core.error
             await self.close()
@@ -144,6 +152,11 @@ class AsyncH3Connection:
             err = self.core.error
             await self.close()
             raise err or Http3ConnectError("QUIC el sıkışması başarısız")
+
+    async def _wait_first_response(self) -> None:
+        core = self.core
+        while not (core.handshake_done or core.closed or core.datagrams_received):
+            await self._wait_state()
 
     async def _wait_handshake(self) -> None:
         while not (self.core.handshake_done or self.core.closed):

@@ -510,6 +510,115 @@ def test_multi_address_fallthrough(pki, h3, monkeypatch, kind):
             silent.close()
 
 
+# --- Adres başına süre bütçesi (belirlenimli: sahte saat, ağ yok) ---------------------------
+
+def test_address_probe_window_sinirli_ve_son_adres_sinirsiz():
+    from fasthttpc.http3.core import ADDRESS_PROBE_TIMEOUT, address_probe_window
+    assert address_probe_window(4.0, 2) == ADDRESS_PROBE_TIMEOUT == 1.0
+    assert address_probe_window(1.0, 2) == 0.5            # kısa toplam sürede eşit pay
+    assert address_probe_window(0.3, 3) == pytest.approx(0.1)
+    assert address_probe_window(4.0, 1) is None           # son adres: kalanın tamamı
+    assert address_probe_window(-1.0, 2) == 0.0
+
+
+class _FakeClock:
+    def __init__(self):
+        self.t = 1000.0
+
+    def __call__(self):
+        return self.t
+
+
+def _two_addrs(monkeypatch, mod):
+    infos = [(socket.AF_INET, socket.SOCK_DGRAM, 17, "", ("127.0.0.1", 1)),
+             (socket.AF_INET, socket.SOCK_DGRAM, 17, "", ("127.0.0.1", 2))]
+    monkeypatch.setattr(mod.socket, "getaddrinfo", lambda *a, **k: infos)
+    return infos
+
+
+@pytest.mark.parametrize("ilk", ["sessiz", "icmp_red"])
+def test_sync_cok_adres_butcesi_son_adres_kalani_alir(monkeypatch, ilk):
+    """Windows CI regresyonu: ilk adres sessizken (ya da ICMP reddi bildirilmeyip yanıt
+    gelmezken) payının tamamını değil en fazla ADDRESS_PROBE_TIMEOUT'u harcar; hızlı
+    reddedilirse kullanılmayan süre sonraki adrese kalır. Son adres kalanın tamamını alır."""
+    from fasthttpc.http3 import sync_client
+    from fasthttpc.http3.core import Http3ConnectError
+    clock = _FakeClock()
+    monkeypatch.setattr(sync_client.time, "monotonic", clock)
+    _two_addrs(monkeypatch, sync_client)
+    calls = []
+
+    def fake_attempt(self, family, addr, deadline, probe):
+        calls.append((addr[1], round(deadline - clock.t, 6), probe))
+        if addr[1] == 1:
+            clock.t += probe if ilk == "sessiz" else 0.01      # sessiz: pencere sonuna kadar
+            raise Http3ConnectError("yanıt yok")
+
+    monkeypatch.setattr(sync_client.SyncH3Connection, "_attempt", fake_attempt)
+    c = sync_client.SyncH3Connection("localhost", 443, "localhost", 443, ca_path=None,
+                                     impersonate=None, opts=Http3Options(connect_timeout=4.0))
+    c.connect()
+    assert calls[0] == (1, 4.0, 1.0)
+    assert calls[1] == (2, 3.0 if ilk == "sessiz" else 3.99, None)
+
+
+def test_async_cok_adres_butcesi_son_adres_kalani_alir(monkeypatch):
+    from fasthttpc.http3 import async_client
+    from fasthttpc.http3.core import Http3ConnectError
+    clock = _FakeClock()
+    monkeypatch.setattr(async_client.time, "monotonic", clock)
+    infos = [(socket.AF_INET, socket.SOCK_DGRAM, 17, "", ("127.0.0.1", 1)),
+             (socket.AF_INET, socket.SOCK_DGRAM, 17, "", ("127.0.0.1", 2))]
+    calls = []
+
+    async def fake_attempt(self, family, addr, deadline, probe):
+        calls.append((addr[1], round(deadline - clock.t, 6), probe))
+        if addr[1] == 1:
+            clock.t += probe
+            raise Http3ConnectError("yanıt yok")
+
+    monkeypatch.setattr(async_client.AsyncH3Connection, "_attempt", fake_attempt)
+
+    async def go():
+        async def fake_gai(*a, **k):
+            return infos
+        monkeypatch.setattr(asyncio.get_running_loop(), "getaddrinfo", fake_gai)
+        c = async_client.AsyncH3Connection("localhost", 443, "localhost", 443, ca_path=None,
+                                           impersonate=None, opts=Http3Options(connect_timeout=4.0))
+        await c.connect()
+    asyncio.run(go())
+    assert calls == [(1, 4.0, 1.0), (2, 3.0, None)]
+
+
+def test_yanitsiz_adres_yoklama_penceresinde_birakilir(monkeypatch):
+    """Gerçek soket: yanıt vermeyen adreste el sıkışması toplam süreyi değil yalnızca
+    yoklama penceresini bekler (sync ve async)."""
+    from fasthttpc.http3.async_client import AsyncH3Connection
+    from fasthttpc.http3.core import Http3ConnectError
+    from fasthttpc.http3.sync_client import SyncH3Connection
+    silent = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    silent.bind(("127.0.0.1", 0))
+    addr = silent.getsockname()
+    kw = dict(ca_path=None, impersonate=None, opts=Http3Options(connect_timeout=30.0))
+    try:
+        c = SyncH3Connection("localhost", addr[1], "127.0.0.1", addr[1], **kw)
+        t = time.monotonic()
+        with pytest.raises(Http3ConnectError, match="yanıt yok"):
+            c._attempt(socket.AF_INET, addr, time.monotonic() + 30.0, 0.3)
+        assert time.monotonic() - t < 10.0          # 30 sn'lik toplam sürenin çok altında
+
+        async def go():
+            a = AsyncH3Connection("localhost", addr[1], "127.0.0.1", addr[1], **kw)
+            a.loop = asyncio.get_running_loop()
+            t = time.monotonic()
+            with pytest.raises(Http3ConnectError, match="yanıt yok"):
+                await a._attempt(socket.AF_INET, addr, time.monotonic() + 30.0, 0.3)
+            assert time.monotonic() - t < 10.0
+        asyncio.run(go())
+    finally:
+        silent.close()
+
+
 def test_multi_address_all_dead_fails_within_timeout(pki, monkeypatch):
     s1 = socket.socket(socket.AF_INET, socket.SOCK_DGRAM); s1.bind(("127.0.0.1", 0))
     port = s1.getsockname()[1]            # sessiz adres; ikinci adres: kapalı port
