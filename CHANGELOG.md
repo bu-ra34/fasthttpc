@@ -54,6 +54,46 @@
 - `tests/test_interop_kex_groups.py`: `openssl s_server -groups` karşısında her
   grup × TLS 1.3/1.2 × senkron/async. Yerel openssl bir grubu tanımıyorsa test
   gerekçesiyle atlanır.
+- **Uyarısız ve katı test takımı:** `pyproject.toml`'da `filterwarnings = ["error"]`;
+  her uyarı (sızan soket/dosya/olay döngüsü için ResourceWarning, `__del__` ve
+  iş parçacığı istisnaları dahil) testi düşürür. Tek istisna dar kapsamlı ve
+  gerekçeli: tlslite-ng'nin Python 3.10/3.11'de asyncore'u içe aktaran
+  `tlsasyncdispatchermixin` modülünün DeprecationWarning'i. cryptography'nin FFDH
+  uyarısı için giriş gerekmez (kütüphane kendi çağrısında dar filtreyle susturur).
+- Python 3.10/3.11'deki `PytestUnraisableExceptionWarning` ("Event loop is closed",
+  `start_h2.<locals>.on_conn`): sahte sunucuların bağlantı görevleri olay döngüsünden
+  uzun yaşıyordu (3.10/3.11'de `Server.wait_closed()` görevleri beklemez ve onlara
+  güçlü referans tutulmaz; iş parçacığındaki döngüler hiç kapatılmıyordu). Yeni
+  `tests/netutil.py` yardımcıları: `TrackedServer` (bağlantı görevlerini ve
+  yazıcıları izler; `wait_closed`/`async with`/döngü kapanışında iptal edip bekler,
+  yazıcıları kapatır), `LoopThread` (iş parçacığındaki döngüyü görevleri iptal edip
+  kapatır), `close_loop`. h2 sahte sunucusunun el sıkışma beklemesi bağlantı TLS
+  bitmeden kapanınca sonsuza dek dönmüyor; pompa görevi beklenerek bitiriliyor.
+- Windows 3.12'deki 29 `RuntimeWarning` (trio "signal handling code might have
+  collided"): `test_backend_trio`'nun sunucu döngüsü ana iş parçacığında
+  oluşturuluyordu; Windows'un ProactorEventLoop'u orada `signal.set_wakeup_fd`'yi
+  kendi soketine çevirip kapanana dek bırakmıyordu. Döngü artık kendi iş
+  parçacığında kuruluyor (regresyon testi ana iş parçacığının wakeup fd'sini denetler).
+- Kapatılmayan soket/dosya/döngüler: stdlib `ssl` ile sarılan sunucu soketleri
+  (`wrap_socket` ham soketi devralır; kapatılan ham soketti), hiç kapatılmayan
+  dinleyiciler ve sahte proxy tünelleri, `TLSAdapter.negotiate` hata verince
+  çağıranın kapatması gereken ham soketler, tlslite sunucusunun PEM dosyaları, HTTP/3
+  test sunucusunun döngüsü. TLS 1.2 stdlib sunucusu okunmamış veriyle kapatırken RST
+  yerine FIN + boşaltma (`netutil.linger_close`) kullanır.
+- `openssl s_server` çıktı pompası yarışı (ara sıra `PytestUnhandledThreadExceptionWarning`,
+  ör. "PyMemoryView_FromBuffer(): info->buf must not be NULL"): kapanışta boru, pompa
+  iş parçacığı `readline()` içindeyken kapatılıyordu. Artık süreç öldürülür, pompa
+  EOF'a ulaşıp bitene kadar beklenir, sonra borular kapanır; pompa yeniden denemede
+  değişen `self.proc` yerine kendi borusunu okur.
+- **Paralel test süreçlerinde port yarışları:** `openssl s_server` artık
+  `-accept 127.0.0.1:0` ile başlar ve gerçek port `ACCEPT` satırından okunur; hazır
+  olma da bu satırla anlaşılır (eskiden seçilip bırakılan port araya giren başka bir
+  sunucuya gidebiliyor, yoklama o yabancı sunucuya bağlanıp "hazır" sanıyordu —
+  `test_sadece_p256_sunan_sunucu_hrr_yolu` gibi testlerin paralel koşuda düşmesi).
+  "Kapalı port" testleri bağlı ama dinlemeyen, süreç boyunca ayrılmış bir port
+  kullanır (`netutil.refused_port`); çift yığınlı (127.0.0.1 + ::1) dinleyiciler port
+  kapılırsa yeni portla yeniden dener (`netutil.listen_dual`, `start_dual`).
+  Dört tam takım aynı makinede eşzamanlı koşarak doğrulandı.
 
 ### Değişti
 - **Parmak izi DEĞİŞMEDİ:** her profilin supported_groups listesi ve ilk
@@ -100,6 +140,19 @@
   isteğinde aioquic'in `ConnectionConfigurationError`'ı olarak çıkıyordu.
   0,001 sn'nin altındaki, negatif, sonsuz ya da NaN değer artık her aioquic
   sürümünde oturum kurulurken `ValueError` verir.
+- **HTTP/3 çok adresli bağlantıda süre bütçesi:** kalan süre adreslere eşit
+  bölünüyordu; sessiz (ya da ICMP reddi bildirilmeyen) ilk adres payının tamamını
+  harcıyor, çalışan son adrese soğuk bir QUIC el sıkışması için yetmeyen süre
+  kalıyordu (Windows CI'da `test_multi_address_fallthrough[icmp_refused|silent]`
+  ~1,98 sn'de zaman aşımı). Artık son olmayan bir adres en fazla
+  `min(1 sn, kalan / kalan_adres)` boyunca hiç yanıt gelmezse bırakılır; yanıt veren
+  adresin el sıkışması kalan toplam sürenin tamamını kullanabilir; son adres kalanın
+  tamamını alır (sync ve async). Belirlenimli (sahte saatli) testler eklendi.
+- **`Response.aclose()` yarıda bırakılan `aiter_*` üreteçlerini kapatır** (iç
+  üreteçler dahil, `aread()` da kendi üretecini kapatır). Önceden çöp toplayıcıya
+  kalıyorlardı: trio altında "Async generator ... was garbage collected" ResourceWarning,
+  asyncio'da sonlandırması olay döngüsü kapandıktan sonraya kalabiliyordu.
+  `aiter_lines()` artık `async def` değil, üreteç döndüren normal metot (kullanım aynı).
 
 
 ## [0.7.0] — 2026-11-16
