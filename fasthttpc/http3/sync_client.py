@@ -110,6 +110,15 @@ class SyncH3Connection:
                 self._sock.close()
                 self._sock = None
             raise Http3ConnectError(f"UDP soketi açılamadı: {e}", e) from e
+        ok = False
+        try:
+            self._handshake_on(addr, host, port, o, deadline, probe)
+            ok = True
+        finally:
+            if not ok:
+                self.close()            # bu denemenin soketi her çıkış yolunda kapanır
+
+    def _handshake_on(self, addr, host, port, o, deadline: float, probe: "Optional[float]") -> None:
         self.core = H3Core(host, port, ca_path=self._ca_path, impersonate=self._impersonate,
                            idle_timeout=o.idle_timeout, clock=time.monotonic)
         self._target = addr

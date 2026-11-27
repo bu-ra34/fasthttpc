@@ -225,6 +225,10 @@
   zaman aşımına uğrar; orada port seçilip bırakılır; çift yığınlı (127.0.0.1 + ::1) dinleyiciler port
   kapılırsa yeni portla yeniden dener (`netutil.listen_dual`, `start_dual`).
   Dört tam takım aynı makinede eşzamanlı koşarak doğrulandı.
+- HTTP/3 test sunucusu (`tcp=True`) aynı numarada TCP+UDP portu bulamazsa (Windows'ta
+  TCP için ayrılmış geniş port aralıkları) TCP'yi başka portta açar, Alt-Svc UDP portunu
+  ilan eder. PTO testinin süre sınırı aioquic'ten türetilir (kayıpsız el sıkışması +
+  2 x PTO, PTO = 2 x `initial_rtt`) ve tek adresle ölçülür.
 - **Test başına zaman sınırı:** `pytest-timeout` geliştirme bağımlılığı oldu
   (`.[dev]`); `pyproject.toml`'da `timeout = 120`, `timeout_method = "thread"`
   (Windows'ta da çalışır, tüm iş parçacıklarının yığınını döker). CI test işine
@@ -436,7 +440,14 @@
   döngü sonunda taşıma yarım kalıyordu (Windows CI: açık UDP soketi,
   `_ProactorBasePipeTransport.__del__` ResourceWarning, 24 test). Artık protokolün
   `connection_lost`'u (en fazla 2 sn) beklenir; retire edilen bağlantılar da ancak
-  taşımaları kapanınca "bitti" sayılır ve oturum kapanışında beklenir.
+  taşımaları kapanınca "bitti" sayılır ve oturum kapanışında beklenir. CPython 3.12
+  `_ProactorDatagramTransport` hatası: close() sırasında süren bir yazma (az önce
+  gönderilen CONNECTION_CLOSE) varsa `_loop_writing` `_conn_lost`'u görüp erken döner,
+  connection_lost hiç çağrılmaz; Proactor'da close()'un ardından abort() çağrılır, diğer
+  döngülerde kapanış takılırsa süre yarısında abort() ile zorlanır. Çok adresli
+  bağlantıda her adres denemesi kendi taşımasını/soketini her çıkış yolunda (hata, zaman
+  aşımı, iptal) kapatır ve kapanışı bekler (sync ve async); el sıkışması süren bağlantılar
+  da oturum kapanışında kapatılır.
 - **Async HTTP/3: kurulu bağlantıda UDP hatası bağlantıyı düşürür.** Önceden yalnızca
   el sıkışması sırasında dikkate alınıyordu; sonradan gelen ICMP reddinde (ya da
   Windows ProactorEventLoop'ta okumayı durduran herhangi bir alım hatasında) bağlantı

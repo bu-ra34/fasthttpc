@@ -192,6 +192,7 @@ class H3TestServer:
         self._ready = threading.Event()
         self._stop = None
         self.tcp_hits = 0
+        self.tcp_port = 0       # tcp=True: h1 sunucusunun portu (genelde UDP ile aynı numara)
 
     def start(self):
         self._exc = None
@@ -230,13 +231,18 @@ class H3TestServer:
                 if not self.tcp:
                     break
                 try:
-                    self._start_tcp()
+                    self._start_tcp(self.port)
                     break
                 except OSError:
                     srv.close()
                     self.port = 0
             else:
-                raise OSError("aynı numarada TCP+UDP portu bulunamadı")
+                # Windows'ta TCP için ayrılmış (excludedportrange) geniş aralıklar UDP'nin
+                # verdiği numaraları sık sık kapsar: aynı numara bulunamazsa TCP başka portta
+                # dinler; Alt-Svc ({port}) yine UDP portunu ilan eder (h3=":<udp>").
+                srv = await serve("127.0.0.1", 0, configuration=cfg, create_protocol=_H3Server)
+                self.port = srv._transport.get_extra_info("sockname")[1]
+                self._start_tcp(0)
             self._quic_server = srv
             self._stop = asyncio.Event()
             self._ready.set()
@@ -273,7 +279,7 @@ class H3TestServer:
         self._loop.call_soon_threadsafe(go)
         assert sent.wait(5), "GOAWAY gönderilemedi (zaman aşımı)"
 
-    def _start_tcp(self):
+    def _start_tcp(self, port):
         outer = self
 
         class H(http.server.BaseHTTPRequestHandler):
@@ -295,7 +301,8 @@ class H3TestServer:
             def log_message(self, *a):
                 pass
 
-        httpd = NoFqdnHTTPServer(("127.0.0.1", self.port), H)
+        httpd = NoFqdnHTTPServer(("127.0.0.1", port), H)
+        self.tcp_port = httpd.server_address[1]
         ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
         ctx.minimum_version = ssl.TLSVersion.TLSv1_3
         ctx.load_cert_chain(*self.tcp_cert)

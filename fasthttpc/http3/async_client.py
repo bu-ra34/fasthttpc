@@ -22,6 +22,10 @@ class _Proto(asyncio.DatagramProtocol):
         # eşzamansızdır; ProactorEventLoop'ta süren bir overlapped yazma varken soketin
         # kapanması o yazma bitene dek ertelenir.
         self.lost: "asyncio.Future[None]" = asyncio.get_running_loop().create_future()
+        self.transport: "Optional[asyncio.DatagramTransport]" = None
+
+    def connection_made(self, transport):
+        self.transport = transport
 
     def datagram_received(self, data, addr):
         self.owner._on_datagram(data)
@@ -76,6 +80,10 @@ class AsyncH3Connection:
                 core._fail_all(core.error, mark_closed=True)
         self._after_event()
 
+    def _is_proactor(self) -> bool:
+        proactor = getattr(asyncio, "ProactorEventLoop", None)
+        return proactor is not None and isinstance(self.loop, proactor)
+
     def _udp_error_is_fatal(self, exc) -> bool:
         """Kurulu bağlantıda UDP hatası bağlantıyı bitirir mi?
 
@@ -85,8 +93,7 @@ class AsyncH3Connection:
         döngülerde geçici gönderim hataları (ENOBUFS, EMSGSIZE) QUIC kayıp kurtarmasına kalır."""
         if isinstance(exc, (ConnectionRefusedError, ConnectionResetError)):
             return True
-        proactor = getattr(asyncio, "ProactorEventLoop", None)
-        return proactor is not None and isinstance(self.loop, proactor)
+        return self._is_proactor()
 
     def _after_event(self) -> None:
         core = self.core
@@ -157,6 +164,21 @@ class AsyncH3Connection:
             self._protos.append(proto)
         except OSError as e:
             raise Http3ConnectError(f"UDP soketi açılamadı: {e}", e) from e
+        # Bu denemenin taşıması HER çıkış yolunda (hata, zaman aşımı, iptal) kapatılır ve
+        # connection_lost'u beklenir; yalnızca el sıkışması başarıyla biterse bağlantıya kalır.
+        ok = False
+        try:
+            await self._handshake_on(addr, host, port, o, deadline, probe)
+            ok = True
+        finally:
+            if not ok:
+                self._close_now()
+                try:
+                    await self.wait_transport_closed()
+                except BaseException:              # iptal: taşıma close() edildi, kapanış sürer
+                    pass
+
+    async def _handshake_on(self, addr, host, port, o, deadline: float, probe: "Optional[float]") -> None:
         self._connected_addr = addr
         self.core = H3Core(host, port, ca_path=self._ca_path, impersonate=self._impersonate,
                            idle_timeout=o.idle_timeout, clock=time.monotonic)
@@ -173,14 +195,11 @@ class AsyncH3Connection:
             await asyncio.wait_for(self._wait_handshake(), max(0.0, deadline - time.monotonic()))
         except (asyncio.TimeoutError, Http3Error) as e:
             err = self.core.error
-            await self.close()
             if isinstance(err, Http3ConnectError):
                 raise err from None
             raise Http3ConnectError(f"QUIC el sıkışması başarısız: {e or 'zaman aşımı'}", e) from e
         if not self.core.handshake_done:
-            err = self.core.error
-            await self.close()
-            raise err or Http3ConnectError("QUIC el sıkışması başarısız")
+            raise self.core.error or Http3ConnectError("QUIC el sıkışması başarısız")
 
     async def _wait_first_response(self) -> None:
         core = self.core
@@ -294,10 +313,18 @@ class AsyncH3Connection:
             running = asyncio.get_running_loop()
         except RuntimeError:
             return
-        pending = [p.lost for p in self._protos
-                   if not p.lost.done() and p.lost.get_loop() is running]
+        protos = [p for p in self._protos if not p.lost.done() and p.lost.get_loop() is running]
+        if not protos:
+            return
+        _, pending = await asyncio.wait([asyncio.shield(p.lost) for p in protos], timeout=timeout / 2)
         if pending:
-            await asyncio.wait([asyncio.shield(f) for f in pending], timeout=timeout)
+            # Kapanış takıldı (bkz. _close_now: Proactor datagram hatası): zorla kapat.
+            for p in protos:
+                if not p.lost.done() and p.transport is not None:
+                    p.transport.abort()
+            rest = [asyncio.shield(p.lost) for p in protos if not p.lost.done()]
+            if rest:
+                await asyncio.wait(rest, timeout=timeout / 2)
 
     def _close_now(self) -> None:
         if self.core is not None and not self.core.closed:
@@ -307,6 +334,13 @@ class AsyncH3Connection:
                 for data, _a in self.core.transmit():
                     self._transport.sendto(data)
             self._transport.close()
+            if self._is_proactor():
+                # CPython (3.12) _ProactorDatagramTransport hatası: close() sırasında süren bir
+                # yazma (az önce gönderilen CONNECTION_CLOSE) varsa connection_lost o yazma
+                # bitince çağrılmalı, ama _loop_writing ``_conn_lost``'u görüp erken döner:
+                # taşıma HİÇ kapanmaz, soket __del__'e kalır (ResourceWarning). abort()
+                # kapanışı zorlar; datagram çekirdeğe WSASendTo ile zaten verilmiştir.
+                self._transport.abort()
             self._transport = None
         if self._timer is not None:
             self._timer.cancel()

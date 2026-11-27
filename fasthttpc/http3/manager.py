@@ -198,6 +198,7 @@ class AsyncHttp3:
         self._ca_path, self._impersonate = ca_path, impersonate
         self._conns: dict[tuple, object] = {}
         self._retired: set = set()      # havuzdan çıkarılmış, süren istekleri biten bağlantılar
+        self._connecting: set = set()   # el sıkışması süren (iptal edilirse close() kapatır)
         self._locks: dict[tuple, asyncio.Lock] = {}
 
     async def _conn(self, origin, target):
@@ -220,7 +221,11 @@ class AsyncHttp3:
                 c = AsyncH3Connection(origin[0], origin[1], target[0], target[1],
                                       ca_path=self._ca_path, impersonate=self._impersonate,
                                       opts=self.state.opts)
-                await c.connect()
+                self._connecting.add(c)
+                try:
+                    await c.connect()
+                finally:
+                    self._connecting.discard(c)
                 self._conns[origin] = c
             return c
 
@@ -263,7 +268,7 @@ class AsyncHttp3:
 
     async def close(self) -> None:
         conns, self._conns = list(self._conns.values()), {}
-        conns += list(self._retired)
-        self._retired = set()
+        conns += list(self._retired) + list(self._connecting)
+        self._retired, self._connecting = set(), set()
         for c in conns:
             await c.close()          # UDP taşımasının gerçekten kapanmasını da bekler
