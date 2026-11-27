@@ -2,6 +2,15 @@
 
 ## [Unreleased]
 
+## [0.8.0] — 2026-11-27
+
+Güvenlik sertleştirmeleri (sıkıştırma bombası ve sıkıştırılmış sertifika
+sınırları, RFC 9112 yanıt çerçevelemesi, çerezler için Public Suffix List, TLS
+kayıt türü denetimi), iş parçacığı güvenli `Session` ve senkron `Timeout.write`,
+`data=` dosya/generator gövdelerinin akışla gönderilmesi (0.7.0'da sessizce boş
+gidiyordu), tarayıcıya özgü HPACK kodlama, secp521r1/x448/ffdhe anahtar değişimi,
+aioquic 1.9 uyumluluğu ve Windows'ta HTTP/3 kaynak sızıntısı düzeltmeleri.
+
 ### Güvenlik
 - **Açılmış gövde sınırı (FHC-07, sıkıştırma bombası):** yeni
   `Limits(max_decompressed_size=...)`, varsayılan 256 MiB, `None` sınırı kapatır.
@@ -142,122 +151,6 @@
   uzunluğunda ve 1 < Y < p-1 olan değer kabul edilir. ffdhe paylaşılan sırrı p
   uzunluğuna soldan sıfırla doldurulur (RFC 8446 §7.4.1).
 
-### Testler / CI
-- RFC 7541 Appendix B tablosu (257 sembol), C.4 ve C.6 örnekleri (tahliye
-  dahil) bayt bayt; tipik Chrome ve Firefox istekleri ile aynı bağlantıdaki
-  ikinci isteğin tam baytları; rastgele istek + tablo boyutu değişikliklerinde
-  kodlayıcı tablosunun bizim ve `hpack` paketinin çözücüsüyle senkronu.
-- Bağımsız sunucuyla birlikte-çalışma (OpenSSL TLS + `h2`): senkron ve async,
-  üç profil, bağlantı ortasında tablo küçültme/büyütme, eşzamanlı stream'ler;
-  ham HEADERS blokları sunucu tarafında denetlenir.
-- `tests/test_kex_groups.py`: gidiş-dönüş, geçersiz karşı değerler (eğri dışı
-  nokta, yanlış uzunluk, x448 sıfır sır, ffdhe Y=0/1/p-1/>=p), deterministik
-  ffdhe dolgu vakaları, HRR kuralları (senkron ve sans-IO), TLS 1.2 ECDHE.
-- `tests/test_interop_kex_groups.py`: `openssl s_server -groups` karşısında her
-  grup × TLS 1.3/1.2 × senkron/async. Yerel openssl bir grubu tanımıyorsa test
-  gerekçesiyle atlanır.
-- Artan GOAWAY kimliği testi (8 → 12, H3_ID_ERROR) aioquic 1.9'da yeni istek
-  başlatılamadığı için düşüyordu. İkinci GOAWAY artık aynı bağlantıda, istek
-  sürerken gönderiliyor (yerel sunucuda `/goaway-hold` yolu); test aioquic 1.3,
-  1.8 ve 1.9.2'de aynı senaryoyu sınar.
-- `tests/test_thread_safety.py`: 16 iş parçacığı × 20 istek (TLS HTTP/1.1, HTTP/2,
-  düz HTTP); her yanıt kendi eşsiz yolu/gövdesiyle doğrulanır, eşzamanlı çerezlerin
-  hepsi kavanozda, havuz sınırı istemci ve sunucu tarafında aşılmıyor, HTTP/2'de
-  bağlantı başına tek açık stream; istek düzeyi zaman aşımı sızmıyor; `close()`
-  süren isteklerle; `DigestAuth` `nc` eşsizliği.
-- `tests/test_write_timeout.py`: hiç okumayan yerel sunucuya büyük gövdeyle
-  `write` (HTTP/1.1 düz/TLS, HTTP/2 gönderim ve akış kontrolü beklemesi), `read`'in
-  bağımsızlığı, `total`'ın üst sınırı, gönderimden sonra okuma süresinin geri
-  gelmesi; `send_all` ve proxy el sıkışması birim testleri.
-- `tests/thread_servers.py`: iş parçacıklı HTTP/2 (`h2`) ve "okumayan" sunucu.
-- `tests/test_upload_body.py` (+ `tests/upload_servers.py`): HTTP/1.1 düz/TLS ve
-  HTTP/2, senkron ve async: BytesIO, gerçek dosya, sıfırdan farklı konum, metin
-  kipi, üreteç, boş parçalı üreteç, async üreteç, bayt benzerleri, 8 MiB akış
-  (bellek tepe sınırı), 307/308 (dosya yeniden / üreteç hata), 303, yeniden deneme
-  (durum ve ağ hatası), Digest, kullanıcı `Content-Length`'i, desteklenmeyen tür,
-  bayt listesi, multipart, bayat keep-alive bağlantı, `Timeout.write`; sunucu
-  alınan gövdeyi ve çerçeveyi (`Content-Length`/chunked, DATA frame'leri,
-  END_STREAM) birebir doğrular. `test_http3.py`: HTTP/3'te akış gövdesi.
-- TLS 1.2 `no_ccs` testi her koşuda hem AES-GCM hem ChaCha20-Poly1305 ile,
-  bilet olan/olmayan sunucuyla ve gövdesi "HelloRequest, dev uzunluk" gibi
-  görünen şifreli Finished'la (sahte sunucu nonce'u seçer) sync ve async
-  sınanır. Son varyant düzeltme öncesi koddaki hatayı her seferinde üretir.
-- **Uyarısız ve katı test takımı:** `pyproject.toml`'da `filterwarnings = ["error"]`;
-  her uyarı (sızan soket/dosya/olay döngüsü için ResourceWarning, `__del__` ve
-  iş parçacığı istisnaları dahil) testi düşürür. Tek istisna dar kapsamlı ve
-  gerekçeli: tlslite-ng'nin Python 3.10/3.11'de asyncore'u içe aktaran
-  `tlsasyncdispatchermixin` modülünün DeprecationWarning'i. cryptography'nin FFDH
-  uyarısı için giriş gerekmez (kütüphane kendi çağrısında dar filtreyle susturur).
-- Python 3.10/3.11'deki `PytestUnraisableExceptionWarning` ("Event loop is closed",
-  `start_h2.<locals>.on_conn`): sahte sunucuların bağlantı görevleri olay döngüsünden
-  uzun yaşıyordu (3.10/3.11'de `Server.wait_closed()` görevleri beklemez ve onlara
-  güçlü referans tutulmaz; iş parçacığındaki döngüler hiç kapatılmıyordu). Yeni
-  `tests/netutil.py` yardımcıları: `TrackedServer` (bağlantı görevlerini ve
-  yazıcıları izler; `wait_closed`/`async with`/döngü kapanışında iptal edip bekler,
-  yazıcıları kapatır), `LoopThread` (iş parçacığındaki döngüyü görevleri iptal edip
-  kapatır), `close_loop`. h2 sahte sunucusunun el sıkışma beklemesi bağlantı TLS
-  bitmeden kapanınca sonsuza dek dönmüyor; pompa görevi beklenerek bitiriliyor.
-- Windows 3.12'deki 29 `RuntimeWarning` (trio "signal handling code might have
-  collided"): `test_backend_trio`'nun sunucu döngüsü ana iş parçacığında
-  oluşturuluyordu; Windows'un ProactorEventLoop'u orada `signal.set_wakeup_fd`'yi
-  kendi soketine çevirip kapanana dek bırakmıyordu. Döngü artık kendi iş
-  parçacığında kuruluyor (regresyon testi ana iş parçacığının wakeup fd'sini denetler).
-- Kapatılmayan soket/dosya/döngüler: stdlib `ssl` ile sarılan sunucu soketleri
-  (`wrap_socket` ham soketi devralır; kapatılan ham soketti — `thread_servers`'ın
-  `close()`'u da bu yüzden açık TLS bağlantılarını kesemiyordu), hiç kapatılmayan
-  dinleyiciler ve sahte proxy tünelleri, `TLSAdapter.negotiate` hata verince
-  çağıranın kapatması gereken ham soketler, tlslite sunucusunun PEM dosyaları, HTTP/3
-  test sunucusunun döngüsü. TLS 1.2 stdlib sunucusu okunmamış veriyle kapatırken RST
-  yerine FIN + boşaltma (`netutil.linger_close`) kullanır.
-- `openssl s_server` çıktı pompası yarışı (ara sıra `PytestUnhandledThreadExceptionWarning`,
-  ör. "PyMemoryView_FromBuffer(): info->buf must not be NULL"): kapanışta boru, pompa
-  iş parçacığı `readline()` içindeyken kapatılıyordu. Artık süreç öldürülür, pompa
-  EOF'a ulaşıp bitene kadar beklenir, sonra borular kapanır; pompa yeniden denemede
-  değişen `self.proc` yerine kendi borusunu okur.
-- **Paralel test süreçlerinde port yarışları:** `openssl s_server` artık
-  `-accept 127.0.0.1:0` ile başlar ve gerçek port `ACCEPT` satırından okunur; hazır
-  olma da bu satırla anlaşılır (eskiden seçilip bırakılan port araya giren başka bir
-  sunucuya gidebiliyor, yoklama o yabancı sunucuya bağlanıp "hazır" sanıyordu —
-  `test_sadece_p256_sunan_sunucu_hrr_yolu` gibi testlerin paralel koşuda düşmesi).
-  "Kapalı port" testleri Linux ve Windows'ta bağlı ama dinlemeyen, süreç boyunca
-  ayrılmış bir port kullanır (`netutil.refused_port`). macOS'ta (XNU, 4.4BSD kökenli
-  `tcp_input`) dinlemeyen bağlı sokete gelen SYN RST'siz atılır, bağlantı reddedilmez
-  zaman aşımına uğrar; orada port seçilip bırakılır; çift yığınlı (127.0.0.1 + ::1) dinleyiciler port
-  kapılırsa yeni portla yeniden dener (`netutil.listen_dual`, `start_dual`).
-  Dört tam takım aynı makinede eşzamanlı koşarak doğrulandı.
-- HTTP/3 test sunucusu (`tcp=True`) aynı numarada TCP+UDP portu bulamazsa (Windows'ta
-  TCP için ayrılmış geniş port aralıkları) TCP'yi başka portta açar, Alt-Svc UDP portunu
-  ilan eder. PTO testinin süre sınırı aioquic'ten türetilir (kayıpsız el sıkışması +
-  2 x PTO, PTO = 2 x `initial_rtt`) ve tek adresle ölçülür.
-- **Test başına zaman sınırı:** `pytest-timeout` geliştirme bağımlılığı oldu
-  (`.[dev]`); `pyproject.toml`'da `timeout = 120`, `timeout_method = "thread"`
-  (Windows'ta da çalışır, tüm iş parçacıklarının yığınını döker). CI test işine
-  `timeout-minutes: 20`. Takılan bir test (ör. PR #18'in Windows işi 4,5 saat asılı
-  kaldı) artık hızla ve yığın dökümüyle düşer. Yerelde en yavaş test ~3 sn.
-- **Windows'ta paylaşılan HTTP/3 test sunucusunun kilitlenmesi:** bir Windows
-  koşusunda `test_request_rejected_repeatedly_fails_after_bound`'dan sonraki 11
-  HTTP/3 testi (sync ve async) "el sıkışma zaman aşımı" ile düşüyordu. Modül boyunca
-  paylaşılan aioquic sunucusu ProactorEventLoop'ta koşuyordu; CPython 3.12'nin
-  Proactor datagram taşıması alım hatasında (`_loop_reading`: `error_received` çağrılır,
-  yeni okuma başlatılmaz) okumayı kalıcı ve sessizce bırakır — kapanmış bir istemci
-  portuna giden yanıtın ICMP'si yeter. Test sunucusu Windows'ta artık
-  SelectorEventLoop'ta koşar (hatayı bildirip okumayı sürdürür). Regresyon testi:
-  sunucu kapalı porta datagram gönderdikten sonra yeni bağlantıları kabul etmeli.
-  İlk Initial datagram'ı düşürülen el sıkışmasının PTO ile ~0,2 sn'de tamamlandığı
-  (sync ve async sürücü) belirlenimli olarak sınanır; sürücülerin zamanlayıcı kullanımı
-  15,6 ms çözünürlüklü saatle (Windows'taki Python 3.12 `time.monotonic`) de denendi.
-- `tests/test_psl.py`: resmi PSL test vektörleri (upstream `tests/test_psl.txt`,
-  dosyaya kopyalandı), joker/istisna, IDN, tembel ve thread-safe yükleme, paketlenmiş
-  dosyanın içeriği ve güncelleme betiği (uydurma, küçük bir listeyle).
-- `tests/test_security_audit.py` (F8): `co.uk`, `github.io`, `herokuapp.com`,
-  joker/istisna ve IDN (`рф`, `公司.cn`) senaryoları; host'un kendisi genel
-  sonekse host-only çerez; `Session` ve `AsyncSession` ile yönlendirme ara
-  yanıtında konan çerezin kardeş sitelere gitmediği. FHC-03 testleri yeni
-  davranışa göre sıkılaştırıldı: `Domain=com`, IP host'ta IP'den farklı
-  `Domain=` ve host'un domain-match etmediği `Domain=` taşıyan çerez artık
-  tümden yok sayılıyor; IP'ye eşit `Domain=` host-only çerez veriyor.
-
-
 ### Değişti
 - **Parmak izi DEĞİŞMEDİ:** her profilin supported_groups listesi ve ilk
   key_share'leri bayt bayt aynıdır. Firefox/Safari secp521r1'i (ve
@@ -277,32 +170,6 @@
   başlatılamadığı için düşüyordu. İkinci GOAWAY artık aynı bağlantıda, istek
   sürerken gönderiliyor (yerel sunucuda `/goaway-hold` yolu); test aioquic 1.3,
   1.8 ve 1.9.2'de aynı senaryoyu sınar.
-
-### Performans
-- Huffman kodlama tablo güdümlü (bit bit Python döngüsü yok); kısa dizelerin
-  kodlanmış hâli süreç genelinde önbellekte. Tipik Chrome başlık listesi (18
-  alan): aynı bağlantıda tekrar eden istek ~13,4 → ~12,3 µs (blok 715 → 40
-  bayt); yeni bağlantının ilk isteği ~13,7 → ~27 µs (blok 715 → 507 bayt;
-  süreçteki ilk bağlantıda, dize önbelleği soğukken ~90 µs).
-
-### Dokümantasyon
-- `docs/http2.md`: tarayıcı başına HPACK davranışı tablosu ve kaynakları.
-  `docs/limits.md`: "HPACK Huffman kodlama yok" sınırı kaldırıldı; Safari HPACK
-  varsayımları ve 16 MiB tablo sınırı sapma tablosuna eklendi.
-- HTTP/3 belgeleri güncellendi: canlı HTTP/3 testleri 0.7.0'dan beri ayrı "Live
-  tests" iş akışında haftalık ve elle tetiklenerek Ubuntu/macOS/Windows
-  makinelerinde Cloudflare, nginx ve Google'a karşı çalışıyor ("yalnızca yerel
-  aioquic sunucusuyla test edildi" ifadeleri kaldırıldı). HTTP/3 deneysel kalıyor.
-- `docs/security-audit.md`: FHC-07 ve FHC-09 "Fixed", yeni bulgu FHC-18 (Fixed); yeni ayar
-  `docs/timeouts-limits-retries.md`'de.
-- `usage.md`: "Using one `Session` from many threads" (garantiler, kilit tasarımı,
-  `close()` anlamı); `timeouts-limits-retries.md`: senkron `write`; `limits.md`,
-  `migration-requests.md`, README'ler güncellendi.
-- `usage.md`: "Request bodies" (kabul edilen `data=` türleri, akış, yeniden
-  gönderim kuralları, `files=`); `migration-requests.md`, `migration-httpx.md`.
-- `docs/security-audit.md`: FHC-08 kapatıldı, FHC-03'e not eklendi.
-  `docs/usage.md` çerez bölümü, README ve README.tr (lisans, sınırlar,
-  geliştirme) güncellendi.
 
 ### Düzeltmeler
 - **Veri kaybı — `data=` ile verilen gövde sessizce BOŞ gönderiliyordu:**
@@ -455,6 +322,13 @@
   sıradaki istek yeni bağlantı kurar. Geçici gönderim hataları (ENOBUFS, EMSGSIZE)
   Selector döngülerinde QUIC kayıp kurtarmasına bırakılır.
 
+### Performans
+- Huffman kodlama tablo güdümlü (bit bit Python döngüsü yok); kısa dizelerin
+  kodlanmış hâli süreç genelinde önbellekte. Tipik Chrome başlık listesi (18
+  alan): aynı bağlantıda tekrar eden istek ~13,4 → ~12,3 µs (blok 715 → 40
+  bayt); yeni bağlantının ilk isteği ~13,7 → ~27 µs (blok 715 → 507 bayt;
+  süreçteki ilk bağlantıda, dize önbelleği soğukken ~90 µs).
+
 ### Paketleme
 - Liste `fasthttpc/public_suffix_list.dat.gz` olarak wheel ve sdist'te: sürüm
   `2026-11-23_15-54-01_UTC`, upstream commit
@@ -471,6 +345,140 @@
 ### Bağımlılıklar
 - `brotli` / `brotlicffi` en az 1.2 (`output_buffer_limit` için). Daha eski bir
   sürüm kuruluysa girdi küçük dilimlerle verilir; sınır yine geçerlidir.
+
+### Testler / CI
+- RFC 7541 Appendix B tablosu (257 sembol), C.4 ve C.6 örnekleri (tahliye
+  dahil) bayt bayt; tipik Chrome ve Firefox istekleri ile aynı bağlantıdaki
+  ikinci isteğin tam baytları; rastgele istek + tablo boyutu değişikliklerinde
+  kodlayıcı tablosunun bizim ve `hpack` paketinin çözücüsüyle senkronu.
+- Bağımsız sunucuyla birlikte-çalışma (OpenSSL TLS + `h2`): senkron ve async,
+  üç profil, bağlantı ortasında tablo küçültme/büyütme, eşzamanlı stream'ler;
+  ham HEADERS blokları sunucu tarafında denetlenir.
+- `tests/test_kex_groups.py`: gidiş-dönüş, geçersiz karşı değerler (eğri dışı
+  nokta, yanlış uzunluk, x448 sıfır sır, ffdhe Y=0/1/p-1/>=p), deterministik
+  ffdhe dolgu vakaları, HRR kuralları (senkron ve sans-IO), TLS 1.2 ECDHE.
+- `tests/test_interop_kex_groups.py`: `openssl s_server -groups` karşısında her
+  grup × TLS 1.3/1.2 × senkron/async. Yerel openssl bir grubu tanımıyorsa test
+  gerekçesiyle atlanır.
+- Artan GOAWAY kimliği testi (8 → 12, H3_ID_ERROR) aioquic 1.9'da yeni istek
+  başlatılamadığı için düşüyordu. İkinci GOAWAY artık aynı bağlantıda, istek
+  sürerken gönderiliyor (yerel sunucuda `/goaway-hold` yolu); test aioquic 1.3,
+  1.8 ve 1.9.2'de aynı senaryoyu sınar.
+- `tests/test_thread_safety.py`: 16 iş parçacığı × 20 istek (TLS HTTP/1.1, HTTP/2,
+  düz HTTP); her yanıt kendi eşsiz yolu/gövdesiyle doğrulanır, eşzamanlı çerezlerin
+  hepsi kavanozda, havuz sınırı istemci ve sunucu tarafında aşılmıyor, HTTP/2'de
+  bağlantı başına tek açık stream; istek düzeyi zaman aşımı sızmıyor; `close()`
+  süren isteklerle; `DigestAuth` `nc` eşsizliği.
+- `tests/test_write_timeout.py`: hiç okumayan yerel sunucuya büyük gövdeyle
+  `write` (HTTP/1.1 düz/TLS, HTTP/2 gönderim ve akış kontrolü beklemesi), `read`'in
+  bağımsızlığı, `total`'ın üst sınırı, gönderimden sonra okuma süresinin geri
+  gelmesi; `send_all` ve proxy el sıkışması birim testleri.
+- `tests/thread_servers.py`: iş parçacıklı HTTP/2 (`h2`) ve "okumayan" sunucu.
+- `tests/test_upload_body.py` (+ `tests/upload_servers.py`): HTTP/1.1 düz/TLS ve
+  HTTP/2, senkron ve async: BytesIO, gerçek dosya, sıfırdan farklı konum, metin
+  kipi, üreteç, boş parçalı üreteç, async üreteç, bayt benzerleri, 8 MiB akış
+  (bellek tepe sınırı), 307/308 (dosya yeniden / üreteç hata), 303, yeniden deneme
+  (durum ve ağ hatası), Digest, kullanıcı `Content-Length`'i, desteklenmeyen tür,
+  bayt listesi, multipart, bayat keep-alive bağlantı, `Timeout.write`; sunucu
+  alınan gövdeyi ve çerçeveyi (`Content-Length`/chunked, DATA frame'leri,
+  END_STREAM) birebir doğrular. `test_http3.py`: HTTP/3'te akış gövdesi.
+- TLS 1.2 `no_ccs` testi her koşuda hem AES-GCM hem ChaCha20-Poly1305 ile,
+  bilet olan/olmayan sunucuyla ve gövdesi "HelloRequest, dev uzunluk" gibi
+  görünen şifreli Finished'la (sahte sunucu nonce'u seçer) sync ve async
+  sınanır. Son varyant düzeltme öncesi koddaki hatayı her seferinde üretir.
+- **Uyarısız ve katı test takımı:** `pyproject.toml`'da `filterwarnings = ["error"]`;
+  her uyarı (sızan soket/dosya/olay döngüsü için ResourceWarning, `__del__` ve
+  iş parçacığı istisnaları dahil) testi düşürür. Tek istisna dar kapsamlı ve
+  gerekçeli: tlslite-ng'nin Python 3.10/3.11'de asyncore'u içe aktaran
+  `tlsasyncdispatchermixin` modülünün DeprecationWarning'i. cryptography'nin FFDH
+  uyarısı için giriş gerekmez (kütüphane kendi çağrısında dar filtreyle susturur).
+- Python 3.10/3.11'deki `PytestUnraisableExceptionWarning` ("Event loop is closed",
+  `start_h2.<locals>.on_conn`): sahte sunucuların bağlantı görevleri olay döngüsünden
+  uzun yaşıyordu (3.10/3.11'de `Server.wait_closed()` görevleri beklemez ve onlara
+  güçlü referans tutulmaz; iş parçacığındaki döngüler hiç kapatılmıyordu). Yeni
+  `tests/netutil.py` yardımcıları: `TrackedServer` (bağlantı görevlerini ve
+  yazıcıları izler; `wait_closed`/`async with`/döngü kapanışında iptal edip bekler,
+  yazıcıları kapatır), `LoopThread` (iş parçacığındaki döngüyü görevleri iptal edip
+  kapatır), `close_loop`. h2 sahte sunucusunun el sıkışma beklemesi bağlantı TLS
+  bitmeden kapanınca sonsuza dek dönmüyor; pompa görevi beklenerek bitiriliyor.
+- Windows 3.12'deki 29 `RuntimeWarning` (trio "signal handling code might have
+  collided"): `test_backend_trio`'nun sunucu döngüsü ana iş parçacığında
+  oluşturuluyordu; Windows'un ProactorEventLoop'u orada `signal.set_wakeup_fd`'yi
+  kendi soketine çevirip kapanana dek bırakmıyordu. Döngü artık kendi iş
+  parçacığında kuruluyor (regresyon testi ana iş parçacığının wakeup fd'sini denetler).
+- Kapatılmayan soket/dosya/döngüler: stdlib `ssl` ile sarılan sunucu soketleri
+  (`wrap_socket` ham soketi devralır; kapatılan ham soketti — `thread_servers`'ın
+  `close()`'u da bu yüzden açık TLS bağlantılarını kesemiyordu), hiç kapatılmayan
+  dinleyiciler ve sahte proxy tünelleri, `TLSAdapter.negotiate` hata verince
+  çağıranın kapatması gereken ham soketler, tlslite sunucusunun PEM dosyaları, HTTP/3
+  test sunucusunun döngüsü. TLS 1.2 stdlib sunucusu okunmamış veriyle kapatırken RST
+  yerine FIN + boşaltma (`netutil.linger_close`) kullanır.
+- `openssl s_server` çıktı pompası yarışı (ara sıra `PytestUnhandledThreadExceptionWarning`,
+  ör. "PyMemoryView_FromBuffer(): info->buf must not be NULL"): kapanışta boru, pompa
+  iş parçacığı `readline()` içindeyken kapatılıyordu. Artık süreç öldürülür, pompa
+  EOF'a ulaşıp bitene kadar beklenir, sonra borular kapanır; pompa yeniden denemede
+  değişen `self.proc` yerine kendi borusunu okur.
+- **Paralel test süreçlerinde port yarışları:** `openssl s_server` artık
+  `-accept 127.0.0.1:0` ile başlar ve gerçek port `ACCEPT` satırından okunur; hazır
+  olma da bu satırla anlaşılır (eskiden seçilip bırakılan port araya giren başka bir
+  sunucuya gidebiliyor, yoklama o yabancı sunucuya bağlanıp "hazır" sanıyordu —
+  `test_sadece_p256_sunan_sunucu_hrr_yolu` gibi testlerin paralel koşuda düşmesi).
+  "Kapalı port" testleri Linux ve Windows'ta bağlı ama dinlemeyen, süreç boyunca
+  ayrılmış bir port kullanır (`netutil.refused_port`). macOS'ta (XNU, 4.4BSD kökenli
+  `tcp_input`) dinlemeyen bağlı sokete gelen SYN RST'siz atılır, bağlantı reddedilmez
+  zaman aşımına uğrar; orada port seçilip bırakılır; çift yığınlı (127.0.0.1 + ::1) dinleyiciler port
+  kapılırsa yeni portla yeniden dener (`netutil.listen_dual`, `start_dual`).
+  Dört tam takım aynı makinede eşzamanlı koşarak doğrulandı.
+- HTTP/3 test sunucusu (`tcp=True`) aynı numarada TCP+UDP portu bulamazsa (Windows'ta
+  TCP için ayrılmış geniş port aralıkları) TCP'yi başka portta açar, Alt-Svc UDP portunu
+  ilan eder. PTO testinin süre sınırı aioquic'ten türetilir (kayıpsız el sıkışması +
+  2 x PTO, PTO = 2 x `initial_rtt`) ve tek adresle ölçülür.
+- **Test başına zaman sınırı:** `pytest-timeout` geliştirme bağımlılığı oldu
+  (`.[dev]`); `pyproject.toml`'da `timeout = 120`, `timeout_method = "thread"`
+  (Windows'ta da çalışır, tüm iş parçacıklarının yığınını döker). CI test işine
+  `timeout-minutes: 20`. Takılan bir test (ör. PR #18'in Windows işi 4,5 saat asılı
+  kaldı) artık hızla ve yığın dökümüyle düşer. Yerelde en yavaş test ~3 sn.
+- **Windows'ta paylaşılan HTTP/3 test sunucusunun kilitlenmesi:** bir Windows
+  koşusunda `test_request_rejected_repeatedly_fails_after_bound`'dan sonraki 11
+  HTTP/3 testi (sync ve async) "el sıkışma zaman aşımı" ile düşüyordu. Modül boyunca
+  paylaşılan aioquic sunucusu ProactorEventLoop'ta koşuyordu; CPython 3.12'nin
+  Proactor datagram taşıması alım hatasında (`_loop_reading`: `error_received` çağrılır,
+  yeni okuma başlatılmaz) okumayı kalıcı ve sessizce bırakır — kapanmış bir istemci
+  portuna giden yanıtın ICMP'si yeter. Test sunucusu Windows'ta artık
+  SelectorEventLoop'ta koşar (hatayı bildirip okumayı sürdürür). Regresyon testi:
+  sunucu kapalı porta datagram gönderdikten sonra yeni bağlantıları kabul etmeli.
+  İlk Initial datagram'ı düşürülen el sıkışmasının PTO ile ~0,2 sn'de tamamlandığı
+  (sync ve async sürücü) belirlenimli olarak sınanır; sürücülerin zamanlayıcı kullanımı
+  15,6 ms çözünürlüklü saatle (Windows'taki Python 3.12 `time.monotonic`) de denendi.
+- `tests/test_psl.py`: resmi PSL test vektörleri (upstream `tests/test_psl.txt`,
+  dosyaya kopyalandı), joker/istisna, IDN, tembel ve thread-safe yükleme, paketlenmiş
+  dosyanın içeriği ve güncelleme betiği (uydurma, küçük bir listeyle).
+- `tests/test_security_audit.py` (F8): `co.uk`, `github.io`, `herokuapp.com`,
+  joker/istisna ve IDN (`рф`, `公司.cn`) senaryoları; host'un kendisi genel
+  sonekse host-only çerez; `Session` ve `AsyncSession` ile yönlendirme ara
+  yanıtında konan çerezin kardeş sitelere gitmediği. FHC-03 testleri yeni
+  davranışa göre sıkılaştırıldı: `Domain=com`, IP host'ta IP'den farklı
+  `Domain=` ve host'un domain-match etmediği `Domain=` taşıyan çerez artık
+  tümden yok sayılıyor; IP'ye eşit `Domain=` host-only çerez veriyor.
+
+### Dokümantasyon
+- `docs/http2.md`: tarayıcı başına HPACK davranışı tablosu ve kaynakları.
+  `docs/limits.md`: "HPACK Huffman kodlama yok" sınırı kaldırıldı; Safari HPACK
+  varsayımları ve 16 MiB tablo sınırı sapma tablosuna eklendi.
+- HTTP/3 belgeleri güncellendi: canlı HTTP/3 testleri 0.7.0'dan beri ayrı "Live
+  tests" iş akışında haftalık ve elle tetiklenerek Ubuntu/macOS/Windows
+  makinelerinde Cloudflare, nginx ve Google'a karşı çalışıyor ("yalnızca yerel
+  aioquic sunucusuyla test edildi" ifadeleri kaldırıldı). HTTP/3 deneysel kalıyor.
+- `docs/security-audit.md`: FHC-07 ve FHC-09 "Fixed", yeni bulgu FHC-18 (Fixed); yeni ayar
+  `docs/timeouts-limits-retries.md`'de.
+- `usage.md`: "Using one `Session` from many threads" (garantiler, kilit tasarımı,
+  `close()` anlamı); `timeouts-limits-retries.md`: senkron `write`; `limits.md`,
+  `migration-requests.md`, README'ler güncellendi.
+- `usage.md`: "Request bodies" (kabul edilen `data=` türleri, akış, yeniden
+  gönderim kuralları, `files=`); `migration-requests.md`, `migration-httpx.md`.
+- `docs/security-audit.md`: FHC-08 kapatıldı, FHC-03'e not eklendi.
+  `docs/usage.md` çerez bölümü, README ve README.tr (lisans, sınırlar,
+  geliştirme) güncellendi.
 
 ### Araçlar
 - `scripts/update_psl.py`: listeyi publicsuffix.org'dan indirir (ya da
