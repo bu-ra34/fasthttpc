@@ -10,13 +10,22 @@ import time
 from typing import AsyncIterator, Optional
 
 from ..security.cert_validator import CertificateValidationError
-from .core import H3Core, Http3ConnectError, Http3Error, Http3RequestRefused, authority_for
+from .core import (H3Core, Http3ConnectError, Http3Error, Http3RequestRefused, address_probe_window,
+                   authority_for)
 from .options import Http3Options
 
 
 class _Proto(asyncio.DatagramProtocol):
     def __init__(self, owner: "AsyncH3Connection"):
         self.owner = owner
+        # Taşıma GERÇEKTEN kapandığında (soket kapatıldı) tamamlanır: transport.close()
+        # eşzamansızdır; ProactorEventLoop'ta süren bir overlapped yazma varken soketin
+        # kapanması o yazma bitene dek ertelenir.
+        self.lost: "asyncio.Future[None]" = asyncio.get_running_loop().create_future()
+        self.transport: "Optional[asyncio.DatagramTransport]" = None
+
+    def connection_made(self, transport):
+        self.transport = transport
 
     def datagram_received(self, data, addr):
         self.owner._on_datagram(data)
@@ -25,6 +34,8 @@ class _Proto(asyncio.DatagramProtocol):
         self.owner._on_udp_error(exc)
 
     def connection_lost(self, exc):
+        if not self.lost.done():
+            self.lost.set_result(None)
         self.owner._on_udp_error(exc or Http3Error("UDP taşıması kapandı"))
 
 
@@ -42,6 +53,7 @@ class AsyncH3Connection:
         self.loop: "Optional[asyncio.AbstractEventLoop]" = None
         self._connected_addr = None
         self._retired = False
+        self._protos: "list[_Proto]" = []      # kapanışı beklenecek UDP protokolleri
 
     # -- IO ---------------------------------------------------------------------
     def _on_datagram(self, data: bytes) -> None:
@@ -55,10 +67,33 @@ class AsyncH3Connection:
         self._after_event()
 
     def _on_udp_error(self, exc) -> None:
-        if self.core is not None and not self.core.closed and not self.core.handshake_done:
-            self.core.error = Http3ConnectError(f"UDP hatası: {exc}", exc)
-            self.core._fail_all(self.core.error, mark_closed=True)
+        core = self.core
+        if core is not None and not core.closed:
+            if not core.handshake_done:
+                core.error = Http3ConnectError(f"UDP hatası: {exc}", exc)
+                core._fail_all(core.error, mark_closed=True)
+            elif self._udp_error_is_fatal(exc):
+                # El sıkışmadan SONRA: eş artık yok (ICMP reddi) ya da taşıma okumayı bıraktı.
+                # Bağlantı "kullanılabilir" kalsaydı sonraki istekler yanıt alamayıp zaman
+                # aşımına uğrardı; kapatılır, sıradaki istek yeni bağlantı kurar.
+                core.error = Http3Error(f"UDP hatası: {exc}")
+                core._fail_all(core.error, mark_closed=True)
         self._after_event()
+
+    def _is_proactor(self) -> bool:
+        proactor = getattr(asyncio, "ProactorEventLoop", None)
+        return proactor is not None and isinstance(self.loop, proactor)
+
+    def _udp_error_is_fatal(self, exc) -> bool:
+        """Kurulu bağlantıda UDP hatası bağlantıyı bitirir mi?
+
+        ICMP kaynaklı ret/sıfırlama her zaman. Windows ProactorEventLoop'ta HER alım hatası:
+        datagram taşıması (CPython 3.12 ``_ProactorDatagramTransport._loop_reading``) hatada
+        ``error_received`` çağırıp yeni okuma başlatmaz, soket bir daha veri vermez. Diğer
+        döngülerde geçici gönderim hataları (ENOBUFS, EMSGSIZE) QUIC kayıp kurtarmasına kalır."""
+        if isinstance(exc, (ConnectionRefusedError, ConnectionResetError)):
+            return True
+        return self._is_proactor()
 
     def _after_event(self) -> None:
         core = self.core
@@ -109,7 +144,7 @@ class AsyncH3Connection:
             if remaining <= 0:
                 break
             try:
-                await self._attempt(family, addr, remaining / (len(addrs) - i))
+                await self._attempt(family, addr, deadline, address_probe_window(remaining, len(addrs) - i))
                 return
             except Http3ConnectError as e:
                 last = e
@@ -117,34 +152,59 @@ class AsyncH3Connection:
                     raise
         raise last or Http3ConnectError("QUIC el sıkışması zaman aşımı")
 
-    async def _attempt(self, family, addr, timeout: float) -> None:
+    async def _attempt(self, family, addr, deadline: float, probe: "Optional[float]") -> None:
         o = self._opts
         host, port = self.origin
         try:
             # asyncio remote_addr için 2'li (host, port) ister; aile adresle eşleşir
             # (IPv6 4'lü adresi AF_INET soketine verilmez). scope id gerekiyorsa host'ta %scope.
             host_part = addr[0] if len(addr) == 2 or not addr[3] else f"{addr[0]}%{addr[3]}"
-            self._transport, _ = await self.loop.create_datagram_endpoint(
+            self._transport, proto = await self.loop.create_datagram_endpoint(
                 lambda: _Proto(self), remote_addr=(host_part, addr[1]), family=family)
+            self._protos.append(proto)
         except OSError as e:
             raise Http3ConnectError(f"UDP soketi açılamadı: {e}", e) from e
+        # Bu denemenin taşıması HER çıkış yolunda (hata, zaman aşımı, iptal) kapatılır ve
+        # connection_lost'u beklenir; yalnızca el sıkışması başarıyla biterse bağlantıya kalır.
+        ok = False
+        try:
+            await self._handshake_on(addr, host, port, o, deadline, probe)
+            ok = True
+        finally:
+            if not ok:
+                self._close_now()
+                try:
+                    await self.wait_transport_closed()
+                except BaseException:              # iptal: taşıma close() edildi, kapanış sürer
+                    pass
+
+    async def _handshake_on(self, addr, host, port, o, deadline: float, probe: "Optional[float]") -> None:
         self._connected_addr = addr
         self.core = H3Core(host, port, ca_path=self._ca_path, impersonate=self._impersonate,
                            idle_timeout=o.idle_timeout, clock=time.monotonic)
         self.core.connect(addr)
         self._after_event()
         try:
-            await asyncio.wait_for(self._wait_handshake(), timeout)
+            if probe is not None:
+                try:
+                    await asyncio.wait_for(self._wait_first_response(),
+                                           min(probe, deadline - time.monotonic()))
+                except asyncio.TimeoutError:
+                    if self.core.datagrams_received == 0:
+                        raise asyncio.TimeoutError(f"{probe:.2f} sn içinde yanıt yok") from None
+            await asyncio.wait_for(self._wait_handshake(), max(0.0, deadline - time.monotonic()))
         except (asyncio.TimeoutError, Http3Error) as e:
             err = self.core.error
-            await self.close()
             if isinstance(err, Http3ConnectError):
                 raise err from None
             raise Http3ConnectError(f"QUIC el sıkışması başarısız: {e or 'zaman aşımı'}", e) from e
         if not self.core.handshake_done:
-            err = self.core.error
-            await self.close()
-            raise err or Http3ConnectError("QUIC el sıkışması başarısız")
+            raise self.core.error or Http3ConnectError("QUIC el sıkışması başarısız")
+
+    async def _wait_first_response(self) -> None:
+        core = self.core
+        while not (core.handshake_done or core.closed or core.datagrams_received):
+            await self._wait_state()
 
     async def _wait_handshake(self) -> None:
         while not (self.core.handshake_done or self.core.closed):
@@ -158,7 +218,8 @@ class AsyncH3Connection:
 
     @property
     def finished(self) -> bool:
-        return self._transport is None
+        """Kapatıldı VE UDP taşıması gerçekten kapandı (soket serbest)."""
+        return self._transport is None and all(p.lost.done() for p in self._protos)
 
     def retire(self) -> None:
         """Yeni istek alma; süren istekler bitince (son akış serbest bırakılınca) kapan."""
@@ -237,7 +298,33 @@ class AsyncH3Connection:
         return st.headers, body_iter()
 
     async def close(self) -> None:
+        """Bağlantıyı kapatır ve UDP taşımasının gerçekten kapanmasını (connection_lost) bekler.
+
+        ``transport.close()`` soketi hemen kapatmaz: kapanış olay döngüsünün sonraki
+        turlarında olur (ProactorEventLoop'ta süren overlapped yazma bitene dek ertelenir).
+        Beklenmeden dönülürse döngü (ör. ``asyncio.run`` sonu) kapanınca taşıma yarım kalır:
+        açık UDP soketi, ``_ProactorBasePipeTransport.__del__`` ResourceWarning'i."""
         self._close_now()
+        await self.wait_transport_closed()
+
+    async def wait_transport_closed(self, timeout: float = 2.0) -> None:
+        """Kapatılmış UDP taşımalarının ``connection_lost``'unu (en fazla ``timeout`` sn) bekler."""
+        try:
+            running = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        protos = [p for p in self._protos if not p.lost.done() and p.lost.get_loop() is running]
+        if not protos:
+            return
+        _, pending = await asyncio.wait([asyncio.shield(p.lost) for p in protos], timeout=timeout / 2)
+        if pending:
+            # Kapanış takıldı (bkz. _close_now: Proactor datagram hatası): zorla kapat.
+            for p in protos:
+                if not p.lost.done() and p.transport is not None:
+                    p.transport.abort()
+            rest = [asyncio.shield(p.lost) for p in protos if not p.lost.done()]
+            if rest:
+                await asyncio.wait(rest, timeout=timeout / 2)
 
     def _close_now(self) -> None:
         if self.core is not None and not self.core.closed:
@@ -247,6 +334,13 @@ class AsyncH3Connection:
                 for data, _a in self.core.transmit():
                     self._transport.sendto(data)
             self._transport.close()
+            if self._is_proactor():
+                # CPython (3.12) _ProactorDatagramTransport hatası: close() sırasında süren bir
+                # yazma (az önce gönderilen CONNECTION_CLOSE) varsa connection_lost o yazma
+                # bitince çağrılmalı, ama _loop_writing ``_conn_lost``'u görüp erken döner:
+                # taşıma HİÇ kapanmaz, soket __del__'e kalır (ResourceWarning). abort()
+                # kapanışı zorlar; datagram çekirdeğe WSASendTo ile zaten verilmiştir.
+                self._transport.abort()
             self._transport = None
         if self._timer is not None:
             self._timer.cancel()

@@ -12,8 +12,10 @@ import io
 import json as jsonlib
 import re
 import time
+import weakref
+from contextlib import aclosing
 from typing import (
-    TYPE_CHECKING, Any, AsyncIterable, AsyncIterator, Callable, Iterable, Iterator,
+    TYPE_CHECKING, Any, AsyncGenerator, AsyncIterator, Callable, Iterable, Iterator,
     List, Optional, Protocol, TypeVar,
 )
 from .headers import Headers
@@ -142,6 +144,8 @@ class Response:
         self._body: Optional[bytes]        = None if (stream or astream) else body
         self._consumed                     = False
         self._closed                       = False
+        # aiter_* ile verilen, henüz bitmemiş olabilecek async üreteçler (aclose() kapatır)
+        self._agens: "weakref.WeakSet[AsyncGenerator[Any, None]] | None" = None
         self._decoder: Optional[IncrementalDecoder] = None
         self._raw_iter: Optional[_RawReader] = None
         self.request: "Request | None"     = request
@@ -390,7 +394,7 @@ class Response:
         if self._stream is not None:
             raise RuntimeError("Senkron akış yanıtı: iter_* kullanın.")
 
-    async def _araw_chunks(self) -> AsyncIterator[bytes]:
+    async def _araw_chunks(self) -> AsyncGenerator[bytes, None]:
         self._acheck()
         if self._astream is None:
             if self._body:
@@ -408,7 +412,7 @@ class Response:
                 return
             yield c
 
-    async def _adecoded(self) -> AsyncIterator[bytes]:
+    async def _adecoded(self) -> AsyncGenerator[bytes, None]:
         if self._body is not None:
             if self._body:
                 yield self._body
@@ -416,19 +420,31 @@ class Response:
         dec = self._get_decoder()
         for out in dec.decode_iter(b""):
             yield out
-        async for c in self._araw_chunks():
-            for out in dec.decode_iter(c):
-                yield out
+        async with aclosing(self._araw_chunks()) as raw:
+            async for c in raw:
+                for out in dec.decode_iter(c):
+                    yield out
         for out in dec.flush_iter():
             yield out
 
     @staticmethod
-    async def _adrive(agen: AsyncIterable[_T], rc: _Chunker[_T]) -> AsyncIterator[_T]:
-        async for c in agen:
-            for o in rc.feed(c):
-                yield o
+    async def _adrive(agen: AsyncGenerator[_T, None], rc: _Chunker[_T]) -> AsyncGenerator[_T, None]:
+        # İç üreteç de belirlenimli kapanır: yarıda bırakılan dış üreteç aclose() edilince
+        # (ör. Response.aclose) iç üreteç çöp toplayıcıya kalmaz (trio bunu ResourceWarning
+        # ile bildirir; asyncio'da sonlandırma döngü kapandıktan sonraya kalabilir).
+        async with aclosing(agen):
+            async for c in agen:
+                for o in rc.feed(c):
+                    yield o
         for o in rc.flush():
             yield o
+
+    def _atrack(self, agen: AsyncGenerator[_T, None]) -> AsyncGenerator[_T, None]:
+        """Üreteci ``aclose()``'ta kapatılmak üzere kaydeder."""
+        if self._agens is None:
+            self._agens = weakref.WeakSet()
+        self._agens.add(agen)
+        return agen
 
     async def aread(self) -> bytes:
         """Gövdenin kalanını okur (açılmış) ve ``content``'e koyar."""
@@ -438,44 +454,60 @@ class Response:
             if self._closed:
                 raise StreamClosed("Yanıt gövde okunmadan kapatıldı.")
             parts = []
-            async for c in self._adecoded():
-                parts.append(c)
+            async with aclosing(self._adecoded()) as dec:
+                async for c in dec:
+                    parts.append(c)
             self._body = b"".join(parts)
         return self._body
 
     def aiter_raw(self, chunk_size: "int | None" = None) -> AsyncIterator[bytes]:
-        return self._adrive(self._araw_chunks(), Rechunker(chunk_size))
+        return self._atrack(self._adrive(self._araw_chunks(), Rechunker(chunk_size)))
 
     def aiter_bytes(self, chunk_size: "int | None" = None) -> AsyncIterator[bytes]:
-        return self._adrive(self._adecoded(), Rechunker(chunk_size))
+        return self._atrack(self._adrive(self._adecoded(), Rechunker(chunk_size)))
 
     def aiter_text(self, chunk_size: "int | None" = None) -> AsyncIterator[str]:
-        async def gen() -> AsyncIterator[str]:
+        async def gen() -> AsyncGenerator[str, None]:
             dec = self._text_decoder()
-            async for c in self._adecoded():
-                t = dec.decode(c)
-                if t:
-                    yield t
+            async with aclosing(self._adecoded()) as src:
+                async for c in src:
+                    t = dec.decode(c)
+                    if t:
+                        yield t
             t = dec.decode(b"", final=True)
             if t:
                 yield t
-        return self._adrive(gen(), TextRechunker(chunk_size))
+        return self._atrack(self._adrive(gen(), TextRechunker(chunk_size)))
 
-    async def aiter_lines(self, decode_unicode: bool = True,
-                          delimiter: "bytes | None" = None) -> "AsyncIterator[bytes | str]":
+    def aiter_lines(self, decode_unicode: bool = True,
+                    delimiter: "bytes | None" = None) -> "AsyncIterator[bytes | str]":
         """Satır satır (async). httpx gibi varsayılan ``str``; ``decode_unicode=False`` -> bytes."""
         splitter = LineSplitter(delimiter)
         conv = self._line_conv(decode_unicode)
-        async for c in self._adecoded():
-            for ln in splitter.feed(c):
+
+        async def gen() -> "AsyncGenerator[bytes | str, None]":
+            async with aclosing(self._adecoded()) as src:
+                async for c in src:
+                    for ln in splitter.feed(c):
+                        yield conv(ln)
+            for ln in splitter.flush():
                 yield conv(ln)
-        for ln in splitter.flush():
-            yield conv(ln)
+        return self._atrack(gen())
 
     async def aclose(self) -> None:
         if self._closed:
             return
         self._closed = True
+        if self._agens:
+            # Yarıda bırakılmış aiter_* üreteçleri burada (doğru bağlamda) kapanır; çöp
+            # toplayıcıya kalırlarsa trio ResourceWarning verir, asyncio'da ise sonlandırma
+            # olay döngüsü kapandıktan sonraya kalabilir.
+            for agen in list(self._agens):
+                try:
+                    await agen.aclose()
+                except RuntimeError:       # başka bir görevde o an yürütülüyor
+                    pass
+            self._agens = None
         if self._astream is not None:
             await self._astream.aclose()
         elif self._stream is not None:

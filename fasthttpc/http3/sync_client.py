@@ -9,7 +9,8 @@ import time
 from typing import Optional
 
 from ..security.cert_validator import CertificateValidationError
-from .core import (H3Core, Http3ConnectError, Http3Error, Http3RequestRefused, authority_for)
+from .core import (H3Core, Http3ConnectError, Http3Error, Http3RequestRefused, address_probe_window,
+                   authority_for)
 from .options import Http3Options
 
 
@@ -67,8 +68,9 @@ class SyncH3Connection:
 
     def connect(self) -> None:
         """getaddrinfo sonuçlarını sırayla dener (Happy Eyeballs benzeri); toplam süre
-        ``connect_timeout``. ICMP reddi/hata anında, sessiz zaman aşımında kalan sürenin
-        payıyla sonraki adrese geçilir. Sertifika hatasında DURULUR (başka adres denenmez)."""
+        ``connect_timeout``. ICMP reddi/hata anında, son olmayan adresten
+        ``address_probe_window`` içinde hiç yanıt gelmezse sonraki adrese geçilir; yanıt veren
+        adresin el sıkışması kalan sürenin tamamını kullanır. Sertifika hatasında DURULUR."""
         o = self._opts
         try:
             infos = socket.getaddrinfo(self._target[0], self._target[1], type=socket.SOCK_DGRAM)
@@ -88,7 +90,7 @@ class SyncH3Connection:
             if remaining <= 0:
                 break
             try:
-                self._attempt(family, addr, remaining / (len(addrs) - i))
+                self._attempt(family, addr, deadline, address_probe_window(remaining, len(addrs) - i))
                 return
             except Http3ConnectError as e:
                 last = e
@@ -96,7 +98,7 @@ class SyncH3Connection:
                     raise
         raise last or Http3ConnectError("QUIC el sıkışması zaman aşımı")
 
-    def _attempt(self, family, addr, timeout: float) -> None:
+    def _attempt(self, family, addr, deadline: float, probe: "Optional[float]") -> None:
         o = self._opts
         host, port = self.origin
         try:
@@ -108,13 +110,29 @@ class SyncH3Connection:
                 self._sock.close()
                 self._sock = None
             raise Http3ConnectError(f"UDP soketi açılamadı: {e}", e) from e
+        ok = False
+        try:
+            self._handshake_on(addr, host, port, o, deadline, probe)
+            ok = True
+        finally:
+            if not ok:
+                self.close()            # bu denemenin soketi her çıkış yolunda kapanır
+
+    def _handshake_on(self, addr, host, port, o, deadline: float, probe: "Optional[float]") -> None:
         self.core = H3Core(host, port, ca_path=self._ca_path, impersonate=self._impersonate,
                            idle_timeout=o.idle_timeout, clock=time.monotonic)
         self._target = addr
         self.core.connect(addr)
+        core = self.core
         try:
-            self._run(lambda: self.core.handshake_done or self.core.closed,
-                      time.monotonic() + timeout, "el sıkışma")
+            if probe is not None:
+                try:
+                    self._run(lambda: core.handshake_done or core.closed or core.datagrams_received > 0,
+                              min(deadline, time.monotonic() + probe), "el sıkışma")
+                except TimeoutError:
+                    if core.datagrams_received == 0:
+                        raise TimeoutError(f"HTTP/3 el sıkışma: {probe:.2f} sn içinde yanıt yok") from None
+            self._run(lambda: core.handshake_done or core.closed, deadline, "el sıkışma")
         except (TimeoutError, Http3Error) as e:
             err = self.core.error
             self.close()

@@ -20,6 +20,7 @@ from fasthttpc.transport.proxy import (
 )
 
 from fake_tls_server import FakeTLS13Server, recv_exact
+from netutil import refused_port
 
 
 @pytest.fixture
@@ -68,18 +69,24 @@ class FakeProxy:
         return f"127.0.0.1:{self.port}"
 
     def _run(self):
+        c = up = None
         try:
             c, _ = self.ls.accept()
             c.settimeout(5)
             ok = self._http(c) if self.kind == "http" else self._socks(c)
             if not ok or self.upstream_port is None:
-                c.close()
                 return
             up = socket.create_connection(("127.0.0.1", self.upstream_port), timeout=5)
-            threading.Thread(target=_pipe, args=(up, c), daemon=True).start()
+            t = threading.Thread(target=_pipe, args=(up, c), daemon=True)
+            t.start()
             _pipe(c, up)
+            t.join(10)
         except Exception as e:  # noqa: BLE001
             self.error = e
+        finally:
+            for s in (c, up, self.ls):       # tek bağlantılık proxy: iş bitince hepsi kapanır
+                if s is not None:
+                    s.close()
 
     def _http(self, c):
         buf = b""
@@ -229,10 +236,7 @@ def test_socks5_connect_failure_reply():
 
 
 def test_proxy_unreachable():
-    s = socket.socket()
-    s.bind(("127.0.0.1", 0))
-    port = s.getsockname()[1]
-    s.close()
+    port = refused_port()
     with pytest.raises(ProxyError):
         connect_via_proxy(ProxyConfig("http", "127.0.0.1", port), "example.com", 443, timeout=2)
 

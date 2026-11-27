@@ -33,7 +33,10 @@ def h3(pki):
 
 
 def url(s, path="/"):
-    return f"https://localhost:{s.port}{path}"
+    # tcp=True sunucuda ilk istek TCP'ye gider (Alt-Svc keşfi); h1 portu UDP'ninkiyle aynı
+    # numara olmayabilir (bkz. H3TestServer._run).
+    port = s.tcp_port if getattr(s, "tcp", False) else s.port
+    return f"https://localhost:{port}{path}"
 
 
 def test_sync_get_post(pki, h3):
@@ -181,11 +184,7 @@ def test_altsvc_discovery_async(pki, dual):
 
 def test_fallback_to_h2_when_udp_dead(pki):
     # Alt-Svc h3 ilan eden TCP sunucusu, UDP tarafında kimse yok -> sessiz düşüş
-    srv = H3TestServer(pki["crt"], pki["key"], tcp=True, alt_svc='h3=":{port}"; ma=60').start()
-    srv._loop.call_soon_threadsafe(lambda: None)
-    port = srv.port
-    # UDP'yi kapatmak için sunucuyu durdur; TCP'yi ayrı ayağa kaldır
-    srv.stop()
+    # TCP sunucusu kendi portunda; Alt-Svc aynı numarada h3 ilan eder, o UDP portunda kimse yok.
     import http.server, ssl, threading
 
     class H(http.server.BaseHTTPRequestHandler):
@@ -194,25 +193,27 @@ def test_fallback_to_h2_when_udp_dead(pki):
             self.send_response(200); self.send_header("Content-Length", "2")
             self.send_header("Alt-Svc", f'h3=":{port}"; ma=60'); self.end_headers(); self.wfile.write(b"ok")
         def log_message(self, *a): pass
-    httpd = NoFqdnHTTPServer(("127.0.0.1", port), H)   # macOS: getfqdn gecikmesi yok
+    httpd = NoFqdnHTTPServer(("127.0.0.1", 0), H)   # macOS: getfqdn gecikmesi yok
+    port = httpd.server_address[1]
+    origin = f"https://localhost:{port}/"
     ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER); ctx.load_cert_chain(pki["crt"], pki["key"])
     httpd.socket = ctx.wrap_socket(httpd.socket, server_side=True)
     threading.Thread(target=httpd.serve_forever, daemon=True).start()
     try:
         opts = Http3Options(connect_timeout=0.4, disable_for=60)
         with Session(http3=opts, verify=pki["ca"], impersonate=None) as s:
-            assert s.get(url(srv)).http_version == "HTTP/1.1"      # keşif
+            assert s.get(origin).http_version == "HTTP/1.1"      # keşif
             t = time.monotonic()
-            r = s.get(url(srv))                                    # h3 dener, düşer
+            r = s.get(origin)                                    # h3 dener, düşer
             assert r.status_code == 200 and r.http_version == "HTTP/1.1"
             assert time.monotonic() - t < 4
             t = time.monotonic()
-            s.get(url(srv))                                        # devre dışı: gecikme yok
+            s.get(origin)                                        # devre dışı: gecikme yok
             assert time.monotonic() - t < 0.35
         async def go():
             async with AsyncSession(http3=opts, verify=pki["ca"], impersonate=None) as a:
-                await a.get(url(srv))
-                r = await a.get(url(srv))
+                await a.get(origin)
+                r = await a.get(origin)
                 assert r.status_code == 200 and r.http_version == "HTTP/1.1"
         asyncio.run(go())
     finally:
@@ -422,7 +423,9 @@ def test_request_rejected_is_retried_async_without_killing_siblings(pki, h3):
             assert rejected.status_code == 200 and rejected.http_version == "HTTP/3"
             assert HITS[path] == 2 and first.core.draining
             assert next(iter(s._h3._conns.values())) is not first
-            assert first.finished                         # son akış bitince kendini kapattı
+            assert first._transport is None               # son akış bitince kendini kapattı
+            await first.wait_transport_closed()           # UDP kapanışı eşzamansız
+            assert first.finished
     asyncio.run(go())
 
 
@@ -589,6 +592,252 @@ def test_multi_address_fallthrough(pki, h3, monkeypatch, kind):
     finally:
         if silent:
             silent.close()
+
+
+# --- Adres başına süre bütçesi (belirlenimli: sahte saat, ağ yok) ---------------------------
+
+def test_address_probe_window_sinirli_ve_son_adres_sinirsiz():
+    from fasthttpc.http3.core import ADDRESS_PROBE_TIMEOUT, address_probe_window
+    assert address_probe_window(4.0, 2) == ADDRESS_PROBE_TIMEOUT == 1.0
+    assert address_probe_window(1.0, 2) == 0.5            # kısa toplam sürede eşit pay
+    assert address_probe_window(0.3, 3) == pytest.approx(0.1)
+    assert address_probe_window(4.0, 1) is None           # son adres: kalanın tamamı
+    assert address_probe_window(-1.0, 2) == 0.0
+
+
+class _FakeClock:
+    def __init__(self):
+        self.t = 1000.0
+
+    def __call__(self):
+        return self.t
+
+
+def _two_addrs(monkeypatch, mod):
+    infos = [(socket.AF_INET, socket.SOCK_DGRAM, 17, "", ("127.0.0.1", 1)),
+             (socket.AF_INET, socket.SOCK_DGRAM, 17, "", ("127.0.0.1", 2))]
+    monkeypatch.setattr(mod.socket, "getaddrinfo", lambda *a, **k: infos)
+    return infos
+
+
+@pytest.mark.parametrize("ilk", ["sessiz", "icmp_red"])
+def test_sync_cok_adres_butcesi_son_adres_kalani_alir(monkeypatch, ilk):
+    """Windows CI regresyonu: ilk adres sessizken (ya da ICMP reddi bildirilmeyip yanıt
+    gelmezken) payının tamamını değil en fazla ADDRESS_PROBE_TIMEOUT'u harcar; hızlı
+    reddedilirse kullanılmayan süre sonraki adrese kalır. Son adres kalanın tamamını alır."""
+    from fasthttpc.http3 import sync_client
+    from fasthttpc.http3.core import Http3ConnectError
+    clock = _FakeClock()
+    monkeypatch.setattr(sync_client.time, "monotonic", clock)
+    _two_addrs(monkeypatch, sync_client)
+    calls = []
+
+    def fake_attempt(self, family, addr, deadline, probe):
+        calls.append((addr[1], round(deadline - clock.t, 6), probe))
+        if addr[1] == 1:
+            clock.t += probe if ilk == "sessiz" else 0.01      # sessiz: pencere sonuna kadar
+            raise Http3ConnectError("yanıt yok")
+
+    monkeypatch.setattr(sync_client.SyncH3Connection, "_attempt", fake_attempt)
+    c = sync_client.SyncH3Connection("localhost", 443, "localhost", 443, ca_path=None,
+                                     impersonate=None, opts=Http3Options(connect_timeout=4.0))
+    c.connect()
+    assert calls[0] == (1, 4.0, 1.0)
+    assert calls[1] == (2, 3.0 if ilk == "sessiz" else 3.99, None)
+
+
+def test_async_cok_adres_butcesi_son_adres_kalani_alir(monkeypatch):
+    from fasthttpc.http3 import async_client
+    from fasthttpc.http3.core import Http3ConnectError
+    clock = _FakeClock()
+    monkeypatch.setattr(async_client.time, "monotonic", clock)
+    infos = [(socket.AF_INET, socket.SOCK_DGRAM, 17, "", ("127.0.0.1", 1)),
+             (socket.AF_INET, socket.SOCK_DGRAM, 17, "", ("127.0.0.1", 2))]
+    calls = []
+
+    async def fake_attempt(self, family, addr, deadline, probe):
+        calls.append((addr[1], round(deadline - clock.t, 6), probe))
+        if addr[1] == 1:
+            clock.t += probe
+            raise Http3ConnectError("yanıt yok")
+
+    monkeypatch.setattr(async_client.AsyncH3Connection, "_attempt", fake_attempt)
+
+    async def go():
+        async def fake_gai(*a, **k):
+            return infos
+        monkeypatch.setattr(asyncio.get_running_loop(), "getaddrinfo", fake_gai)
+        c = async_client.AsyncH3Connection("localhost", 443, "localhost", 443, ca_path=None,
+                                           impersonate=None, opts=Http3Options(connect_timeout=4.0))
+        await c.connect()
+    asyncio.run(go())
+    assert calls == [(1, 4.0, 1.0), (2, 3.0, None)]
+
+
+def test_yanitsiz_adres_yoklama_penceresinde_birakilir(monkeypatch):
+    """Gerçek soket: yanıt vermeyen adreste el sıkışması toplam süreyi değil yalnızca
+    yoklama penceresini bekler (sync ve async)."""
+    from fasthttpc.http3.async_client import AsyncH3Connection
+    from fasthttpc.http3.core import Http3ConnectError
+    from fasthttpc.http3.sync_client import SyncH3Connection
+    silent = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    silent.bind(("127.0.0.1", 0))
+    addr = silent.getsockname()
+    kw = dict(ca_path=None, impersonate=None, opts=Http3Options(connect_timeout=30.0))
+    try:
+        c = SyncH3Connection("localhost", addr[1], "127.0.0.1", addr[1], **kw)
+        t = time.monotonic()
+        with pytest.raises(Http3ConnectError, match="yanıt yok"):
+            c._attempt(socket.AF_INET, addr, time.monotonic() + 30.0, 0.3)
+        assert time.monotonic() - t < 10.0          # 30 sn'lik toplam sürenin çok altında
+
+        async def go():
+            a = AsyncH3Connection("localhost", addr[1], "127.0.0.1", addr[1], **kw)
+            a.loop = asyncio.get_running_loop()
+            t = time.monotonic()
+            with pytest.raises(Http3ConnectError, match="yanıt yok"):
+                await a._attempt(socket.AF_INET, addr, time.monotonic() + 30.0, 0.3)
+            assert time.monotonic() - t < 10.0
+        asyncio.run(go())
+    finally:
+        silent.close()
+
+
+# --- Kayıp ve ICMP dayanıklılığı (Windows CI'daki el sıkışma zaman aşımları) --------------------
+
+def test_ilk_initial_kaybolursa_pto_ile_el_sikisilir(pki, h3, monkeypatch):
+    """İstemcinin ilk Initial datagram'ı kaybolursa sürücü aioquic'in PTO zamanlayıcısıyla
+    yeniden gönderir. Süre sınırı aioquic'ten türetilir: ilk RTT örneğinden önce PTO =
+    2 x initial_rtt. Kayıplı el sıkışması kayıpsız olandan en fazla bir PTO (+ aynı kadar pay:
+    Windows'ta 15,6 ms zamanlayıcı çözünürlüğü, CI gecikmesi) uzun sürebilir. Tek adres:
+    "localhost" Windows'ta önce ::1'e çözülür, o adresin yoklama penceresi (1 sn) ölçüme
+    karışmasın. Sync ve async sürücü."""
+    from aioquic.quic.configuration import QuicConfiguration
+    from fasthttpc.http3 import async_client, sync_client
+    pto = 2 * QuicConfiguration(is_client=True).initial_rtt
+    _patch_addrs(monkeypatch, [], h3.port)
+
+    def olc_sync():
+        t = time.monotonic()
+        with Session(http3="force", verify=pki["ca"]) as s:
+            assert s.get(url(h3)).http_version == "HTTP/3"
+        return time.monotonic() - t
+
+    async def olc_async():
+        t = time.monotonic()
+        async with AsyncSession(http3="force", verify=pki["ca"]) as a:
+            assert (await a.get(url(h3))).http_version == "HTTP/3"
+        return time.monotonic() - t
+
+    taban_sync = olc_sync()                      # kayıpsız (ısınmış) el sıkışması
+    taban_async = asyncio.run(olc_async())
+    orig_flush = sync_client.SyncH3Connection._flush
+
+    def flush(self):
+        if not getattr(self, "_dusuruldu", False):
+            dg = self.core.transmit()
+            self._dusuruldu = bool(dg)
+            for data, _a in dg[1:]:                      # ilk datagram (Initial) kaybolur
+                self._sock.send(data)
+            return
+        orig_flush(self)
+    monkeypatch.setattr(sync_client.SyncH3Connection, "_flush", flush)
+    assert olc_sync() < taban_sync + 2 * pto
+
+    orig_after = async_client.AsyncH3Connection._after_event
+
+    def after(self):
+        if not getattr(self, "_dusuruldu", False) and self._transport is not None:
+            dg = self.core.transmit()
+            self._dusuruldu = bool(dg)
+            for data, _a in dg[1:]:
+                self._transport.sendto(data)
+        orig_after(self)
+    monkeypatch.setattr(async_client.AsyncH3Connection, "_after_event", after)
+    assert asyncio.run(olc_async()) < taban_async + 2 * pto
+
+
+def test_sunucu_icmp_hatasindan_sonra_almaya_devam_eder(pki, h3):
+    """Sunucu kapalı bir porta datagram gönderir (Windows'ta sonraki alım ICMP kaynaklı hata
+    verir). Paylaşılan test sunucusu yine de yeni bağlantıları kabul etmeli: Proactor
+    datagram taşıması bu hatada okumayı bırakıyordu (bkz. h3_servers.H3TestServer._run)."""
+    for _ in range(3):
+        h3.send_raw(b"\x00" * 32, ("127.0.0.1", _free_udp_port()))
+    time.sleep(0.1)
+    with Session(http3="force", verify=pki["ca"]) as s:
+        assert s.get(url(h3)).http_version == "HTTP/3"
+
+
+def test_kurulu_baglantida_udp_reddi_baglantiyi_dusurur(pki, h3):
+    """El sıkışmadan sonra gelen ICMP reddi (ConnectionRefusedError) bağlantıyı kapatır;
+    sonraki istek yeni bağlantı kurar (eski bağlantı sessizce "kullanılabilir" kalmaz)."""
+    async def go():
+        async with AsyncSession(http3="force", verify=pki["ca"]) as a:
+            assert (await a.get(url(h3))).http_version == "HTTP/3"
+            first = next(iter(a._h3._conns.values()))
+            first._on_udp_error(ConnectionRefusedError(111, "Connection refused"))
+            assert first.core.closed and not first.usable
+            assert (await a.get(url(h3))).http_version == "HTTP/3"
+            assert next(iter(a._h3._conns.values())) is not first
+    asyncio.run(go())
+
+
+def test_async_close_udp_tasimasinin_kapanmasini_bekler(pki, h3):
+    """AsyncSession.close() (ve bağlantının close()'u) UDP taşıması GERÇEKTEN kapanmadan
+    (protokolün connection_lost'u) dönmez. transport.close() eşzamansızdır; beklenmeden
+    dönülürse asyncio.run sonunda taşıma yarım kalır (Windows Proactor: açık UDP soketi,
+    _ProactorBasePipeTransport.__del__ ResourceWarning). Retire edilmiş bağlantılar dahil."""
+    async def go():
+        a = AsyncSession(http3="force", verify=pki["ca"])
+        assert (await a.get(url(h3))).http_version == "HTTP/3"
+        conn = next(iter(a._h3._conns.values()))
+        protos = list(conn._protos)
+        # Önceki (başarısız) adres denemelerinin taşımaları (ör. localhost -> ::1) çoktan kapandı;
+        # yalnızca bağlantının kullandığı son taşıma açık.
+        assert protos and not protos[-1].lost.done()
+        assert all(p.lost.done() for p in protos[:-1])
+        conn.retire()                         # akış yok: hemen kapanır (eşzamanlı yol)
+        a._h3._retired.add(conn)
+        a._h3._conns.clear()
+        assert (await a.get(url(h3))).http_version == "HTTP/3"
+        second = next(iter(a._h3._conns.values()))
+        await a.close()
+        for c in (conn, second):
+            assert c._protos and all(p.lost.done() for p in c._protos), "close() connection_lost'tan önce döndü"
+            assert c.finished
+    asyncio.run(go())
+
+
+def test_async_close_kapanisi_takilan_tasimayi_zorla_kapatir(pki, h3, monkeypatch):
+    """CPython 3.12 ProactorEventLoop'ta datagram taşıması, close() sırasında süren bir yazma
+    varsa connection_lost'u HİÇ çağırmaz (_loop_writing ``_conn_lost`` görüp erken döner).
+    Öykünme: close() hiçbir şey yapmasın. close() yine de sınırlı sürede döner, taşıma
+    abort() ile zorla kapanır ve connection_lost gelir. Ayrıca Proactor'da _close_now
+    close()'tan sonra doğrudan abort() çağırır."""
+    from fasthttpc.http3 import async_client
+
+    async def go():
+        async with AsyncSession(http3="force", verify=pki["ca"]) as a:
+            assert (await a.get(url(h3))).http_version == "HTTP/3"
+            conn = next(iter(a._h3._conns.values()))
+            proto = conn._protos[-1]
+            monkeypatch.setattr(proto.transport, "close", lambda: None)   # kapanış takılır
+            t = time.monotonic()
+            await conn.close()
+            assert proto.lost.done() and time.monotonic() - t < 3
+            a._h3._conns.clear()
+
+            assert (await a.get(url(h3))).http_version == "HTTP/3"
+            conn2 = next(iter(a._h3._conns.values()))
+            p2 = conn2._protos[-1]
+            monkeypatch.setattr(p2.transport, "close", lambda: None)
+            monkeypatch.setattr(async_client.AsyncH3Connection, "_is_proactor", lambda self: True)
+            conn2._close_now()                           # Proactor yolu: close() + abort()
+            await asyncio.sleep(0)
+            await asyncio.sleep(0)
+            assert p2.lost.done()
+            a._h3._conns.clear()
+    asyncio.run(go())
 
 
 def test_multi_address_all_dead_fails_within_timeout(pki, monkeypatch):

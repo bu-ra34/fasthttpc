@@ -182,6 +182,70 @@
   bilet olan/olmayan sunucuyla ve gövdesi "HelloRequest, dev uzunluk" gibi
   görünen şifreli Finished'la (sahte sunucu nonce'u seçer) sync ve async
   sınanır. Son varyant düzeltme öncesi koddaki hatayı her seferinde üretir.
+- **Uyarısız ve katı test takımı:** `pyproject.toml`'da `filterwarnings = ["error"]`;
+  her uyarı (sızan soket/dosya/olay döngüsü için ResourceWarning, `__del__` ve
+  iş parçacığı istisnaları dahil) testi düşürür. Tek istisna dar kapsamlı ve
+  gerekçeli: tlslite-ng'nin Python 3.10/3.11'de asyncore'u içe aktaran
+  `tlsasyncdispatchermixin` modülünün DeprecationWarning'i. cryptography'nin FFDH
+  uyarısı için giriş gerekmez (kütüphane kendi çağrısında dar filtreyle susturur).
+- Python 3.10/3.11'deki `PytestUnraisableExceptionWarning` ("Event loop is closed",
+  `start_h2.<locals>.on_conn`): sahte sunucuların bağlantı görevleri olay döngüsünden
+  uzun yaşıyordu (3.10/3.11'de `Server.wait_closed()` görevleri beklemez ve onlara
+  güçlü referans tutulmaz; iş parçacığındaki döngüler hiç kapatılmıyordu). Yeni
+  `tests/netutil.py` yardımcıları: `TrackedServer` (bağlantı görevlerini ve
+  yazıcıları izler; `wait_closed`/`async with`/döngü kapanışında iptal edip bekler,
+  yazıcıları kapatır), `LoopThread` (iş parçacığındaki döngüyü görevleri iptal edip
+  kapatır), `close_loop`. h2 sahte sunucusunun el sıkışma beklemesi bağlantı TLS
+  bitmeden kapanınca sonsuza dek dönmüyor; pompa görevi beklenerek bitiriliyor.
+- Windows 3.12'deki 29 `RuntimeWarning` (trio "signal handling code might have
+  collided"): `test_backend_trio`'nun sunucu döngüsü ana iş parçacığında
+  oluşturuluyordu; Windows'un ProactorEventLoop'u orada `signal.set_wakeup_fd`'yi
+  kendi soketine çevirip kapanana dek bırakmıyordu. Döngü artık kendi iş
+  parçacığında kuruluyor (regresyon testi ana iş parçacığının wakeup fd'sini denetler).
+- Kapatılmayan soket/dosya/döngüler: stdlib `ssl` ile sarılan sunucu soketleri
+  (`wrap_socket` ham soketi devralır; kapatılan ham soketti — `thread_servers`'ın
+  `close()`'u da bu yüzden açık TLS bağlantılarını kesemiyordu), hiç kapatılmayan
+  dinleyiciler ve sahte proxy tünelleri, `TLSAdapter.negotiate` hata verince
+  çağıranın kapatması gereken ham soketler, tlslite sunucusunun PEM dosyaları, HTTP/3
+  test sunucusunun döngüsü. TLS 1.2 stdlib sunucusu okunmamış veriyle kapatırken RST
+  yerine FIN + boşaltma (`netutil.linger_close`) kullanır.
+- `openssl s_server` çıktı pompası yarışı (ara sıra `PytestUnhandledThreadExceptionWarning`,
+  ör. "PyMemoryView_FromBuffer(): info->buf must not be NULL"): kapanışta boru, pompa
+  iş parçacığı `readline()` içindeyken kapatılıyordu. Artık süreç öldürülür, pompa
+  EOF'a ulaşıp bitene kadar beklenir, sonra borular kapanır; pompa yeniden denemede
+  değişen `self.proc` yerine kendi borusunu okur.
+- **Paralel test süreçlerinde port yarışları:** `openssl s_server` artık
+  `-accept 127.0.0.1:0` ile başlar ve gerçek port `ACCEPT` satırından okunur; hazır
+  olma da bu satırla anlaşılır (eskiden seçilip bırakılan port araya giren başka bir
+  sunucuya gidebiliyor, yoklama o yabancı sunucuya bağlanıp "hazır" sanıyordu —
+  `test_sadece_p256_sunan_sunucu_hrr_yolu` gibi testlerin paralel koşuda düşmesi).
+  "Kapalı port" testleri Linux ve Windows'ta bağlı ama dinlemeyen, süreç boyunca
+  ayrılmış bir port kullanır (`netutil.refused_port`). macOS'ta (XNU, 4.4BSD kökenli
+  `tcp_input`) dinlemeyen bağlı sokete gelen SYN RST'siz atılır, bağlantı reddedilmez
+  zaman aşımına uğrar; orada port seçilip bırakılır; çift yığınlı (127.0.0.1 + ::1) dinleyiciler port
+  kapılırsa yeni portla yeniden dener (`netutil.listen_dual`, `start_dual`).
+  Dört tam takım aynı makinede eşzamanlı koşarak doğrulandı.
+- HTTP/3 test sunucusu (`tcp=True`) aynı numarada TCP+UDP portu bulamazsa (Windows'ta
+  TCP için ayrılmış geniş port aralıkları) TCP'yi başka portta açar, Alt-Svc UDP portunu
+  ilan eder. PTO testinin süre sınırı aioquic'ten türetilir (kayıpsız el sıkışması +
+  2 x PTO, PTO = 2 x `initial_rtt`) ve tek adresle ölçülür.
+- **Test başına zaman sınırı:** `pytest-timeout` geliştirme bağımlılığı oldu
+  (`.[dev]`); `pyproject.toml`'da `timeout = 120`, `timeout_method = "thread"`
+  (Windows'ta da çalışır, tüm iş parçacıklarının yığınını döker). CI test işine
+  `timeout-minutes: 20`. Takılan bir test (ör. PR #18'in Windows işi 4,5 saat asılı
+  kaldı) artık hızla ve yığın dökümüyle düşer. Yerelde en yavaş test ~3 sn.
+- **Windows'ta paylaşılan HTTP/3 test sunucusunun kilitlenmesi:** bir Windows
+  koşusunda `test_request_rejected_repeatedly_fails_after_bound`'dan sonraki 11
+  HTTP/3 testi (sync ve async) "el sıkışma zaman aşımı" ile düşüyordu. Modül boyunca
+  paylaşılan aioquic sunucusu ProactorEventLoop'ta koşuyordu; CPython 3.12'nin
+  Proactor datagram taşıması alım hatasında (`_loop_reading`: `error_received` çağrılır,
+  yeni okuma başlatılmaz) okumayı kalıcı ve sessizce bırakır — kapanmış bir istemci
+  portuna giden yanıtın ICMP'si yeter. Test sunucusu Windows'ta artık
+  SelectorEventLoop'ta koşar (hatayı bildirip okumayı sürdürür). Regresyon testi:
+  sunucu kapalı porta datagram gönderdikten sonra yeni bağlantıları kabul etmeli.
+  İlk Initial datagram'ı düşürülen el sıkışmasının PTO ile ~0,2 sn'de tamamlandığı
+  (sync ve async sürücü) belirlenimli olarak sınanır; sürücülerin zamanlayıcı kullanımı
+  15,6 ms çözünürlüklü saatle (Windows'taki Python 3.12 `time.monotonic`) de denendi.
 - `tests/test_psl.py`: resmi PSL test vektörleri (upstream `tests/test_psl.txt`,
   dosyaya kopyalandı), joker/istisna, IDN, tembel ve thread-safe yükleme, paketlenmiş
   dosyanın içeriği ve güncelleme betiği (uydurma, küçük bir listeyle).
@@ -192,6 +256,7 @@
   davranışa göre sıkılaştırıldı: `Domain=com`, IP host'ta IP'den farklı
   `Domain=` ve host'un domain-match etmediği `Domain=` taşıyan çerez artık
   tümden yok sayılıyor; IP'ye eşit `Domain=` host-only çerez veriyor.
+
 
 ### Değişti
 - **Parmak izi DEĞİŞMEDİ:** her profilin supported_groups listesi ve ilk
@@ -346,6 +411,49 @@
   reddedilen istek nedeniyle havuzdan çıkarılan bağlantı, yeni istek geldiğinde
   hemen kapatılıyor ve aynı bağlantıda süren istekler "bağlantı kapatıldı"
   hatasıyla düşüyordu. Bağlantı artık son akışı bitince kapanır.
+- **HTTP/3 çok adresli bağlantıda süre bütçesi:** kalan süre adreslere eşit
+  bölünüyordu; sessiz (ya da ICMP reddi bildirilmeyen) ilk adres payının tamamını
+  harcıyor, çalışan son adrese soğuk bir QUIC el sıkışması için yetmeyen süre
+  kalıyordu (Windows CI'da `test_multi_address_fallthrough[icmp_refused|silent]`
+  ~1,98 sn'de zaman aşımı). Artık son olmayan bir adres en fazla
+  `min(1 sn, kalan / kalan_adres)` boyunca hiç yanıt gelmezse bırakılır; yanıt veren
+  adresin el sıkışması kalan toplam sürenin tamamını kullanabilir; son adres kalanın
+  tamamını alır (sync ve async). Belirlenimli (sahte saatli) testler eklendi.
+- **`Response.aclose()` yarıda bırakılan `aiter_*` üreteçlerini kapatır** (iç
+  üreteçler dahil, `aread()` da kendi üretecini kapatır). Önceden çöp toplayıcıya
+  kalıyorlardı: trio altında "Async generator ... was garbage collected" ResourceWarning,
+  asyncio'da sonlandırması olay döngüsü kapandıktan sonraya kalabiliyordu.
+  `aiter_lines()` artık `async def` değil, üreteç döndüren normal metot (kullanım aynı).
+- **asyncio: iptal edilen istek bağlantıyı yarım kapalı bırakmıyor.** asyncio'nun
+  `StreamWriter.wait_closed()`'ı protokolün paylaşılan kapanış future'ını doğrudan
+  bekler; bekleyen iptal edilince (ör. anyio `move_on_after`/görev grubu iptali her
+  `await`'i yeniden iptal eder) future da iptal oluyor, sonraki her `wait_closed()`
+  TLS kapanışı bitmeden dönüyordu. `AsyncSession.close()` bu yüzden kapanışı süren
+  bağlantıyı beklemiyor, olay döngüsü kapanınca soket açık kalıyordu (ResourceWarning).
+  Artık kapanış ayrı görevde ve `shield` ile beklenir (`_backend.wait_closed`); iptal
+  yüzünden yarım kalan kapanışlar oturumda izlenir ve `close()` onları da (en fazla
+  1 sn, sonra TCP kesilir) bekler. `close_streams` iptal edilmiş kapanış future'ını
+  "kapanmadı" sayıp bağlantıyı keser.
+- **Async HTTP/3: `close()` UDP taşımasının gerçekten kapanmasını bekler.**
+  `transport.close()` eşzamansızdır (ProactorEventLoop'ta süren overlapped yazma varken
+  soketin kapanması ertelenir); bağlantı ve `AsyncSession.close()` beklemeden dönünce
+  döngü sonunda taşıma yarım kalıyordu (Windows CI: açık UDP soketi,
+  `_ProactorBasePipeTransport.__del__` ResourceWarning, 24 test). Artık protokolün
+  `connection_lost`'u (en fazla 2 sn) beklenir; retire edilen bağlantılar da ancak
+  taşımaları kapanınca "bitti" sayılır ve oturum kapanışında beklenir. CPython 3.12
+  `_ProactorDatagramTransport` hatası: close() sırasında süren bir yazma (az önce
+  gönderilen CONNECTION_CLOSE) varsa `_loop_writing` `_conn_lost`'u görüp erken döner,
+  connection_lost hiç çağrılmaz; Proactor'da close()'un ardından abort() çağrılır, diğer
+  döngülerde kapanış takılırsa süre yarısında abort() ile zorlanır. Çok adresli
+  bağlantıda her adres denemesi kendi taşımasını/soketini her çıkış yolunda (hata, zaman
+  aşımı, iptal) kapatır ve kapanışı bekler (sync ve async); el sıkışması süren bağlantılar
+  da oturum kapanışında kapatılır.
+- **Async HTTP/3: kurulu bağlantıda UDP hatası bağlantıyı düşürür.** Önceden yalnızca
+  el sıkışması sırasında dikkate alınıyordu; sonradan gelen ICMP reddinde (ya da
+  Windows ProactorEventLoop'ta okumayı durduran herhangi bir alım hatasında) bağlantı
+  "kullanılabilir" kalıp sonraki istekleri zaman aşımına sokuyordu. Artık kapatılır,
+  sıradaki istek yeni bağlantı kurar. Geçici gönderim hataları (ENOBUFS, EMSGSIZE)
+  Selector döngülerinde QUIC kayıp kurtarmasına bırakılır.
 
 ### Paketleme
 - Liste `fasthttpc/public_suffix_list.dat.gz` olarak wheel ve sdist'te: sürüm

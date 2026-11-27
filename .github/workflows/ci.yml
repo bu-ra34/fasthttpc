@@ -35,6 +35,8 @@ jobs:
 
   test:
     runs-on: ${{ matrix.os }}
+    # Takılan bir test işi saatlerce asılı bırakmasın (test başına sınır: pyproject timeout).
+    timeout-minutes: 20
     strategy:
       fail-fast: false
       matrix:

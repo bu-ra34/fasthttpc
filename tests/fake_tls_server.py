@@ -145,6 +145,9 @@ class FakeTLS13Server:
 
     def close(self):
         self.lsock.close()
+        conn = getattr(self, "conn", None)       # kabul edilen bağlantı (el sıkışmadan sonra açık kalır)
+        if conn is not None:
+            conn.close()
 
     # ---- sunucu mantığı --------------------------------------------------
     def _read_ch(self, sock):

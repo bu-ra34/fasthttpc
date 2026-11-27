@@ -714,7 +714,10 @@ def test_fake_bozuk_record_mac_ve_asiri_buyuk_record(pki, files, tamper, match):
     port, t, ls = serve_fake_in_thread(srv)
     with pytest.raises(ConnectionError, match=match):
         es = _connect(port, files[0])
-        es.recv_record(skip_post_handshake=True)
+        try:
+            es.recv_record(skip_post_handshake=True)
+        finally:
+            es.close()
     t.join(3)
 
 

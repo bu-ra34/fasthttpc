@@ -6,6 +6,7 @@ import time
 import pytest
 
 from fasthttpc.transport import happy_eyeballs as he
+from netutil import refused_port
 
 
 def _listener(family=socket.AF_INET, host="127.0.0.1"):
@@ -16,11 +17,7 @@ def _listener(family=socket.AF_INET, host="127.0.0.1"):
 
 
 def _closed_port():
-    s = socket.socket()
-    s.bind(("127.0.0.1", 0))
-    p = s.getsockname()[1]
-    s.close()
-    return p
+    return refused_port()          # yarışsız "kapalı port" (bkz. netutil)
 
 
 def _info(family, addr):

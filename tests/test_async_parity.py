@@ -1,7 +1,6 @@
 """AsyncSession: proxy (HTTP CONNECT / SOCKS5), Timeout/Limits ve HTTP/1.1 gövde
 çerçevelemesi testleri (ağsız; yerel asyncio sunucular)."""
 import asyncio
-import socket
 import time
 
 import pytest
@@ -10,7 +9,7 @@ from fasthttpc import AsyncSession, Limits, Timeout
 from fasthttpc.transport import proxy as P
 from fasthttpc.transport.proxy import ProxyConfig, ProxyError
 
-from netutil import start_dual
+from netutil import refused_port, start_dual, start_server
 from async_fakes import AsyncFakeProxy, start_stdlib_tls, start_tls13
 from tls13_fakeserver import PKI, http_responder
 
@@ -139,10 +138,7 @@ def test_proxy_http_reddi_ve_socks_reddi(pki, ca):
 
 
 def test_proxy_ulasilamaz_proxyerror(ca):
-    s = socket.socket()
-    s.bind(("127.0.0.1", 0))
-    port = s.getsockname()[1]
-    s.close()
+    port = refused_port()
 
     async def main():
         a = AsyncSession(verify=ca, timeout=2, proxy=f"http://127.0.0.1:{port}")
@@ -200,7 +196,7 @@ def test_connect_timeout_tls_el_sikisma_takilirsa(ca):
             # Sunucu tarafını da kapat: Python 3.12+ Server.wait_closed() açık
             # kalan bağlantı transport'larını bekler; kapatılmazsa test asılı kalır.
             w.close()
-        srv = await asyncio.start_server(hang, "127.0.0.1", 0)
+        srv = await start_server(hang, "127.0.0.1", 0)
         port = srv.sockets[0].getsockname()[1]
         async with srv:
             s = AsyncSession(verify=ca, timeout=Timeout(30, connect=0.3))

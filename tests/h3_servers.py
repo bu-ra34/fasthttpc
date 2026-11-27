@@ -9,6 +9,7 @@ import json
 import socket
 import socketserver
 import ssl
+import sys
 import threading
 from urllib.parse import parse_qs, urlsplit
 
@@ -26,6 +27,8 @@ from aioquic.buffer import encode_uint_var
 from aioquic.h3.connection import FrameType, H3Connection, encode_frame
 from aioquic.h3.events import DataReceived, HeadersReceived
 from aioquic.quic.configuration import QuicConfiguration
+
+from netutil import close_loop
 
 
 def _name(cn):
@@ -189,6 +192,7 @@ class H3TestServer:
         self._ready = threading.Event()
         self._stop = None
         self.tcp_hits = 0
+        self.tcp_port = 0       # tcp=True: h1 sunucusunun portu (genelde UDP ile aynı numara)
 
     def start(self):
         self._exc = None
@@ -201,7 +205,15 @@ class H3TestServer:
         return self
 
     def _run(self):
-        loop = asyncio.new_event_loop()
+        # Windows: UDP sunucusu ProactorEventLoop'ta DEĞİL, SelectorEventLoop'ta koşar.
+        # Proactor datagram taşıması (CPython 3.12, proactor_events._ProactorDatagramTransport.
+        # _loop_reading) recvfrom'dan gelen OSError'da protocol.error_received() çağırıp
+        # yeni okuma BAŞLATMAZ: tek bir ICMP kaynaklı hata (istemcinin kapattığı porta giden
+        # yanıt; Windows bunu sonraki alımda raporlar) sunucunun alımını sessizce ve kalıcı
+        # olarak durdurur, modül boyunca paylaşılan sunucuya sonraki tüm el sıkışmalar zaman
+        # aşımına uğrar (Windows CI: test_request_rejected_repeatedly_fails_after_bound'dan
+        # sonraki 11 HTTP/3 testi). Selector taşıması hatayı bildirir ve okumayı sürdürür.
+        loop = asyncio.SelectorEventLoop() if sys.platform == "win32" else asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
         self._loop = loop
         cfg = QuicConfiguration(is_client=False, alpn_protocols=["h3"])
@@ -219,13 +231,19 @@ class H3TestServer:
                 if not self.tcp:
                     break
                 try:
-                    self._start_tcp()
+                    self._start_tcp(self.port)
                     break
                 except OSError:
                     srv.close()
                     self.port = 0
             else:
-                raise OSError("aynı numarada TCP+UDP portu bulunamadı")
+                # Windows'ta TCP için ayrılmış (excludedportrange) geniş aralıklar UDP'nin
+                # verdiği numaraları sık sık kapsar: aynı numara bulunamazsa TCP başka portta
+                # dinler; Alt-Svc ({port}) yine UDP portunu ilan eder (h3=":<udp>").
+                srv = await serve("127.0.0.1", 0, configuration=cfg, create_protocol=_H3Server)
+                self.port = srv._transport.get_extra_info("sockname")[1]
+                self._start_tcp(0)
+            self._quic_server = srv
             self._stop = asyncio.Event()
             self._ready.set()
             await self._stop.wait()
@@ -235,6 +253,18 @@ class H3TestServer:
         except BaseException as e:      # noqa: BLE001 - start() yeniden fırlatır
             self._exc = e
             self._ready.set()
+        finally:
+            close_loop(loop)            # UDP soketi ve kalan görevler döngüyle birlikte kapanır
+
+    def send_raw(self, data: bytes, addr) -> None:
+        """Sunucu UDP soketinden ``addr``'e ham datagram (ör. kapalı porta: ICMP tetikler)."""
+        sent = threading.Event()
+
+        def go():
+            self._quic_server._transport.sendto(data, addr)
+            sent.set()
+        self._loop.call_soon_threadsafe(go)
+        assert sent.wait(5), "datagram gönderilemedi (zaman aşımı)"
 
     def send_goaway(self, path, goaway_id):
         """``/goaway-hold`` isteği ``path``'i bekleten bağlantıda bir GOAWAY(goaway_id) daha gönder
@@ -249,7 +279,7 @@ class H3TestServer:
         self._loop.call_soon_threadsafe(go)
         assert sent.wait(5), "GOAWAY gönderilemedi (zaman aşımı)"
 
-    def _start_tcp(self):
+    def _start_tcp(self, port):
         outer = self
 
         class H(http.server.BaseHTTPRequestHandler):
@@ -271,7 +301,8 @@ class H3TestServer:
             def log_message(self, *a):
                 pass
 
-        httpd = NoFqdnHTTPServer(("127.0.0.1", self.port), H)
+        httpd = NoFqdnHTTPServer(("127.0.0.1", port), H)
+        self.tcp_port = httpd.server_address[1]
         ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
         ctx.minimum_version = ssl.TLSVersion.TLSv1_3
         ctx.load_cert_chain(*self.tcp_cert)
@@ -285,3 +316,4 @@ class H3TestServer:
             self._loop.call_soon_threadsafe(self._stop.set)
         if self.tcp:
             self._httpd.shutdown(); self._httpd.server_close()
+        self._thread.join(10)

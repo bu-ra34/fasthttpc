@@ -25,7 +25,7 @@ from fasthttpc.protocol.http2_parser import FrameType, HTTP2Frame, _strip_header
 
 from async_fakes import start_h2
 from interop import pki as ipki
-from netutil import dual_endpoint
+from netutil import listen_dual
 from tls13_fakeserver import PKI
 
 h2 = pytest.importorskip("h2", reason="h2 kütüphanesi kurulu değil (pip install h2)")
@@ -49,18 +49,9 @@ class H2LibSunucu:
         self.baglantilar = 0
         self.hatalar: "list[BaseException]" = []
         self._dur = threading.Event()
-        self._dinleyiciler = []
-        hosts, port = dual_endpoint()
-        for h in hosts:
-            s = socket.socket(socket.AF_INET6 if ":" in h else socket.AF_INET)
-            if ":" in h:
-                s.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 1)
-            s.bind((h, port))
-            port = s.getsockname()[1]
-            s.listen(8)
+        self._dinleyiciler, self.port = listen_dual(8)    # paralel süreçlerde port yarışına dayanıklı
+        for s in self._dinleyiciler:
             s.settimeout(0.2)
-            self._dinleyiciler.append(s)
-        self.port = port
 
     def __enter__(self):
         for s in self._dinleyiciler:
@@ -84,9 +75,10 @@ class H2LibSunucu:
         from h2.connection import H2Connection
         from h2.events import RequestReceived, StreamEnded
         from h2.settings import SettingCodes
+        tc = None
         try:
             c.settimeout(10)
-            tc = self.ctx.wrap_socket(c, server_side=True)
+            tc = self.ctx.wrap_socket(c, server_side=True)    # c'yi devralır (detach)
             self.baglantilar += 1
             conn = H2Connection(H2Configuration(client_side=False, header_encoding=None))
             conn.initiate_connection()
@@ -134,7 +126,7 @@ class H2LibSunucu:
             if not self._dur.is_set():
                 self.hatalar.append(e)
         finally:
-            c.close()
+            (tc or c).close()
 
 
 @pytest.fixture(scope="module")

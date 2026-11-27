@@ -223,6 +223,7 @@ class _AsyncH1Stream:
             return
         self._done = True
         _AsyncH1Stream._kill(self._o)
+        self._s._closing_add(self._o)
 
     @staticmethod
     def _kill(o: "_Opened") -> None:
@@ -243,15 +244,20 @@ class _AsyncH1Stream:
         o = self._o
         try:
             o.writer.close()
-            await o.writer.wait_closed()
-        except (OSError, RuntimeError, asyncio.CancelledError):
+            await B.wait_closed(o.writer)
+        except (OSError, RuntimeError):
             pass
+        except asyncio.CancelledError:
+            self._s._closing_add(o)        # kapanışı session.close() bekler
         finally:
             o.release()
 
     def __del__(self) -> None:
+        if self._done:
+            return
+        self._done = True
         try:
-            self.close_nowait()
+            _AsyncH1Stream._kill(self._o)
         except Exception:  # noqa: BLE001
             pass
 
@@ -423,6 +429,11 @@ class AsyncSession:
         self._origin_proto: dict[_ConnKey, str] = {}
         self._origin_locks: dict[_ConnKey, Any] = {}    # B.Lock(): asyncio.Lock | anyio.Lock
         self._bg_tasks:     set[Any] = set()             # B.spawn(): asyncio.Task | TrioTask
+        # close() edilmiş ama kapanışı beklenemeyen (iptal edilen istek, eşzamanlı kapatma)
+        # asyncio bağlantıları: görev -> (yazıcı, döngü). TLS kapanışı birkaç döngü turu
+        # sürer; olay döngüsü ondan önce kapanırsa taşıma yarım kalır (ResourceWarning,
+        # açık soket). close() bunları da (kısa süre) bekler. Biten kayıt kendini siler.
+        self._closing:      dict[Any, tuple[Any, Any]] = {}
         # HTTP/1.1 keep-alive havuzu: (host, port, proxy, impersonate-mi) -> boşta bağlantılar.
         # Boştaki bağlantı semaphore slotu TUTMAZ (slot yalnızca kullanımdayken).
         self._idle: dict[_ConnKey, list[_Opened]] = {}
@@ -714,13 +725,31 @@ class AsyncSession:
         except (AttributeError, RuntimeError):
             return True
 
-    @staticmethod
-    def _drop_conn(o: "_Opened") -> None:
-        """Bağlantıyı eşzamanlı kapatır (wait_closed beklenmez)."""
+    def _drop_conn(self, o: "_Opened") -> None:
+        """Bağlantıyı eşzamanlı kapatır (wait_closed beklenmez; close() bekler)."""
         try:
             o.writer.close()
         except (OSError, RuntimeError) as e:   # kapalı event loop vb.
             logger.debug("boştaki bağlantı kapatılamadı: %s", e)
+            return
+        self._closing_add(o)
+
+    def _closing_add(self, o: "_Opened") -> None:
+        """close() edilmiş asyncio bağlantısının kapanışını arka planda izler (bkz. _closing)."""
+        if B._is_trio() or o.loop is None or o.loop is not B.current_token():
+            return
+        self._closing_track(o.writer, o.loop)
+
+    def _closing_track(self, writer: Any, loop: Any) -> None:
+        try:
+            task = loop.create_task(B._quiet_wait_closed(writer))
+        except RuntimeError:                   # döngü kapalı
+            return
+        self._closing[task] = (writer, loop)
+        task.add_done_callback(self._closing_done)
+
+    def _closing_done(self, task: Any) -> None:
+        self._closing.pop(task, None)
 
     def _idle_expired(self, o: "_Opened", now: float) -> bool:
         exp = self.limits.keepalive_expiry
@@ -819,9 +848,14 @@ class AsyncSession:
                     return
             o.writer.close()
             try:
-                await o.writer.wait_closed()
+                await B.wait_closed(o.writer)
             except OSError as e:  # ssl kapanış hataları dahil
                 logger.debug("wait_closed hatası yok sayıldı: %s", e)
+            except BaseException:
+                # İptal (ör. anyio iptal kapsamı her await'i yeniden iptal eder): kapanış
+                # yarım kaldı; session.close() bekler.
+                self._closing_add(o)
+                raise
         finally:
             o.release()
 
@@ -1824,6 +1858,10 @@ class AsyncSession:
             self._drop_conn(o)
             if running is not None and o.loop is running:
                 waits.append(o.writer)
+        # Kapanışı süren (iptal edilmiş / düşürülmüş) bağlantılar: bu döngüdekiler beklenir.
+        for w, loop in list(self._closing.values()):
+            if running is not None and loop is running and w not in waits:
+                waits.append(w)
         # Karşı taraf TLS close_notify'a yanıt vermezse (ssl kapanış zaman aşımı
         # 30 sn) close() takılmasın: kısa süre bekle, kalanı arka planda kapanır.
         await B.close_streams(waits, 1.0)
@@ -1969,7 +2007,7 @@ class AsyncWebSocket:
                 logger.debug("WebSocket CLOSE frame'i gönderilemedi: %s", e)
         self._writer.close()
         try:
-            await self._writer.wait_closed()
+            await B.wait_closed(self._writer)
         except OSError as e:
             logger.debug("WebSocket wait_closed hatası yok sayıldı: %s", e)
 

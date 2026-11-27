@@ -38,6 +38,25 @@ except ImportError:     # pragma: no cover - aioquic < 1.9 never refuses; nothin
         pass
 
 from ..security.cert_validator import CertificateValidationError
+
+# Çok adresli çözümlemede (ör. localhost -> ::1, 127.0.0.1) SON OLMAYAN bir adres, bu süre
+# içinde sunucudan hiç datagram gelmezse bırakılıp sıradakine geçilir (RFC 8305'teki sabit
+# "connection attempt delay" fikri; QUIC Initial'ı birkaç kez yeniden gönderilecek kadar uzun).
+# Yanıt gelen adrese bağlanılır: el sıkışması kalan toplam sürenin tamamını kullanabilir.
+ADDRESS_PROBE_TIMEOUT = 1.0
+
+
+def address_probe_window(remaining: float, addrs_left: int) -> "Optional[float]":
+    """Sıradaki adresin "ilk yanıt" bekleme penceresi (sn); ``None``: son adres, sınır yok.
+
+    Eski davranış kalan süreyi adreslere EŞİT bölüyordu: sessiz (ya da ICMP reddinin
+    bildirilmediği) ilk adres payının tamamını harcıyor, çalışan son adrese soğuk bir QUIC
+    el sıkışması için yetersiz süre kalıyordu. Artık son olmayan adres en fazla
+    ``min(ADDRESS_PROBE_TIMEOUT, remaining / addrs_left)`` sn yanıtsız beklenir; hızlı
+    başarısızlıkta (ICMP reddi) kullanılmayan süre zaten sonraki adrese kalır."""
+    if addrs_left <= 1:
+        return None
+    return max(0.0, min(ADDRESS_PROBE_TIMEOUT, remaining / addrs_left))
 from . import fingerprint as fp
 from .verify import validate_peer_chain
 
@@ -185,6 +204,7 @@ class H3Core:
         # aioquic yeni istek başlatmayı reddetti (GOAWAY alındı / bağlantı kapanıyor): yeniden kullanılmaz.
         self.draining = False
         self.last_activity = clock()
+        self.datagrams_received = 0          # eşten gelen datagram sayısı (adres yoklaması)
         self.on_state_change: "Optional[Callable[[], None]]" = None
         self._addr: "Optional[tuple]" = None
 
@@ -199,6 +219,7 @@ class H3Core:
 
     def receive(self, data: bytes, addr: tuple) -> None:
         self.last_activity = self.clock()
+        self.datagrams_received += 1
         self.quic.receive_datagram(data, addr, self.clock())
         self._pump()
 

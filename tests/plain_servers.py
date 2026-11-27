@@ -15,7 +15,7 @@ from typing import Callable, Optional
 
 from cryptography.hazmat.primitives import serialization
 
-from netutil import dual_endpoint
+from netutil import listen_dual, refused_port
 
 
 @dataclass
@@ -78,19 +78,7 @@ class ThreadedHTTPServer:
         self.conns = 0
         self.errors: "list[BaseException]" = []
         self._lock = threading.Lock()
-        self._socks: "list[socket.socket]" = []
-        hosts, port = dual_endpoint()
-        for h in hosts:
-            fam = socket.AF_INET6 if ":" in h else socket.AF_INET
-            s = socket.socket(fam, socket.SOCK_STREAM)
-            s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-            if fam == socket.AF_INET6:
-                s.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 1)
-            s.bind((h, port))
-            port = s.getsockname()[1]
-            s.listen(16)
-            self._socks.append(s)
-        self.port = port
+        self._socks, self.port = listen_dual(16)
         scheme = "https" if ssl_ctx is not None else "http"
         self.base = f"{scheme}://{scheme_host}:{self.port}"
         self._stop = False
@@ -190,8 +178,5 @@ class ForwardProxy(ThreadedHTTPServer):
 
 
 def closed_port() -> int:
-    s = socket.socket()
-    s.bind(("127.0.0.1", 0))
-    port = s.getsockname()[1]
-    s.close()
-    return port
+    """Bağlantıyı reddeden port (bkz. netutil.refused_port; platforma göre ayrılır)."""
+    return refused_port()

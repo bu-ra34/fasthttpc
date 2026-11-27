@@ -147,7 +147,7 @@ class _ReaderWriter:
         self._w.close()
 
     async def wait_closed(self) -> None:
-        await self._w.wait_closed()
+        await B.wait_closed(self._w)
 
 
 class H2StreamHandle:
@@ -897,6 +897,6 @@ class AsyncHttp2Connection:
         self._teardown(Http2ConnectionError("HTTP/2 bağlantısı kapatıldı."))
         await B.cancel_task(task)
         try:
-            await self._s.wait_closed()
+            await B.wait_closed(self._s)
         except (OSError, ConnectionError, asyncio.CancelledError, RuntimeError):
             pass

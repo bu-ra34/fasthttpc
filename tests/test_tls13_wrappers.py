@@ -9,6 +9,7 @@ import pytest
 from fasthttpc.security import cert_validator as cv
 from fasthttpc.tls13 import SyncTLSSocket, AsyncTLSStream, TLSError
 
+from netutil import start_server
 from tls13_fakeserver import PKI, FakeTLS13Server, async_serve, sync_serve, http_responder
 
 HOST = "example.com"
@@ -88,7 +89,7 @@ async def _start(pki, handler=None, **server_kw):
         servers.append(srv)
         await async_serve(srv, r, w, handler)
 
-    srv = await asyncio.start_server(on_conn, "127.0.0.1", 0)
+    srv = await start_server(on_conn, "127.0.0.1", 0)
     port = srv.sockets[0].getsockname()[1]
     return srv, port, servers
 
